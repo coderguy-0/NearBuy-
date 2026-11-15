@@ -28,6 +28,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const orderApi = require('./orders');
 
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -121,6 +122,8 @@ function resolvePath(urlPath) {
   const rel = clean.replace(/^\/+/, '');
   const abs = path.resolve(ROOT, rel || '.');
   if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) return null;
+  const privateData = path.join(ROOT, 'data');
+  if (abs === privateData || abs.startsWith(privateData + path.sep)) return null;
   return abs;
 }
 
@@ -176,7 +179,8 @@ function redirect(res, to, code = 301) {
   res.end();
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
+  if ((req.url || '').split('?')[0].startsWith('/api/')) { await orderApi.handle(req, res); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { Allow: 'GET, HEAD', 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Method not allowed');
