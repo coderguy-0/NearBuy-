@@ -4,3 +4,4 @@ package-lock.json
 *.log
 data/
 .cache/
+public/assets/_src/

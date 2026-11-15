@@ -179,8 +179,8 @@ Local orders are carried by a delivery network that runs on the same server and 
 | App | Address | Who uses it | Demo sign-in (only when `SEED_DEMO=1`) |
 | --- | --- | --- | --- |
 | Partner app (mobile-first) | `/runner/` | Delivery partners: apply, go online, accept offers, pick up, deliver, earnings, support | `rohan@nearbuy.demo` / `Runner123!` |
-| Control tower | `/control-tower/` | Operations: live map, dispatch, partner approval, zones and fees, finance, support, reports, audit | `tower@nearbuy.demo` / `Tower123!` |
-| Fleet portal | `/fleet/` | Fleet managers: their own riders, deliveries, performance, settlements | `fleet@nearbuy.demo` / `Fleet123!` |
+| Control tower | `/control-tower/` | Operations: live map, dispatch, partner approval, zones and fees, finance, support, reports, audit | access code `NB-OPS-2026` |
+| Fleet portal | `/fleet/` | Fleet managers: their own riders, deliveries, performance, settlements | `arjun@nearbuy.demo` / `Fleet123!` |
 | Order tracking | `/track/?t=<private link>` | Customers: status, arrival estimate, delivery code, preferences, rating, problem report | link is created with each order |
 | Seller deliveries | `/seller/deliveries` | Sellers: preparation time, ready for pickup, pickup PIN, handover, issues | `owner@nearbuy.demo` / `Seller123!` |
 
@@ -232,7 +232,7 @@ Each portal signs in **on its own** and opens **only its own tools**. There is n
 | Customer | `/customer/` | `riya@nearbuy.demo` / `NearBuy123!` |
 | Seller | `/seller/` | `owner@nearbuy.demo` / `Seller123!` |
 | Delivery Partner | `/runner/` | `rohan@nearbuy.demo` / `Runner123!` |
-| Fleet | `/fleet/` | `fleet@nearbuy.demo` / `Fleet123!` |
+| Fleet | `/fleet/` | `arjun@nearbuy.demo` / `Fleet123!` |
 | Operations | `/admin/` or `#/ops/overview` | access code `NB-OPS-2026` |
 
 Sessions live in `sessionStorage` for the current tab and are cleared by *Sign out*, so a demo reviewer can walk all five portals one after another without one session ever unlocking the next. Registration (`/seller/register/`, `/runner/register/`) stays public — you register before you have an account.
@@ -307,7 +307,7 @@ in turn — the record underneath is the same row throughout, never a copy.
    pickup PIN printed on the seller's screen, then follow the route and type the customer's delivery code.
 4. **Customer again** — the order page now shows the runner, the ETA and the live status, and closes when the delivery
    code is verified. The collection order closes with its own code at the counter.
-5. **Operations** — `/control-tower/` as `tower@nearbuy.demo`: the same delivery in *Deliveries*, every status change,
+5. **Operations** — `/control-tower/` with the access code `NB-OPS-2026`: the same delivery in *Deliveries*, every status change,
    both code attempts, the payout record, and the audit log entry for each action.
 
 Nothing carries a session across those steps: each one is a fresh sign-in for that portal only. The older
@@ -426,7 +426,24 @@ nearbuy.css           product design system + every workspace style
 nearbuy.js            data, store, router, five workspaces, flows, modals
 classic.html · seller.html · partner.html · business.html · delivery-admin.html
                       earlier standalone pages (legacy, kept for reference)
+roadmap/              the 84-item feature checklist (selections persist per browser)
+fleet/ · control-tower/ · customer/login/
+                      remaining front doors into the matching workspace
+delivery/             NearBuy Delivery kit: brand mark, DM Sans, auth-card styles
 public/assets/        brand mark + compressed 3D renders used by the homepage
+server/index.js       zero-dependency static server with clean-URL routing (npm start)
+tools/                generators: brand-mark raster, front doors, public pages
+tests/                node:test regression suite over routes and assets (npm test)
+```
+
+### Regenerating generated files
+
+Nothing here is required to run the site; these exist so the committed output stays reproducible:
+
+```bash
+node tools/render-logo.mjs          # public/assets/nearbuy-logo.png from the brand vector
+node tools/build-pages.mjs          # the portal front doors (customer/, seller/, runner/, …)
+node tools/build-public-pages.mjs   # about/ · help/ · roadmap/
 ```
 
 ## Brand
