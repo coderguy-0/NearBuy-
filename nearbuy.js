@@ -3341,35 +3341,13 @@ function deliverOverview() {
 }
 /* One delivery at a time: the runner accepts or declines the single open offer, and
    cannot pick up another until the current one is delivered. */
-function runnerFocusTask() {
-  const mine = state.tasks.find((t) => t.partnerId === me().id && !['Delivered', 'Returned', 'Cancelled'].includes(t.status));
-  if (mine) return { task: mine, locked: true, kind: 'active' };
-  const offer = state.tasks.find((t) => t.status === 'Requested' && !(t.declinedBy || []).includes(me().id));
-  return offer ? { task: offer, locked: false, kind: 'offer' } : { task: null, locked: false, kind: 'none' };
+function offerForRunner(r) {
+  const offer = state.tasks.find((t) => t.status === 'Requested' && !(t.declinedBy || []).includes(r.id));
+  return offer ? { task: offer, locked: true, kind: 'offer' } : { task: null, locked: false, kind: 'none' };
 }
-function runnerFocusPanel() {
-  const r = me();
-  const focus = runnerFocusTask();
-  const t = focus.task;
-  const offers = state.tasks.filter((x) => x.status === 'Requested').length;
-  const head = `<div class="between wrap mb-14">
-      <div>
-        <span class="kicker kicker--deliver"><i></i>DELIVERY OFFER · ONE AT A TIME</span>
-        <h2 id="runnerFocusTitle" style="font-size:17px;margin-top:6px">${focus.kind === 'active' ? 'Finish this delivery before the next offer.' : focus.kind === 'offer' ? 'Accept or decline this request.' : 'No request waiting right now.'}</h2>
-        <p class="tiny muted" style="margin-top:4px">Runner home shows a single offer at a time. ${focus.kind === 'active' ? 'The next request opens as soon as this one is delivered.' : 'Requests you decline move to another nearby runner.'}</p>
-      </div>
-      <div class="row gap-6 wrap">${pill(r.online ? 'Online' : 'Offline', r.online ? 'green' : 'neutral', true)}${pill(`${offers} open in the network`, 'blue')}</div>
-    </div>`;
-  if (!t) {
-    return `<section class="card card--pad mb-18 fulfill-runner" aria-labelledby="runnerFocusTitle">
-      ${head}
-      ${emptyState('inbox', 'Nothing to accept yet', `We will offer one task at a time within ${r.maxKm} km. Go online to see the next request.`, `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="requests">Browse the queue ${icon('arrowRight')}</button>`)}
-    </section>`;
-  }
-  const isActive = focus.kind === 'active';
-  return `<section class="card card--pad mb-18 fulfill-runner" aria-labelledby="runnerFocusTitle">
-    ${head}
-    <div class="runner-focus">
+function runnerFocusTaskCard(t, kind) {
+  const isActive = kind === 'active';
+  return `<div class="runner-focus">
       <div class="runner-focus__main">
         <div class="between wrap mb-8">
           <span class="task-card__id">${esc(t.id)} <span class="muted" style="font-weight:500;font-family:var(--body);font-size:11px">· ${esc(t.createdAt)}</span></span>
@@ -3399,7 +3377,36 @@ function runnerFocusPanel() {
               <p class="tiny muted" style="text-align:center">Declining never carries a penalty in this demo.</p>
             </div>`}
       </div>
+    </div>`;
+}
+
+function runnerFocusPanel() {
+  const r = me();
+  const active = activeDelivery();
+  const offer = offerForRunner(r).task;
+  const offers = state.tasks.filter((x) => x.status === 'Requested').length;
+  const headline = offer ? 'Accept or decline this request.' : active ? 'Finish this delivery before the next offer.' : 'No request waiting right now.';
+  const sub = offer
+    ? 'One delivery at a time: accept this request, or decline it and it moves to another nearby runner.'
+    : active ? 'One delivery at a time: the next request unlocks as soon as this one is delivered.' : 'Requests you decline move to another nearby runner.';
+  return `<section class="card card--pad mb-18 fulfill-runner" aria-labelledby="runnerFocusTitle">
+    <div class="between wrap mb-14">
+      <div>
+        <span class="kicker kicker--deliver"><i></i>DELIVERY OFFER · ONE AT A TIME</span>
+        <h2 id="runnerFocusTitle" style="font-size:17px;margin-top:6px">${headline}</h2>
+        <p class="tiny muted" style="margin-top:4px">${sub}</p>
+      </div>
+      <div class="row gap-6 wrap">${pill(r.online ? 'Online' : 'Offline', r.online ? 'green' : 'neutral', true)}${pill(`${offers} open in the network`, 'blue')}</div>
     </div>
+    ${active ? `<div class="runner-focus-group">
+      <div class="runner-focus-label">${pill('On the road now', 'blue', true)}<span class="tiny muted">Accepting a second task stays locked until this is delivered.</span></div>
+      ${runnerFocusTaskCard(active, 'active')}
+    </div>` : ''}
+    ${offer ? `<div class="runner-focus-group">
+      <div class="runner-focus-label">${pill('Next offer for you', 'amber', true)}<span class="tiny muted">${active ? 'Ready the moment your current delivery closes.' : 'Accept or decline — it is entirely your call.'}</span></div>
+      ${runnerFocusTaskCard(offer, 'offer')}
+    </div>` : ''}
+    ${!active && !offer ? emptyState('inbox', 'Nothing to accept yet', `We will offer one task at a time within ${r.maxKm} km. Go online to see the next request.`, `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="requests">Browse the queue ${icon('arrowRight')}</button>`) : ''}
   </section>`;
 }
 

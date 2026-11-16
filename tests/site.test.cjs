@@ -291,6 +291,13 @@ test('runner home enforces one delivery at a time with accept and decline', () =
 
   assert.match(nbJs, /function runnerFocusPanel\(/, 'runner home should render the single-offer panel');
   assert.match(nbJs, /DELIVERY OFFER · ONE AT A TIME/, 'runner panel should explain the one-at-a-time rule');
+
+  // Accept/decline must be reachable from runner home even while a task is active:
+  // the live task and the next offer are rendered as separate groups.
+  const panel = nbJs.slice(nbJs.indexOf('function runnerFocusPanel('), nbJs.indexOf('function deliverHowStrip('));
+  assert.match(panel, /offerForRunner\(r\)/, 'the offer must be computed independently of the active task');
+  assert.match(panel, /On the road now/, 'the active delivery should be labelled');
+  assert.match(panel, /Next offer for you/, 'the next offer should be shown alongside the active task');
   assert.match(nbJs, /data-act="decline-task"/, 'runner must be able to decline a request');
   assert.match(nbJs, /function declineTask\(/, 'decline handler should exist');
 

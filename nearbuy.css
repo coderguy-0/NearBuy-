@@ -1145,6 +1145,8 @@ p, .prod__name, .list-row__main small, .shop-card__p { text-wrap: pretty; }
 .fulfil-panel { border-color: #d8e9e0; background: linear-gradient(180deg, #f6fbf8 0%, #ffffff 62%); }
 .detect-panel { border-color: #dbe8f6; background: linear-gradient(180deg, #f5f9fe 0%, #ffffff 62%); }
 .fulfill-runner { border-color: #dbe3f2; background: linear-gradient(180deg, #f6f9ff 0%, #ffffff 66%); }
+.runner-focus-group + .runner-focus-group { margin-top: 14px; padding-top: 14px; border-top: 1px dashed #dfe7f4; }
+.runner-focus-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
 .runner-focus { display: grid; grid-template-columns: minmax(0, 1fr) 208px; gap: 16px; align-items: stretch; }
 .runner-focus__main { min-width: 0; }
 .runner-focus__side {
