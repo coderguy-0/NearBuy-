@@ -424,7 +424,7 @@ admin/                noindex signpost to the gated operations console
 portal.html           NearBuy One — the unified product shell
 nearbuy.css           product design system + every workspace style
 nearbuy.js            data, store, router, five workspaces, flows, modals
-classic.html · seller.html · partner.html · business.html · delivery-admin.html
+seller.html · partner.html · business.html · delivery-admin.html
                       earlier standalone pages (legacy, kept for reference)
 roadmap/              the 84-item feature checklist (selections persist per browser)
 fleet/ · control-tower/ · customer/login/
