@@ -1,389 +1,413 @@
 #!/usr/bin/env node
 /*
- * tools/render-logo.mjs — renders public/assets/nearbuy-logo.png from the exact
- * brand-mark vector data used by nearbuy.js (const LOGO), so the favicon and the
- * in-app mark are always the same shape.
+ * tools/render-logo.mjs — processes and syncs the universal NearBuy badge logo
+ * across `public/assets/nearbuy-logo.png` and `delivery/logo.svg`.
  *
- * Dependency-free: a small SVG path flattener, an anti-aliased scanline filler
- * and a PNG encoder built on node:zlib. No npm install, no build step.
+ * Dependency-free (node:zlib + node:fs):
+ *   - Decodes 8-bit RGB / RGBA PNGs (scanline filters 0..4)
+ *   - Flood-fills opaque exterior background/shadow outside the circular badge
+ *     when given a flat RGB badge source, with smooth anti-aliased edge matting
+ *   - Centers and Lanczos-2 resamples in premultiplied alpha space
+ *   - Writes `public/assets/nearbuy-logo.png` and `delivery/logo.svg`
  *
- *   node tools/render-logo.mjs [--size 512] [--out public/assets/nearbuy-logo.png]
+ * Usage:
+ *   node tools/render-logo.mjs [--in <source.png>] [--size 512] [--out public/assets/nearbuy-logo.png]
  */
-import { deflateSync } from 'node:zlib';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { deflateSync, inflateSync } from 'node:zlib';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
-/* ------------------------------- cli -------------------------------------- */
+/* ---------------------------------- cli ----------------------------------- */
 const argv = process.argv.slice(2);
 const arg = (name, fallback) => {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback;
 };
-const SIZE = Number(arg('size', 512));
+const hasFlag = (name) => argv.includes(`--${name}`);
+
 const OUT = resolve(arg('out', 'public/assets/nearbuy-logo.png'));
+const IN = resolve(arg('in', OUT));
+const SIZE = Number(arg('size', 512));
+const SVG_OUT = resolve(arg('svg-out', 'delivery/logo.svg'));
+const SVG_SIZE = Number(arg('svg-size', 256));
+const WRITE_SVG = !hasFlag('no-svg');
 
-/* The mark, copied verbatim from nearbuy.js (viewBox 0 0 44 44). */
-const VB = 44;
-const PIN_D =
-  'M22 4.5c-7.7 0-14 6.1-14 13.6 0 9.6 11 20.4 13.3 22.4a1 1 0 0 0 1.4 0C25 38.5 36 27.7 36 18.1 36 10.6 29.7 4.5 22 4.5Z';
-const SWOOSH_D = 'M6.5 25.5c5.5 4.6 15 6.6 30.5-1.4';
-const RING = { cx: 22, cy: 18, r: 7.4, w: 3.4 };
+/* ------------------------------ png decode -------------------------------- */
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-/* --------------------------- path flattening ------------------------------- */
-const tokenise = (d) =>
-  d
-    .replace(/([MmZzLlHhVvCcSsQqTtAa])/g, ' $1 ')
-    .replace(/-/g, ' -')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean);
-
-const num = (t) => Number(t);
-
-/** Cubic sample. */
-const cubic = (p0, p1, p2, p3, t) => {
-  const m = 1 - t;
-  return {
-    x: m * m * m * p0.x + 3 * m * m * t * p1.x + 3 * m * t * t * p2.x + t * t * t * p3.x,
-    y: m * m * m * p0.y + 3 * m * m * t * p1.y + 3 * m * t * t * p2.y + t * t * t * p3.y,
-  };
-};
-
-/** SVG elliptical-arc endpoint -> centre parameterisation, sampled as a polyline. */
-function arcPoints(p0, rx, ry, rotDeg, largeArc, sweep, p1, steps = 24) {
-  if (rx === 0 || ry === 0) return [p1];
-  const phi = (rotDeg * Math.PI) / 180;
-  const cosP = Math.cos(phi);
-  const sinP = Math.sin(phi);
-  const dx = (p0.x - p1.x) / 2;
-  const dy = (p0.y - p1.y) / 2;
-  const x1p = cosP * dx + sinP * dy;
-  const y1p = -sinP * dx + cosP * dy;
-  let rx2 = rx * rx;
-  let ry2 = ry * ry;
-  const lambda = (x1p * x1p) / rx2 + (y1p * y1p) / ry2;
-  if (lambda > 1) {
-    const s = Math.sqrt(lambda);
-    rx *= s;
-    ry *= s;
-    rx2 = rx * rx;
-    ry2 = ry * ry;
-  }
-  const sign = largeArc === sweep ? -1 : 1;
-  const num0 = rx2 * ry2 - rx2 * y1p * y1p - ry2 * x1p * x1p;
-  const den = rx2 * y1p * y1p + ry2 * x1p * x1p;
-  const co = den === 0 ? 0 : sign * Math.sqrt(Math.max(0, num0 / den));
-  const cxp = (co * (rx * y1p)) / ry;
-  const cyp = (co * (-ry * x1p)) / rx;
-  const cx = cosP * cxp - sinP * cyp + (p0.x + p1.x) / 2;
-  const cy = sinP * cxp + cosP * cyp + (p0.y + p1.y) / 2;
-  const angle = (ux, uy, vx, vy) => {
-    const dot = ux * vx + uy * vy;
-    const len = Math.hypot(ux, uy) * Math.hypot(vx, vy);
-    let a = Math.acos(len === 0 ? 1 : Math.max(-1, Math.min(1, dot / len)));
-    if (ux * vy - uy * vx < 0) a = -a;
-    return a;
-  };
-  const th1 = angle(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
-  let dth = angle((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
-  if (!sweep && dth > 0) dth -= 2 * Math.PI;
-  if (sweep && dth < 0) dth += 2 * Math.PI;
-  const pts = [];
-  for (let i = 1; i <= steps; i++) {
-    const th = th1 + (dth * i) / steps;
-    const x = rx * Math.cos(th);
-    const y = ry * Math.sin(th);
-    pts.push({ x: cosP * x - sinP * y + cx, y: sinP * x + cosP * y + cy });
-  }
-  return pts;
+function paethPredictor(a, b, c) {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
 }
 
-/** Flatten a path `d` into a single polyline (the marks here are one contour each). */
-function flatten(d, seg = 40) {
-  const t = tokenise(d);
-  const pts = [];
-  let i = 0;
-  let cur = { x: 0, y: 0 };
-  let start = { x: 0, y: 0 };
-  let lastCubic = null;
-  let prevCmd = 'M';
-  const push = (p) => {
-    const prev = pts[pts.length - 1];
-    if (!prev || Math.hypot(prev.x - p.x, prev.y - p.y) > 1e-6) pts.push(p);
-  };
-  const take = (n) => t.slice(i, i + n).map(num);
+function decodePng(buf) {
+  if (buf.subarray(0, 8).compare(PNG_SIG) !== 0) {
+    throw new Error('Input is not a valid PNG file');
+  }
+  let pos = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  const idatChunks = [];
 
-  while (i < t.length) {
-    let cmd = t[i];
-    if (!/[A-Za-z]/.test(cmd)) {
-      /* Implicit repeat of the previous command (SVG allows this after C/c,
-       * and after M/m the repeats become lineTo). */
-      cmd = prevCmd === 'M' ? 'L' : prevCmd === 'm' ? 'l' : prevCmd;
-    } else {
-      i++;
-    }
-    const rel = cmd === cmd.toLowerCase();
-    const base = rel ? cur : { x: 0, y: 0 };
-    const lastCmd = cmd.toUpperCase();
-    prevCmd = cmd;
-
-    switch (lastCmd) {
-      case 'M': {
-        const [x, y] = take(2);
-        i += 2;
-        cur = { x: base.x + x, y: base.y + y };
-        start = cur;
-        push(cur);
-        break;
-      }
-      case 'L': {
-        const [x, y] = take(2);
-        i += 2;
-        cur = { x: base.x + x, y: base.y + y };
-        push(cur);
-        break;
-      }
-      case 'C': {
-        const [x1, y1, x2, y2, x, y] = take(6);
-        i += 6;
-        const p1 = { x: base.x + x1, y: base.y + y1 };
-        const p2 = { x: base.x + x2, y: base.y + y2 };
-        const p3 = { x: base.x + x, y: base.y + y };
-        for (let s = 1; s <= seg; s++) push(cubic(cur, p1, p2, p3, s / seg));
-        lastCubic = { p2, p3 };
-        cur = p3;
-        break;
-      }
-      case 'S': {
-        const [x2, y2, x, y] = take(4);
-        i += 4;
-        const p1 = lastCubic
-          ? { x: 2 * cur.x - lastCubic.p2.x, y: 2 * cur.y - lastCubic.p2.y }
-          : cur;
-        const p2 = { x: base.x + x2, y: base.y + y2 };
-        const p3 = { x: base.x + x, y: base.y + y };
-        for (let s = 1; s <= seg; s++) push(cubic(cur, p1, p2, p3, s / seg));
-        lastCubic = { p2, p3 };
-        cur = p3;
-        break;
-      }
-      case 'A': {
-        const [rx, ry, rot, laf, sf, x, y] = take(7);
-        i += 7;
-        const p1 = { x: base.x + x, y: base.y + y };
-        for (const p of arcPoints(cur, rx, ry, rot, !!Number(laf), !!Number(sf), p1)) push(p);
-        lastCubic = null;
-        cur = p1;
-        break;
-      }
-      case 'Z': {
-        cur = start;
-        push(cur);
-        break;
-      }
-      default:
-        throw new Error(`Unsupported path command: ${cmd}`);
+  while (pos < buf.length) {
+    const len = buf.readUInt32BE(pos);
+    const type = buf.subarray(pos + 4, pos + 8).toString('ascii');
+    const data = buf.subarray(pos + 8, pos + 8 + len);
+    pos += 12 + len;
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      bitDepth = data[8];
+      colorType = data[9];
+      interlace = data[12];
+    } else if (type === 'IDAT') {
+      idatChunks.push(data);
+    } else if (type === 'IEND') {
+      break;
     }
   }
-  return pts;
-}
 
-/* ------------------------------- painting --------------------------------- */
-const buf = new Float32Array(SIZE * SIZE * 4); /* RGBA, straight alpha */
-
-const over = (px, py, r, g, b, a) => {
-  if (a <= 0) return;
-  const k = (py * SIZE + px) * 4;
-  const sa = buf[k + 3];
-  const da = a + sa * (1 - a);
-  if (da === 0) return;
-  buf[k] = (r * a + buf[k] * sa * (1 - a)) / da;
-  buf[k + 1] = (g * a + buf[k + 1] * sa * (1 - a)) / da;
-  buf[k + 2] = (b * a + buf[k + 2] * sa * (1 - a)) / da;
-  buf[k + 3] = da;
-};
-
-const hex = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
-const lerp = (a, b, t) => a + (b - a) * t;
-const mixHex = (h1, h2, t) => {
-  const a = hex(h1);
-  const b = hex(h2);
-  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
-};
-
-/** objectBoundingBox linear gradient, as in the SVG defs. */
-function gradientFn(box, x1, y1, x2, y2, c1, c2) {
-  const ax = box.x + x1 * box.w;
-  const ay = box.y + y1 * box.h;
-  const bx = box.x + x2 * box.w;
-  const by = box.y + y2 * box.h;
-  const dx = bx - ax;
-  const dy = by - ay;
-  const len2 = dx * dx + dy * dy || 1;
-  return (x, y) => {
-    let t = ((x - ax) * dx + (y - ay) * dy) / len2;
-    t = Math.max(0, Math.min(1, t));
-    return mixHex(c1, c2, t);
-  };
-}
-
-const bboxOf = (pts) => {
-  let x0 = Infinity;
-  let y0 = Infinity;
-  let x1 = -Infinity;
-  let y1 = -Infinity;
-  for (const p of pts) {
-    x0 = Math.min(x0, p.x);
-    y0 = Math.min(y0, p.y);
-    x1 = Math.max(x1, p.x);
-    y1 = Math.max(y1, p.y);
+  if (bitDepth !== 8 || interlace !== 0 || (colorType !== 2 && colorType !== 6)) {
+    throw new Error(`Unsupported PNG format: bitDepth=${bitDepth}, colorType=${colorType}, interlace=${interlace}`);
   }
-  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0, x1, y1 };
-};
 
-const SS = 3; /* supersamples per axis */
-const toPx = (v) => (v / VB) * SIZE; /* viewBox units -> pixels */
+  const bpp = colorType === 6 ? 4 : 3;
+  const stride = width * bpp;
+  const raw = inflateSync(Buffer.concat(idatChunks));
+  const recon = new Uint8Array(height * stride);
 
-/** Anti-aliased scanline fill of a closed polygon (nonzero winding). */
-function fillPolygon(pts, paint) {
-  const box = bboxOf(pts);
-  const pad = 0.6;
-  const yTop = Math.max(0, Math.floor(toPx(box.y - pad)));
-  const yBot = Math.min(SIZE - 1, Math.ceil(toPx(box.y1 + pad)));
-  const n = pts.length;
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)];
+    const srcOff = y * (stride + 1) + 1;
+    const dstOff = y * stride;
+    const prevOff = (y - 1) * stride;
 
-  for (let py = yTop; py <= yBot; py++) {
-    for (let j = 0; j < SS; j++) {
-      const sy = ((py * SS + j) + 0.5) / (SIZE * SS); /* 0..1 of canvas */
-      const y = sy * VB;
-      const xs = [];
-      for (let e = 0; e < n; e++) {
-        const a = pts[e];
-        const b = pts[(e + 1) % n];
-        if (a.y === b.y) continue;
-        if (y < Math.min(a.y, b.y) || y >= Math.max(a.y, b.y)) continue;
-        const t = (y - a.y) / (b.y - a.y);
-        xs.push({ x: a.x + t * (b.x - a.x), dir: b.y > a.y ? 1 : -1 });
+    for (let i = 0; i < stride; i++) {
+      const x = raw[srcOff + i];
+      const a = i >= bpp ? recon[dstOff + i - bpp] : 0;
+      const b = y > 0 ? recon[prevOff + i] : 0;
+      const c = y > 0 && i >= bpp ? recon[prevOff + i - bpp] : 0;
+      let val = x;
+      if (filter === 1) val = (x + a) & 0xff;
+      else if (filter === 2) val = (x + b) & 0xff;
+      else if (filter === 3) val = (x + ((a + b) >> 1)) & 0xff;
+      else if (filter === 4) val = (x + paethPredictor(a, b, c)) & 0xff;
+      recon[dstOff + i] = val;
+    }
+  }
+
+  const rgba = new Uint8Array(width * height * 4);
+  if (colorType === 6) {
+    rgba.set(recon);
+  } else {
+    for (let p = 0; p < width * height; p++) {
+      rgba[p * 4] = recon[p * 3];
+      rgba[p * 4 + 1] = recon[p * 3 + 1];
+      rgba[p * 4 + 2] = recon[p * 3 + 2];
+      rgba[p * 4 + 3] = 255;
+    }
+  }
+  return { width, height, colorType, rgba };
+}
+
+/* ------------------------ exterior badge extraction ----------------------- */
+function extractCircularBadge(img) {
+  const { width: w, height: h, rgba: src } = img;
+  // If corners are already transparent, preserve existing alpha as-is.
+  const cornersOpaqueLight = [0, w - 1, (h - 1) * w, (h - 1) * w + (w - 1)].every((idx) => {
+    const a = src[idx * 4 + 3];
+    const mn = Math.min(src[idx * 4], src[idx * 4 + 1], src[idx * 4 + 2]);
+    return a === 255 && mn >= 200;
+  });
+  if (!cornersOpaqueLight) return img;
+
+  const total = w * h;
+  const ext = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  let qHead = 0;
+  let qTail = 0;
+
+  for (const [sx, sy] of [
+    [0, 0],
+    [w - 1, 0],
+    [0, h - 1],
+    [w - 1, h - 1],
+  ]) {
+    const idx = sy * w + sx;
+    ext[idx] = 1;
+    queue[qTail++] = idx;
+  }
+
+  const dirs4 = [-1, 1, -w, w];
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
+    const x = idx % w;
+    const y = (idx - x) / w;
+    for (let k = 0; k < 4; k++) {
+      const nx = k === 0 ? x - 1 : k === 1 ? x + 1 : x;
+      const ny = k === 2 ? y - 1 : k === 3 ? y + 1 : y;
+      if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+      const nidx = ny * w + nx;
+      if (ext[nidx]) continue;
+      const i4 = nidx * 4;
+      const r = src[i4];
+      const g = src[i4 + 1];
+      const b = src[i4 + 2];
+      const mn = Math.min(r, g, b);
+      const mx = Math.max(r, g, b);
+      if (mn >= 180 && mx - mn <= 30) {
+        ext[nidx] = 1;
+        queue[qTail++] = nidx;
       }
-      if (!xs.length) continue;
-      xs.sort((p, q) => p.x - q.x);
+    }
+  }
 
-      /* nonzero winding: walk crossings, track winding, emit covered spans */
-      let winding = 0;
-      let spanStart = null;
-      for (const c of xs) {
-        const before = winding;
-        winding += c.dir;
-        if (before === 0 && winding !== 0) spanStart = c.x;
-        else if (before !== 0 && winding === 0 && spanStart !== null) {
-          emitSpan(py, j, spanStart, c.x, paint, y);
-          spanStart = null;
+  const dist = new Uint8Array(total);
+  dist.fill(99);
+  qHead = 0;
+  qTail = 0;
+
+  for (let idx = 0; idx < total; idx++) {
+    if (!ext[idx]) continue;
+    dist[idx] = 0;
+    const x = idx % w;
+    const y = (idx - x) / w;
+    if (
+      (x > 0 && !ext[idx - 1]) ||
+      (x + 1 < w && !ext[idx + 1]) ||
+      (y > 0 && !ext[idx - w]) ||
+      (y + 1 < h && !ext[idx + w])
+    ) {
+      queue[qTail++] = idx;
+    }
+  }
+
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
+    const d = dist[idx];
+    if (d >= 4) continue;
+    const x = idx % w;
+    const y = (idx - x) / w;
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = y + dy;
+      if (ny < 0 || ny >= h) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        if (nx < 0 || nx >= w) continue;
+        const nidx = ny * w + nx;
+        if (dist[nidx] > d + 1) {
+          dist[nidx] = d + 1;
+          queue[qTail++] = nidx;
         }
       }
     }
   }
-}
 
-function emitSpan(py, subRow, x0v, x1v, paint, y) {
-  const xf0 = toPx(x0v);
-  const xf1 = toPx(x1v);
-  const pxStart = Math.max(0, Math.floor(xf0));
-  const pxEnd = Math.min(SIZE - 1, Math.ceil(xf1) - 1);
-  const w = 1 / SS; /* this sub-row's vertical share of the pixel */
-  for (let px = pxStart; px <= pxEnd; px++) {
-    const cov = Math.max(0, Math.min(1, xf1 - px)) - Math.max(0, Math.min(1, xf0 - px));
-    if (cov <= 0) continue;
-    const x = ((px + 0.5) / SIZE) * VB;
-    const [r, g, b] = paint(x, y);
-    over(px, py, r, g, b, cov * w);
-  }
-}
+  const out = new Uint8Array(total * 4);
+  let minX = w;
+  let maxX = 0;
+  let minY = h;
+  let maxY = 0;
 
-/** Anti-aliased stroke by distance to a polyline, with round caps/joins. */
-function strokePolyline(pts, width, paint) {
-  const box = bboxOf(pts);
-  const pad = width / 2 + 0.6;
-  const half = width / 2;
-  const yTop = Math.max(0, Math.floor(toPx(box.y - pad)));
-  const yBot = Math.min(SIZE - 1, Math.ceil(toPx(box.y1 + pad)));
-  const xLeft = Math.max(0, Math.floor(toPx(box.x - pad)));
-  const xRight = Math.min(SIZE - 1, Math.ceil(toPx(box.x1 + pad)));
-  const segs = [];
-  for (let i = 0; i + 1 < pts.length; i++) segs.push([pts[i], pts[i + 1]]);
+  for (let idx = 0; idx < total; idx++) {
+    const d = dist[idx];
+    if (d === 0) continue;
+    const i4 = idx * 4;
+    const r = src[i4];
+    const g = src[i4 + 1];
+    const b = src[i4 + 2];
+    const x = idx % w;
+    const y = (idx - x) / w;
 
-  const distToSeg = (x, y, a, b) => {
-    const vx = b.x - a.x;
-    const vy = b.y - a.y;
-    const len2 = vx * vx + vy * vy;
-    let t = len2 === 0 ? 0 : ((x - a.x) * vx + (y - a.y) * vy) / len2;
-    t = Math.max(0, Math.min(1, t));
-    return Math.hypot(x - (a.x + t * vx), y - (a.y + t * vy));
-  };
-
-  for (let py = yTop; py <= yBot; py++) {
-    for (let px = xLeft; px <= xRight; px++) {
-      let hits = 0;
-      for (let j = 0; j < SS; j++) {
-        for (let i = 0; i < SS; i++) {
-          const x = (((px * SS + i) + 0.5) / (SIZE * SS)) * VB;
-          const y = (((py * SS + j) + 0.5) / (SIZE * SS)) * VB;
-          let d = Infinity;
-          for (const [a, b] of segs) {
-            const dd = distToSeg(x, y, a, b);
-            if (dd < d) d = dd;
-            if (d < half - 0.35) break; /* well inside: stop early */
+    if (d <= 2) {
+      let bestD2 = 999;
+      let fr = r;
+      let fg = g;
+      let fb = b;
+      for (let dy = -4; dy <= 4; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= h) continue;
+        for (let dx = -4; dx <= 4; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= w) continue;
+          const nidx = ny * w + nx;
+          if (dist[nidx] >= 3) {
+            const dd2 = dx * dx + dy * dy;
+            if (dd2 < bestD2) {
+              bestD2 = dd2;
+              fr = src[nidx * 4];
+              fg = src[nidx * 4 + 1];
+              fb = src[nidx * 4 + 2];
+            }
           }
-          if (d <= half) hits++;
         }
       }
-      if (!hits) continue;
-      const x = ((px + 0.5) / SIZE) * VB;
-      const y = ((py + 0.5) / SIZE) * VB;
-      const [r, g, b] = paint(x, y);
-      over(px, py, r, g, b, hits / (SS * SS));
-    }
-  }
-}
-
-/* ------------------------------- the mark ---------------------------------- */
-const pin = flatten(PIN_D, 48);
-const swoosh = flatten(SWOOSH_D, 48);
-const pinBox = bboxOf(pin);
-const swooshBox = bboxOf(swoosh);
-
-const pinPaint = gradientFn(pinBox, 0, 0, 1, 1, '#24467f', '#0f2a55');
-const swooshPaint = gradientFn(swooshBox, 0, 0, 1, 0, '#ff9a3d', '#ef6c0a');
-
-/* 1. navy pin */
-fillPolygon(pin, pinPaint);
-
-/* 2. white ring (analytic annulus, supersampled) */
-{
-  const inner = RING.r - RING.w / 2;
-  const outer = RING.r + RING.w / 2;
-  const yTop = Math.max(0, Math.floor(toPx(RING.cy - outer - 0.6)));
-  const yBot = Math.min(SIZE - 1, Math.ceil(toPx(RING.cy + outer + 0.6)));
-  const xLeft = Math.max(0, Math.floor(toPx(RING.cx - outer - 0.6)));
-  const xRight = Math.min(SIZE - 1, Math.ceil(toPx(RING.cx + outer + 0.6)));
-  for (let py = yTop; py <= yBot; py++) {
-    for (let px = xLeft; px <= xRight; px++) {
-      let hits = 0;
-      for (let j = 0; j < SS; j++) {
-        for (let i = 0; i < SS; i++) {
-          const x = (((px * SS + i) + 0.5) / (SIZE * SS)) * VB;
-          const y = (((py * SS + j) + 0.5) / (SIZE * SS)) * VB;
-          const d = Math.hypot(x - RING.cx, y - RING.cy);
-          if (d >= inner && d <= outer) hits++;
+      const wr = 255 - r;
+      const wg = 255 - g;
+      const wb = 255 - b;
+      const vr = 255 - fr;
+      const vg = 255 - fg;
+      const vb = 255 - fb;
+      const denom = vr * vr + vg * vg + vb * vb;
+      let alpha = denom < 100 ? 0 : (wr * vr + wg * vg + wb * vb) / denom;
+      alpha = Math.max(0, Math.min(1, (alpha - 0.08) / 0.92));
+      const fa = Math.round(alpha * 255);
+      if (fa > 0) {
+        out[i4] = fr;
+        out[i4 + 1] = fg;
+        out[i4 + 2] = fb;
+        out[i4 + 3] = fa;
+        if (fa > 16) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
         }
       }
-      if (hits) over(px, py, 255, 255, 255, hits / (SS * SS));
+    } else {
+      out[i4] = r;
+      out[i4 + 1] = g;
+      out[i4 + 2] = b;
+      out[i4 + 3] = 255;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
     }
   }
+
+  const bw = maxX - minX + 1;
+  const bh = maxY - minY + 1;
+  const side = Math.max(bw, bh) + 12;
+  const ox = Math.round(side / 2 - (minX + maxX) / 2);
+  const oy = Math.round(side / 2 - (minY + maxY) / 2);
+  const sq = new Uint8Array(side * side * 4);
+
+  for (let y = minY; y <= maxY; y++) {
+    const dy = y + oy;
+    if (dy < 0 || dy >= side) continue;
+    for (let x = minX; x <= maxX; x++) {
+      const dx = x + ox;
+      if (dx < 0 || dx >= side) continue;
+      const si = (y * w + x) * 4;
+      const di = (dy * side + dx) * 4;
+      sq[di] = out[si];
+      sq[di + 1] = out[si + 1];
+      sq[di + 2] = out[si + 2];
+      sq[di + 3] = out[si + 3];
+    }
+  }
+
+  return { width: side, height: side, colorType: 6, rgba: sq };
 }
 
-/* 3. marigold swoosh */
-strokePolyline(swoosh, 3.6, swooshPaint);
+/* --------------------- premultiplied lanczos-2 resize --------------------- */
+function lanczos2(x) {
+  if (x === 0) return 1;
+  if (Math.abs(x) >= 2) return 0;
+  const px = Math.PI * x;
+  return (Math.sin(px) / px) * (Math.sin(px / 2) / (px / 2));
+}
+
+function resizeRgba(src, sw, sh, dw, dh) {
+  if (sw === dw && sh === dh) return new Uint8Array(src);
+  const scaleX = sw / dw;
+  const scaleY = sh / dh;
+  const supX = 2 * Math.max(1, scaleX);
+  const supY = 2 * Math.max(1, scaleY);
+
+  const hWeights = Array.from({ length: dw }, (_, dx) => {
+    const cx = (dx + 0.5) * scaleX - 0.5;
+    const left = Math.max(0, Math.floor(cx - supX));
+    const right = Math.min(sw - 1, Math.ceil(cx + supX));
+    const wts = [];
+    let sum = 0;
+    for (let sx = left; sx <= right; sx++) {
+      const wt = lanczos2((sx - cx) / Math.max(1, scaleX));
+      wts.push([sx * 4, wt]);
+      sum += wt;
+    }
+    return wts.map(([off, wt]) => [off, wt / sum]);
+  });
+
+  const tmp = new Float32Array(sh * dw * 4);
+  for (let sy = 0; sy < sh; sy++) {
+    const rowOff = sy * sw * 4;
+    const outRow = sy * dw * 4;
+    for (let dx = 0; dx < dw; dx++) {
+      let pr = 0;
+      let pg = 0;
+      let pb = 0;
+      let pa = 0;
+      for (const [off, wt] of hWeights[dx]) {
+        const i = rowOff + off;
+        const a = src[i + 3] / 255;
+        if (a > 0) {
+          pr += src[i] * a * wt;
+          pg += src[i + 1] * a * wt;
+          pb += src[i + 2] * a * wt;
+          pa += a * wt;
+        }
+      }
+      const o = outRow + dx * 4;
+      tmp[o] = pr;
+      tmp[o + 1] = pg;
+      tmp[o + 2] = pb;
+      tmp[o + 3] = pa;
+    }
+  }
+
+  const vWeights = Array.from({ length: dh }, (_, dy) => {
+    const cy = (dy + 0.5) * scaleY - 0.5;
+    const top = Math.max(0, Math.floor(cy - supY));
+    const bot = Math.min(sh - 1, Math.ceil(cy + supY));
+    const wts = [];
+    let sum = 0;
+    for (let sy = top; sy <= bot; sy++) {
+      const wt = lanczos2((sy - cy) / Math.max(1, scaleY));
+      wts.push([sy * dw * 4, wt]);
+      sum += wt;
+    }
+    return wts.map(([off, wt]) => [off, wt / sum]);
+  });
+
+  const out = new Uint8Array(dw * dh * 4);
+  for (let dy = 0; dy < dh; dy++) {
+    const outRow = dy * dw * 4;
+    for (let dx = 0; dx < dw; dx++) {
+      let pr = 0;
+      let pg = 0;
+      let pb = 0;
+      let pa = 0;
+      const col = dx * 4;
+      for (const [roff, wt] of vWeights[dy]) {
+        const i = roff + col;
+        pr += tmp[i] * wt;
+        pg += tmp[i + 1] * wt;
+        pb += tmp[i + 2] * wt;
+        pa += tmp[i + 3] * wt;
+      }
+      const o = outRow + col;
+      pa = Math.max(0, Math.min(1, pa));
+      if (pa >= 1 / 255) {
+        out[o] = Math.round(Math.max(0, Math.min(255, pr / pa)));
+        out[o + 1] = Math.round(Math.max(0, Math.min(255, pg / pa)));
+        out[o + 2] = Math.round(Math.max(0, Math.min(255, pb / pa)));
+        out[o + 3] = Math.round(pa * 255);
+      }
+    }
+  }
+  return out;
+}
 
 /* ----------------------------- png encoding ------------------------------- */
 const crcTable = (() => {
@@ -415,31 +439,46 @@ function encodePng(w, h, rgba) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
-  ihdr[8] = 8; /* bit depth */
-  ihdr[9] = 6; /* colour type: RGBA */
+  ihdr[8] = 8;
+  ihdr[9] = 6;
   const stride = w * 4;
   const raw = Buffer.alloc((stride + 1) * h);
   for (let y = 0; y < h; y++) {
-    raw[y * (stride + 1)] = 0; /* filter: none */
-    rgba.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride);
+    const rowOff = y * stride;
+    const dstOff = y * (stride + 1);
+    raw[dstOff] = 1; // Sub filter
+    for (let i = 0; i < stride; i++) {
+      const left = i >= 4 ? rgba[rowOff + i - 4] : 0;
+      raw[dstOff + 1 + i] = (rgba[rowOff + i] - left) & 0xff;
+    }
   }
   return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    PNG_SIG,
     chunk('IHDR', ihdr),
     chunk('IDAT', deflateSync(raw, { level: 9 })),
     chunk('IEND', Buffer.alloc(0)),
   ]);
 }
 
-const rgba = Buffer.alloc(SIZE * SIZE * 4);
-for (let i = 0; i < SIZE * SIZE; i++) {
-  const a = buf[i * 4 + 3];
-  rgba[i * 4] = Math.round(Math.max(0, Math.min(255, buf[i * 4])));
-  rgba[i * 4 + 1] = Math.round(Math.max(0, Math.min(255, buf[i * 4 + 1])));
-  rgba[i * 4 + 2] = Math.round(Math.max(0, Math.min(255, buf[i * 4 + 2])));
-  rgba[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, a)) * 255);
-}
+/* ---------------------------------- run ----------------------------------- */
+const decoded = decodePng(readFileSync(IN));
+const badge = extractCircularBadge(decoded);
+const resized = resizeRgba(badge.rgba, badge.width, badge.height, SIZE, SIZE);
+const pngBytes = encodePng(SIZE, SIZE, resized);
 
 mkdirSync(dirname(OUT), { recursive: true });
-writeFileSync(OUT, encodePng(SIZE, SIZE, rgba));
-process.stdout.write(`wrote ${OUT} (${SIZE}x${SIZE}, ${rgba.length} bytes raw)\n`);
+writeFileSync(OUT, pngBytes);
+process.stdout.write(`wrote ${OUT} (${SIZE}x${SIZE}, ${pngBytes.length} bytes)\n`);
+
+if (WRITE_SVG) {
+  const svgRgba = resizeRgba(badge.rgba, badge.width, badge.height, SVG_SIZE, SVG_SIZE);
+  const svgPng = encodePng(SVG_SIZE, SVG_SIZE, svgRgba);
+  const b64 = svgPng.toString('base64');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${SVG_SIZE} ${SVG_SIZE}" width="44" height="44" role="img" aria-label="NearBuy">
+  <image width="${SVG_SIZE}" height="${SVG_SIZE}" href="data:image/png;base64,${b64}"/>
+</svg>
+`;
+  mkdirSync(dirname(SVG_OUT), { recursive: true });
+  writeFileSync(SVG_OUT, svg);
+  process.stdout.write(`wrote ${SVG_OUT} (${SVG_SIZE}x${SVG_SIZE} embedded, ${svg.length} bytes)\n`);
+}

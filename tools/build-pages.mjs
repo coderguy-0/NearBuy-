@@ -14,15 +14,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-const MARK = `<svg viewBox="0 0 44 44" aria-hidden="true">
-    <defs>
-      <linearGradient id="mk" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3a63a6"/><stop offset="1" stop-color="#0f2a55"/></linearGradient>
-      <linearGradient id="sw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffb066"/><stop offset="1" stop-color="#f47718"/></linearGradient>
-    </defs>
-    <path d="M22 4.5c-7.7 0-14 6.1-14 13.6 0 9.6 11 20.4 13.3 22.4a1 1 0 0 0 1.4 0C25 38.5 36 27.7 36 18.1 36 10.6 29.7 4.5 22 4.5Z" fill="url(#mk)"/>
-    <circle cx="22" cy="18" r="7.4" fill="none" stroke="#fff" stroke-width="3.4"/>
-    <path d="M6.5 25.5c5.5 4.6 15 6.6 30.5-1.4" fill="none" stroke="url(#sw)" stroke-width="3.6" stroke-linecap="round"/>
-  </svg>`;
+const MARK = `<img src="/public/assets/nearbuy-logo.png" width="88" height="88" alt="NearBuy" decoding="async" />`;
 
 /* One entry per clean URL that must exist. */
 const DOORS = [
@@ -159,7 +151,8 @@ ${d.noindex ? '<meta name="robots" content="noindex" />\n' : ''}<meta name="them
     padding: 40px 36px; text-align: center;
     box-shadow: 0 30px 70px rgba(12, 26, 51, .14);
   }
-  .mark { width: 62px; height: 62px; margin: 0 auto 16px; display: block; }
+  .mark { width: 88px; height: 88px; margin: 0 auto 16px; display: block; filter: drop-shadow(0 10px 22px rgba(12, 26, 51, .14)); }
+  .mark img, .mark svg { width: 100%; height: 100%; display: block; object-fit: contain; }
   .kicker {
     display: inline-flex; align-items: center; gap: 8px; margin-bottom: 14px;
     font: 700 11px/1 'Manrope', system-ui, sans-serif; letter-spacing: .14em; text-transform: uppercase;

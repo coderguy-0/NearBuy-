@@ -79,7 +79,7 @@ const notFoundHtml = `<!doctype html>
     font: 400 16px/1.6 'DM Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   }
   main { max-width: 560px; text-align: center; }
-  .mark { width: 72px; height: 72px; margin: 0 auto 18px; display: block; }
+  .mark { width: 88px; height: 88px; margin: 0 auto 18px; display: block; object-fit: contain; filter: drop-shadow(0 10px 22px rgba(12, 26, 51, .14)); }
   h1 { font: 800 40px/1.1 'Manrope', ui-sans-serif, system-ui, sans-serif; color: #0c1a33; margin: 0 0 10px; }
   p { margin: 0 0 26px; color: #6f7b8f; }
   a.btn {
@@ -93,11 +93,7 @@ const notFoundHtml = `<!doctype html>
 </head>
 <body>
 <main>
-  <svg class="mark" viewBox="0 0 44 44" aria-hidden="true">
-    <path d="M22 4.5c-7.7 0-14 6.1-14 13.6 0 9.6 11 20.4 13.3 22.4a1 1 0 0 0 1.4 0C25 38.5 36 27.7 36 18.1 36 10.6 29.7 4.5 22 4.5Z" fill="#1b3a72"/>
-    <circle cx="22" cy="18" r="7.4" fill="none" stroke="#fff" stroke-width="3.4"/>
-    <path d="M6.5 25.5c5.5 4.6 15 6.6 30.5-1.4" fill="none" stroke="#f47718" stroke-width="3.6" stroke-linecap="round"/>
-  </svg>
+  <img class="mark" src="/public/assets/nearbuy-logo.png" width="88" height="88" alt="NearBuy" />
   <h1>This street isn&rsquo;t on our map.</h1>
   <p>The page <code id="path"></code> doesn&rsquo;t exist on NearBuy. Head back to the neighbourhood and pick a portal.</p>
   <a class="btn" href="/">Back to NearBuy home</a>
@@ -107,6 +103,16 @@ const notFoundHtml = `<!doctype html>
 </html>
 `;
 
+const BLOCKED_ROOTS = new Set([
+  'data',
+  'server',
+  'tools',
+  'tests',
+  'node_modules',
+  'package.json',
+  'package-lock.json'
+]);
+
 /** Map a request path to an absolute file path inside ROOT, or null when refused. */
 function resolvePath(urlPath) {
   let clean;
@@ -115,15 +121,17 @@ function resolvePath(urlPath) {
   } catch {
     return null;
   }
-  if (clean.includes('\0')) return null;
+  if (clean.includes('\0') || clean.includes('\\')) return null;
+
+  const segments = clean.split('/').filter(Boolean);
+  if (segments.some((seg) => seg.startsWith('.'))) return null;
+  if (segments.length > 0 && BLOCKED_ROOTS.has(segments[0].toLowerCase())) return null;
 
   if (clean === '/favicon.ico') clean = '/public/assets/nearbuy-logo.png';
 
   const rel = clean.replace(/^\/+/, '');
   const abs = path.resolve(ROOT, rel || '.');
   if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) return null;
-  const privateData = path.join(ROOT, 'data');
-  if (abs === privateData || abs.startsWith(privateData + path.sep)) return null;
   return abs;
 }
 
@@ -180,7 +188,15 @@ function redirect(res, to, code = 301) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if ((req.url || '').split('?')[0].startsWith('/api/')) { await orderApi.handle(req, res); return; }
+  try {
+    if ((req.url || '').split('?')[0].startsWith('/api/')) { await orderApi.handle(req, res); return; }
+  } catch {
+    if (!res.headersSent && !res.destroyed) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Internal server error' }));
+    }
+    return;
+  }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { Allow: 'GET, HEAD', 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Method not allowed');

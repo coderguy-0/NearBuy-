@@ -288,8 +288,8 @@ NearBuy One rebuilds them as **one product**:
 | Workspace | Who | What you can do |
 | --- | --- | --- |
 | **Shop** | Neighbour | Real shops, catalogue and stock, multi-shop cart, checkout with delivery or collection, order tracking, cancellation, account — at `/customer/` |
-| **Sell** | Green Basket Market | Accept real customer orders, prepare, mark ready, choose *deliver myself* or *find a runner*, edit catalogue & stock, promotions, payouts, insights, settings, team — plus the **Why Sell on NearBuy?** benefits band |
-| **Deliver** | Runner | Go online, accept/pass requests, shop arrival, pickup OTP, route, delivery OTP, earnings, preferences, safety reports — plus the **Why Become a NearBuy Delivery Partner?** band |
+| **Sell** | Green Basket Market | Accept real customer orders, prepare, mark ready, choose *assign a runner* or *deliver myself*, edit catalogue & stock with automatic order detection and restock on decline, promotions, payouts, insights, settings, team |
+| **Deliver** | Runner | Go online, accept or decline one request at a time, shop arrival, pickup OTP, route, delivery OTP, earnings, preferences, safety reports |
 | **Fleet** | Neighbourhood fleet lead | Team availability, work allocation, auto-match, reports, safety commitments |
 | **Ops** | South Delhi ops desk | Control tower, dispatch queue, **verification queue**, **homepage enquiry queue**, partner eligibility, service areas, pricing bands, incidents, audit log |
 
@@ -320,42 +320,28 @@ No workspace is a public portal. Any gated route withholds its module list, its 
 
 This is a browser-only demonstration of the model, not a security boundary: the checks run in the client, so production still needs server-side sessions, per-role permission checks on every sensitive action, and MFA for administrative roles.
 
-## Three benefits bands, one identity
+## Seller Hub and Runner home
 
-Each portal opens with its own benefits band, built from the same component — same card grid, same status/legend pattern, same closing banner — but speaking to its own side of the marketplace.
+Both signed-in workspaces open on their **working dashboard**, not a marketing band.
 
-| | Customer (`#/shop/home`) | Seller Hub (`#/sell/overview`) | Delivery Partner (`#/deliver/overview`) |
-| --- | --- | --- | --- |
-| Heading | **Why Use NearBuy?** | **Why Sell on NearBuy?** | **Why Become a NearBuy Delivery Partner?** |
-| Message | Your neighbourhood. Your favourite shops. Everything closer. | Grow your business with local customers | Your neighbourhood. Your delivery journey. |
-| Accent | Marigold on warm cream | Green on mint | Blue on pale blue |
-| Proof points | Nearby shops, local products, search, delivery or pickup, support local, choice, tracking, assistance | Reach customers, digital shop, catalogue, orders, delivery, promotion, insights, support | Nearby requests, flexible availability, transparent earnings, easy pickup, simple process, tracking, support, safety |
-| Ends with | Explore nearby shops · *Shop local. Shop smart. Shop NearBuy.* | Start selling on NearBuy | Join as Delivery Partner · see how earnings work |
+**Seller Hub (`#/sell/overview`)** opens with a *Delivery choice* panel under the KPI hero. Every delivery order carries the same two options:
 
-Each band links only to routes inside its own portal, and each states its limits plainly. The partner band also carries a four-step **How NearBuy Runner works** strip (register → receive requests → pick up and deliver → get paid) and says outright that there are no guaranteed orders, fixed earnings or speed incentives, that only verified adults aged 18+ are onboarded at launch, and that every request can be declined without penalty.
+| Option | Behaviour |
+| --- | --- |
+| **Option 1 · Assign a NearBuy Runner** | Creates a task in the shared delivery queue (`#/deliver/requests`) and moves the order to *Runner requested*. |
+| **Option 2 · Deliver it yourself** | Stamps the order as own-staff delivery, keeps it in this Seller Hub, and adds a single *Mark delivered* step. No runner payout. |
 
-## Selling on NearBuy — the benefits band
+The choice is stored on the order (`fulfilment`), so the orders table, the order modal and **Delivery & pickup** all show which way it is going, and the seller can switch before handover.
 
-The seller landing page (`#/sell/overview`) carries a **Why Sell on NearBuy?** section directly under the KPI hero: eight benefit cards, each with a real destination, a status label and a closing CTA that opens the seller registration flow.
+**Catalogue stock is automatic.** Each incoming order line is matched back to a catalogue product (`findProductForLine`) and the shop's *Stock detected automatically* panel shows the match. Stock falls on purchase, and declining or cancelling — from the **customer's** order page or the **seller's** — puts exactly that quantity back. Restocking is idempotent (`order.stockReturned`), so a double decline cannot inflate stock, and a runner *Cannot deliver* return restores the same way. The standalone `seller.html` hub mirrors all of this.
 
-Two rules are enforced in the copy, not just in review:
+**Runner home (`#/deliver/overview`)** opens with a *Delivery offer · one at a time* panel instead:
 
-- **No promises.** The band states plainly that there are no guaranteed sales, orders, commission or delivery, that delivery depends on an eligible partner being available, and that fees and settlement timing live in *Payments & earnings*.
-- **No dead claims.** Every card is labelled either **In demo** (it works in this prototype) or **Partly** (some of it is still planned — advertising products, a real human support desk, photo upload). Nothing is marked live that a reviewer cannot click.
+- One request is offered at a time, with **Accept this delivery** and **Decline · pass to another runner**.
+- **One delivery at a time is enforced** — `runnerQueue()` returns nothing while a task is active, `acceptTask()` refuses a second concurrent delivery, and the panel shows the live task above the next offer with a note that it unlocks after delivery.
+- Declining records the runner on `declinedBy`, keeps the task open for other partners, and carries no penalty.
 
-The section is NearBuy's own; it borrows the *structure* of marketplace seller pages, never their claims, and the Flipkart name appears nowhere in the product.
-
-### Monthly feature review
-
-Keep all three bands honest by reviewing them once a month against what actually ships:
-
-1. Re-read the eight cards on each band against the build; flip **Partly → In demo** only when the feature is genuinely clickable, and delete a card rather than overstate it.
-2. Compare the offer with nearby marketplaces (fees, payout timing, ad formats, support hours, catalogue limits, delivery windows) and record the differences — without importing their guarantees.
-3. Update *Payments & earnings* if commission or settlement timing changes, since the seller band points there for money questions.
-4. Re-walk the customer journeys the customer band claims — search, compare, checkout, pickup, tracking, help — and remove any claim the demo cannot demonstrate.
-5. **Delivery partner review (monthly):** compare nearby platforms' partner features, earnings models, verification requirements and safety systems; check that distance bands, payout timing and deductions still match what the app shows before a request is accepted, and that the safety centre is reachable from every delivery state.
-6. **Seller profile review (monthly):** re-check the four Manage profile modules against what NearBuy actually uses each field for, confirm the completion checks still mirror real requirements (not aspiration), and verify that bank, PAN, GSTIN and documents are still masked outside Seller Hub and Operations.
-7. Check all three honesty lines still match reality before publishing any new claim.
+The separate `whyUseSection()` band remains on the **customer** shop home only (`#/shop/home`), where it explains the product to a first-time visitor.
 
 ## Seller Hub · Manage profile
 
@@ -424,7 +410,7 @@ admin/                noindex signpost to the gated operations console
 portal.html           NearBuy One — the unified product shell
 nearbuy.css           product design system + every workspace style
 nearbuy.js            data, store, router, five workspaces, flows, modals
-classic.html · seller.html · partner.html · business.html · delivery-admin.html
+seller.html · partner.html · business.html · delivery-admin.html
                       earlier standalone pages (legacy, kept for reference)
 roadmap/              the 84-item feature checklist (selections persist per browser)
 fleet/ · control-tower/ · customer/login/
@@ -441,7 +427,7 @@ tests/                node:test regression suite over routes and assets (npm tes
 Nothing here is required to run the site; these exist so the committed output stays reproducible:
 
 ```bash
-node tools/render-logo.mjs          # public/assets/nearbuy-logo.png from the brand vector
+node tools/render-logo.mjs          # syncs public/assets/nearbuy-logo.png and delivery/logo.svg
 node tools/build-pages.mjs          # the portal front doors (customer/, seller/, runner/, …)
 node tools/build-public-pages.mjs   # about/ · help/ · roadmap/
 ```

@@ -324,8 +324,8 @@
   document.querySelectorAll('a[href^="#"]').forEach(function (link) {
     if (link.hasAttribute('data-tab-jump')) return;
     var id = link.getAttribute('href');
-    if (!id || id === '#') return;
-    var target = document.querySelector(id);
+    if (!id || id === '#' || id.charAt(0) !== '#') return;
+    var target = document.getElementById(id.slice(1));
     if (!target || target.id === 'chooser') return;
     link.addEventListener('click', function (event) {
       event.preventDefault();

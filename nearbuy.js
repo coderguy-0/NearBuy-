@@ -79,7 +79,9 @@ const PATHS = {
   book: '<path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17.5H6.5A2.5 2.5 0 0 0 4 22z"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>',
   leaf: '<path d="M20 4c-9 0-15 3.5-15 10a6 6 0 0 0 6 6c6.5 0 9-6 9-16z"/><path d="M4 21c2-5 6-9 12-12"/>',
   bread: '<path d="M5.5 12a5.5 5.5 0 0 1 1.1-10.3 5.8 5.8 0 0 1 10.8 0A5.5 5.5 0 0 1 18.5 12v6.5a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" transform="translate(0 1)"/>',
-  gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M5 12v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8"/><path d="M12 8v13"/><path d="M12 8S9.5 8 8.2 6.6a2.3 2.3 0 1 1 3.2-3.2C12 4.5 12 8 12 8z"/><path d="M12 8s2.5 0 3.8-1.4a2.3 2.3 0 1 0-3.2-3.2C12 4.5 12 8 12 8z"/>'
+  gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M5 12v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8"/><path d="M12 8v13"/><path d="M12 8S9.5 8 8.2 6.6a2.3 2.3 0 1 1 3.2-3.2C12 4.5 12 8 12 8z"/><path d="M12 8s2.5 0 3.8-1.4a2.3 2.3 0 1 0-3.2-3.2C12 4.5 12 8 12 8z"/>',
+  command: '<path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"/>',
+  key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8"/><path d="m17 6 3 3"/><path d="m14.5 8.5 2.5 2.5"/>'
 };
 function icon(name, cls = '') {
   const d = PATHS[name] || PATHS.grid;
@@ -312,7 +314,10 @@ const runnerById = (id) => state.runners.find((r) => r.id === id);
 const liveTasks = () => state.tasks.filter((t) => !['Delivered', 'Returned', 'Cancelled'].includes(t.status));
 const openOrders = () => myOrders().filter((o) => !['Delivered', 'Cancelled'].includes(o.status));
 const pendingSellerOrders = () => sellerOrders().filter((o) => ['New', 'Preparing'].includes(o.status));
-const runnerQueue = () => state.tasks.filter((t) => t.status === 'Requested' && !(t.skippedBy || []).includes(me().id) && t.distance <= me().maxKm);
+/* One delivery at a time: the queue is empty while the runner already holds a task. */
+const runnerQueue = () => activeDelivery()
+  ? []
+  : state.tasks.filter((t) => t.status === 'Requested' && !(t.skippedBy || []).includes(me().id) && !(t.declinedBy || []).includes(me().id) && t.distance <= me().maxKm);
 const myDeliveries = () => state.tasks.filter((t) => t.partnerId === me().id && t.status !== 'Requested');
 const activeDelivery = () => state.tasks.find((t) => t.partnerId === me().id && !['Delivered', 'Returned', 'Cancelled'].includes(t.status));
 const earningsFor = (runnerId) => sumBy(state.tasks.filter((t) => t.partnerId === runnerId && t.status === 'Delivered'), (t) => t.earned || t.payout);
@@ -557,13 +562,7 @@ function viewTitle() {
 }
 
 /* --------------------------------- chrome ---------------------------------- */
-const LOGO = `<svg class="mark" viewBox="0 0 44 44" aria-hidden="true">
-  <defs><linearGradient id="nbMark" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#24467f"/><stop offset="1" stop-color="#0f2a55"/></linearGradient>
-  <linearGradient id="nbSwoosh" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ff9a3d"/><stop offset="1" stop-color="#ef6c0a"/></linearGradient></defs>
-  <path d="M22 4.5c-7.7 0-14 6.1-14 13.6 0 9.6 11 20.4 13.3 22.4a1 1 0 0 0 1.4 0C25 38.5 36 27.7 36 18.1 36 10.6 29.7 4.5 22 4.5Z" fill="url(#nbMark)"/>
-  <circle cx="22" cy="18" r="7.4" fill="none" stroke="#fff" stroke-width="3.4"/>
-  <path d="M6.5 25.5c5.5 4.6 15 6.6 30.5-1.4" fill="none" stroke="url(#nbSwoosh)" stroke-width="3.6" stroke-linecap="round"/>
-</svg>`;
+const LOGO = `<img class="mark" src="/public/assets/nearbuy-logo.png" width="42" height="42" alt="" decoding="async" />`;
 
 function personaFor(surface) {
   switch (surface) {
@@ -603,7 +602,6 @@ function railHtml() {
     <div class="rail__scroll">${nav}</div>
     <div class="rail__foot">
       <button class="rail__link" data-act="sign-out">${icon('logout')}<span>Sign out</span></button>
-      <a class="rail__link" href="/classic.html">${icon('store')}<span>Classic storefront</span></a>
       <button class="rail__link" data-act="reset">${icon('refresh')}<span>Reset demo data</span></button>
       <div class="rail__badge"><b>Local demo.</b> Every order, task and payout is simulated in this browser. No real money or dispatch.</div>
     </div>
@@ -917,7 +915,7 @@ function paletteIndex() {
 function paletteMatches() {
   const q = (ui.palette?.q || '').trim().toLowerCase();
   const all = paletteIndex();
-  if (!q) return all.filter((i) => ['Go to Shop', 'Go to Sell', 'Go to Deliver', 'Go to Ops'].includes(i.group)).slice(0, 14);
+  if (!q) return all.filter((i) => i.group.startsWith('Go to ')).slice(0, 14);
   return all.filter((i) => `${i.label} ${i.sub} ${i.group}`.toLowerCase().includes(q)).slice(0, 12);
 }
 function paletteHtml() {
@@ -989,8 +987,12 @@ function stepper(steps, currentIndex) {
     <div class="stepper__step ${i < currentIndex ? 'done' : i === currentIndex ? 'now' : ''}"><i></i><small>${esc(s)}</small></div>`).join('')}</div>`;
 }
 function orderTimeline(order) {
+  if (order.status === 'Cancelled' || order.status === 'Returned') {
+    return `<div class="notice notice--plain">${icon('alert')}<span>Order ${esc(order.status.toLowerCase())}.</span></div>`;
+  }
   const steps = ['New', 'Preparing', 'Runner assigned', 'Out for delivery', 'Delivered'];
-  const idx = Math.max(0, steps.indexOf(order.status === 'Ready' ? 'Runner assigned' : order.status));
+  const mapped = ['Ready', 'Runner requested', 'Runner at shop'].includes(order.status) ? 'Runner assigned' : order.status;
+  const idx = Math.max(0, steps.indexOf(mapped));
   return stepper(['Placed', 'Preparing', order.method === 'Pickup' ? 'Ready' : 'Runner', order.method === 'Pickup' ? 'Pickup' : 'On the way', 'Delivered'], order.status === 'Delivered' ? 5 : clamp(idx, 1, 4));
 }
 
@@ -1777,8 +1779,8 @@ function orderCard(order) {
 }
 function shopOrders() {
   const orders = myOrders();
-  const live = orders.filter((o) => !['Delivered', 'Cancelled'].includes(o.status));
-  const past = orders.filter((o) => ['Delivered', 'Cancelled'].includes(o.status));
+  const live = orders.filter((o) => !['Delivered', 'Cancelled', 'Returned'].includes(o.status));
+  const past = orders.filter((o) => ['Delivered', 'Cancelled', 'Returned'].includes(o.status));
   return `<div class="page">
     ${pageHead('YOUR ORDERS', 'Orders & tracking', 'Follow every order from the shop shelf to your door.', `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="shop" data-view="explore">${icon('bag')} Shop again</button>`)}
     ${live.length ? subHead(`${live.length} order${live.length > 1 ? 's' : ''} in motion`, 'Live status, updated by the shop and runner workspaces.') : ''}
@@ -1810,7 +1812,7 @@ function shopOrder(id) {
             <button class="btn btn--ghost btn--sm btn--block" data-act="switch" data-surface="deliver" data-view="requests">${icon('truck')} See it in Deliver</button>
             <button class="btn btn--ghost btn--sm btn--block" data-act="switch" data-surface="ops" data-view="dispatch">${icon('shield')} See it in Ops</button>
           </div>` })}
-        ${order.status === 'New' || order.status === 'Preparing' ? `<section class="card card--pad"><h2 style="font-size:14px">Need to change something?</h2><p class="small muted mt-6">The shop has not handed this order over yet. In the demo you can cancel it and it will update everywhere.</p><button class="btn btn--danger btn--sm btn--block mt-10" data-act="cancel-order" data-id="${order.id}">${icon('x')} Cancel this order</button></section>` : ''}
+        ${order.status === 'New' || order.status === 'Preparing' || order.status === 'Ready' ? `<section class="card card--pad"><h2 style="font-size:14px">Decline this order?</h2><p class="small muted mt-6">You can still decline before it is handed over. Every item goes straight back into the shop's catalogue stock, whichever side calls it off.</p><button class="btn btn--danger btn--sm btn--block mt-10" data-act="cancel-order" data-id="${order.id}">${icon('x')} Decline this order</button></section>` : ''}
         ${card({ body: `<div class="row gap-8 small"><span class="kpi__icon">${icon('help')}</span><div><b>Need help with this order?</b><div class="tiny muted">A demo support note can be saved in your account.</div></div></div><button class="btn btn--soft btn--sm btn--block mt-10" data-act="nav" data-surface="shop" data-view="help">Open help centre</button>` })}
       </aside>
     </div>
@@ -1921,9 +1923,25 @@ function sellerNextAction(o) {
   if (o.status === 'New') return { label: 'Accept order', act: 'accept-order', icon: 'check' };
   if (o.status === 'Preparing') return { label: 'Mark ready', act: 'ready-order', icon: 'checkCircle' };
   if (o.status === 'Ready' && o.method === 'Pickup') return { label: 'Mark collected', act: 'collect-order', icon: 'bag' };
-  if (o.status === 'Ready' && o.method === 'Delivery' && !o.taskId) return { label: 'Request runner', act: 'request-runner', icon: 'truck' };
+  if (o.status === 'Ready' && o.method === 'Delivery' && fulfilmentOf(o) === 'self') return { label: 'Mark delivered', act: 'deliver-order', icon: 'checkCircle' };
+  if (o.status === 'Ready' && o.method === 'Delivery' && fulfilmentOf(o) !== 'runner') return { label: 'Assign runner', act: 'request-runner', icon: 'truck' };
   if (o.status === 'Runner requested') return { label: 'Awaiting runner', act: '', icon: 'clock' };
+  if (o.status === 'Out for delivery' && fulfilmentOf(o) === 'self') return { label: 'Mark delivered', act: 'deliver-order', icon: 'checkCircle' };
   return { label: 'View order', act: 'view-order', icon: 'eye' };
+}
+function orderRowsActions(o, action) {
+  const primary = action.act && action.act !== 'view-order'
+    ? `<button class="btn btn--${['accept-order', 'ready-order'].includes(action.act) ? 'primary' : 'ghost'} btn--xs" data-act="${action.act}" data-id="${o.id}">${icon(action.icon, 'sm')} ${action.label}</button>`
+    : `<span class="tiny muted">${action.label}</span>`;
+  const isOpenDelivery = o.method === 'Delivery' && !['Delivered', 'Cancelled', 'Returned'].includes(o.status);
+  const choice = isOpenDelivery && fulfilmentOf(o) === 'self'
+    ? `<button class="btn btn--ghost btn--xs" data-act="request-runner" data-id="${o.id}">${icon('truck', 'sm')} Assign runner</button>`
+    : isOpenDelivery && fulfilmentOf(o) === 'runner'
+      ? `<button class="btn btn--ghost btn--xs" data-act="own-delivery" data-id="${o.id}">${icon('store', 'sm')} Deliver myself</button>`
+      : isOpenDelivery
+        ? `<button class="btn btn--ghost btn--xs" data-act="own-delivery" data-id="${o.id}">${icon('store', 'sm')} Deliver myself</button>`
+        : '';
+  return `${primary}${choice}<button class="btn btn--ghost btn--xs" data-act="view-order" data-id="${o.id}" aria-label="View order">${icon('eye', 'sm')}</button>`;
 }
 function orderRow(o, showCustomer = true) {
   const action = sellerNextAction(o);
@@ -1932,10 +1950,16 @@ function orderRow(o, showCustomer = true) {
     <td><b>${esc(o.id)}</b><small>${esc(o.placed)}</small></td>
     ${showCustomer ? `<td><div class="cell-item"><span class="table__thumb">${icon('user')}</span><div><b>${esc(o.customer)}</b><small>${esc(o.area)}</small></div></div></td>` : ''}
     <td><div class="order-mini">${o.items.slice(0, 3).map((i) => `<span class="${i.tone}">${i.emoji}</span>`).join('')}${o.items.length > 3 ? `<span style="background:none;font-size:10px;color:var(--muted)">+${o.items.length - 3}</span>` : ''}</div></td>
-    <td>${pill(o.method === 'Pickup' ? 'Pickup' : (task ? `Runner · ${task.partnerName ? task.partnerName.split(' ')[0] : 'unassigned'}` : 'Runner delivery'), o.method === 'Pickup' ? 'neutral' : 'blue')}</td>
+    <td>${o.method === 'Pickup'
+      ? pill('Pickup', 'neutral')
+      : fulfilmentOf(o) === 'self'
+        ? pill('Own delivery', 'violet')
+        : fulfilmentOf(o) === 'runner'
+          ? pill(task ? `Runner · ${task.partnerName ? task.partnerName.split(' ')[0] : 'unassigned'}` : 'Runner assigned', 'blue')
+          : pill('Choose runner / self', 'amber')}</td>
     <td class="nowrap"><b>${money(o.total)}</b></td>
     <td>${statusPill(orderStatusLabel(o))}</td>
-    <td><div class="actions">${action.act ? `<button class="btn btn--${action.act === 'accept-order' || action.act === 'ready-order' ? 'primary' : 'ghost'} btn--xs" data-act="${action.act}" data-id="${o.id}">${icon(action.icon, 'sm')} ${action.label}</button>` : `<span class="tiny muted">${action.label}</span>`}<button class="btn btn--ghost btn--xs" data-act="view-order" data-id="${o.id}" aria-label="View order">${icon('eye', 'sm')}</button></div></td>
+    <td><div class="actions">${orderRowsActions(o, action)}</div></td>
   </tr>`;
 }
 function sellerOrderFilter() { return ui.orderFilter || 'Active'; }
@@ -1954,7 +1978,7 @@ function sellOverview() {
       ${kpi({ label: 'Next payout', value: money(4820), icon: 'wallet', delta: 'Fri', dir: 'flat', foot: 'settlement due' })}
     </div>
 
-    ${whySellSection()}
+    ${sellFulfilmentPanel()}
 
     <div class="grid grid--main mb-18">
       <section class="card card--flush">
@@ -1965,7 +1989,7 @@ function sellOverview() {
         </table></div>
       </section>
       <div class="stack">
-        ${card({ title: 'Runner network', sub: 'Requests from this shop', action: `<button class="link" data-act="nav" data-surface="deliver" data-view="requests">Open Deliver ${icon('arrowUpRight')}</button>`, body: `<div class="stack-sm">${state.tasks.filter((t) => t.shopId === SELLER.shopId && t.status !== 'Delivered').slice(0, 3).map((t) => `<div class="task-card ${t.status !== 'Requested' ? 'task-card--live' : ''}" style="padding:11px 12px">
+        ${card({ title: 'Runner network', sub: 'Requests from this shop', action: `<button class="link" data-act="switch" data-surface="deliver" data-view="requests">Open Deliver ${icon('arrowUpRight')}</button>`, body: `<div class="stack-sm">${state.tasks.filter((t) => t.shopId === SELLER.shopId && t.status !== 'Delivered').slice(0, 3).map((t) => `<div class="task-card ${t.status !== 'Requested' ? 'task-card--live' : ''}" style="padding:11px 12px">
             <div class="task-card__top"><span class="task-card__id">${esc(t.id)}</span>${statusPill(t.status)}</div>
             <div class="tiny muted">${esc(t.customer)} · ${esc(t.area)} · ${t.distance} km</div>
             <div class="task-card__foot" style="padding-top:6px"><span class="tiny">${t.partnerName ? `${icon('user', 'sm')} ${esc(t.partnerName)}` : `<span class="muted">No partner yet</span>`}</span><b class="small">${money(t.payout)}</b></div>
@@ -2002,44 +2026,61 @@ function sellOverview() {
     </section>
   </div>`;
 }
-/* ---- "Why Sell on NearBuy?" — benefits band on the Seller Hub landing ---- */
-const WHY_SELL = [
-  { icon: 'pin', title: 'Reach nearby customers', copy: 'Your shop appears to neighbours inside your serviceable radius — the street, not the whole city.', state: 'In demo', view: 'settings', link: 'Set your radius' },
-  { icon: 'store', title: 'Your digital shop', copy: 'A storefront for your physical shop: timings, fulfilment modes, ratings and shop details.', state: 'In demo', view: 'settings', link: 'Open shop settings' },
-  { icon: 'package', title: 'Easy catalogue management', copy: 'Add products with price, MRP, stock and category. Photo upload is a labelled placeholder here.', state: 'In demo', view: 'catalogue', link: 'Manage catalogue' },
-  { icon: 'clipboard', title: 'Manage orders easily', copy: 'View, accept, prepare and track every order — pickup or runner delivery — from one queue.', state: 'In demo', view: 'orders', link: 'Open orders' },
-  { icon: 'truck', title: 'Delivery support', copy: 'Request a nearby NearBuy Runner for eligible short-distance deliveries, when a partner is available.', state: 'In demo', view: 'delivery', link: 'Delivery & pickup' },
-  { icon: 'megaphone', title: 'Promote your shop', copy: 'Run a storefront coupon and see clearly which placements are paid. Advertising products are not built yet.', state: 'Partly', view: 'promotions', link: 'Open promotions' },
-  { icon: 'chart', title: 'Business insights', copy: 'Watch orders, sales, product performance and restock alerts — sample figures in this prototype.', state: 'In demo', view: 'insights', link: 'View insights' },
-  { icon: 'help', title: 'Seller support', copy: 'Guided onboarding, an academy and a help centre. A real human support desk is not connected yet.', state: 'Partly', view: 'support', link: 'Visit the academy' }
-];
-
-function whySellSection() {
-  return `<section class="why-sell" aria-labelledby="whySellTitle">
-    <div class="why-sell__head">
-      <div class="why-sell__copy">
-        <span class="kicker kicker--sell"><i></i>WHY SELL ON NEARBUY?</span>
-        <h2 id="whySellTitle">Grow your local business. Reach more customers. Sell smarter with NearBuy.</h2>
-        <p>Your shop deserves to be discovered. Join the local commerce network that brings neighbourhood shops and nearby customers together.</p>
+/* ---- Delivery choice — every delivery order is either runner-assigned or self-delivered ---- */
+function fulfilmentOf(o) {
+  if (o.method !== 'Delivery') return 'pickup';
+  return o.fulfilment || (o.taskId ? 'runner' : '');
+}
+function openDeliveryOrders() {
+  return sellerOrders().filter((o) => o.method === 'Delivery' && !['Delivered', 'Cancelled', 'Returned'].includes(o.status));
+}
+function sellFulfilmentPanel() {
+  const open = openDeliveryOrders();
+  const undecided = open.filter((o) => !fulfilmentOf(o));
+  const withRunner = open.filter((o) => fulfilmentOf(o) === 'runner');
+  const own = open.filter((o) => fulfilmentOf(o) === 'self');
+  return `<section class="card card--pad mb-18 fulfil-panel" aria-labelledby="fulfilTitle">
+    <div class="between wrap mb-14">
+      <div>
+        <span class="kicker kicker--sell"><i></i>DELIVERY CHOICE</span>
+        <h2 id="fulfilTitle" style="font-size:17px;margin-top:6px">Assign a runner, or deliver it yourself.</h2>
+        <p class="tiny muted" style="margin-top:4px">Every delivery order gives the shop the same two options. Choose one per order — you can still switch before handover.</p>
       </div>
-      <div class="why-sell__actions">
-        <button class="btn btn--primary btn--sm" data-act="nav" data-surface="sell" data-view="register">${icon('store')} Start selling on NearBuy</button>
-        <span class="tiny muted">Already a seller? You are signed in as Green Basket Market.</span>
-      </div>
+      ${pill(`${undecided.length} awaiting a choice`, undecided.length ? 'amber' : 'green')}
     </div>
-    <div class="why-grid">
-      ${WHY_SELL.map((b) => `<article class="why-card">
-        <span class="why-card__icon">${icon(b.icon)}</span>
-        <div class="why-card__body">
-          <div class="why-card__title"><b>${b.title}</b>${pill(b.state, b.state === 'In demo' ? 'green' : 'neutral')}</div>
-          <small>${b.copy}</small>
-          <button class="link why-card__link" data-act="nav" data-surface="sell" data-view="${b.view}">${b.link} ${icon('arrowRight')}</button>
+    <div class="grid grid--2 mb-14">
+      <article class="fulfil-option">
+        <span class="kpi__icon kpi__icon--blue">${icon('truck')}</span>
+        <div class="fulfil-option__copy">
+          <b>Option 1 · Assign a NearBuy Runner</b>
+          <small>A nearby partner collects from the shop and delivers to the door. Progress appears in the Deliver workspace.</small>
+          <div class="row gap-6 wrap mt-6">${pill(`${withRunner.length} with a runner`, 'blue')}</div>
         </div>
-      </article>`).join('')}
+      </article>
+      <article class="fulfil-option">
+        <span class="kpi__icon">${icon('store')}</span>
+        <div class="fulfil-option__copy">
+          <b>Option 2 · Deliver it yourself</b>
+          <small>Your own staff carries the parcel. The order stays in this Seller Hub with a simple self-delivery step and no runner payout.</small>
+          <div class="row gap-6 wrap mt-6">${pill(`${own.length} on own delivery`, 'violet')}</div>
+        </div>
+      </article>
     </div>
-    <div class="why-sell__foot">
-      ${icon('shield')}
-      <p><b>No guaranteed sales, orders, commission or delivery.</b> NearBuy does not promise a volume of orders or earnings, and delivery depends on an eligible partner being available. <span class="why-legend"><i class="why-dot why-dot--green"></i> In demo — working in this prototype</span> <span class="why-legend"><i class="why-dot"></i> Partly — some of it is still planned</span> Fees and settlement timing live in <button class="link" data-act="nav" data-surface="sell" data-view="payments">Payments &amp; earnings</button>.</p>
+    <div class="rows" style="border:1px solid var(--line);border-radius:12px;overflow:hidden">
+      ${open.slice(0, 5).map((o) => {
+        const f = fulfilmentOf(o);
+        const task = o.taskId ? taskById(o.taskId) : null;
+        const decision = f === 'runner'
+          ? `${pill('Runner assigned', 'blue')}${task ? `<span class="tiny muted">${esc(task.status)}</span>` : ''}`
+          : f === 'self'
+            ? `<button class="btn btn--primary btn--xs" data-act="deliver-order" data-id="${o.id}">${icon('check', 'sm')} Mark delivered</button>`
+            : `<button class="btn btn--ghost btn--xs" data-act="request-runner" data-id="${o.id}">${icon('truck', 'sm')} Assign runner</button><button class="btn btn--ghost btn--xs" data-act="own-delivery" data-id="${o.id}">${icon('store', 'sm')} Deliver myself</button>`;
+        return `<div class="list-row">
+          <span class="table__thumb">${icon('truck')}</span>
+          <div class="list-row__main"><b>${esc(o.id)} · ${esc(o.customer)}</b><small>${esc(o.area)} · ${money(o.total)} · ${f === 'runner' ? (task ? `Runner task ${esc(task.id)}` : 'Runner requested') : f === 'self' ? 'Own delivery by shop staff' : 'No delivery choice yet'}</small></div>
+          <div class="list-row__end">${decision}</div>
+        </div>`;
+      }).join('') || emptyState('truck', 'No delivery orders open', 'New delivery orders appear here with both choices ready.')}
     </div>
   </section>`;
 }
@@ -2077,11 +2118,55 @@ function sellOrders() {
     </section>
   </div>`;
 }
+/* Every incoming order line is matched back to a catalogue row automatically. */
+function findProductForLine(line) {
+  if (!line) return null;
+  const byId = state.catalogue.find((p) => p.id === line.id);
+  if (byId) return byId;
+  const name = String(line.name || '').trim().toLowerCase();
+  if (!name) return null;
+  return state.catalogue.find((p) => String(p.name).trim().toLowerCase() === name) || null;
+}
+function detectedOrderLines(limit = 6) {
+  const out = [];
+  sellerOrders().forEach((o) => {
+    (o.items || []).forEach((i) => {
+      const p = findProductForLine(i);
+      out.push({
+        order: o.id, status: o.status, qty: i.qty, name: p ? p.name : i.name, emoji: p ? p.emoji : (i.emoji || '🛍️'),
+        matched: !!p, restored: !!o.stockReturned, cancelled: ['Cancelled', 'Returned'].includes(o.status)
+      });
+    });
+  });
+  return out.slice(0, limit);
+}
+function catalogueAutoDetect() {
+  const lines = detectedOrderLines(5);
+  const restored = sellerOrders().filter((o) => o.stockReturned).length;
+  return `<section class="card card--pad mb-18 detect-panel">
+    <div class="between wrap mb-12">
+      <div>
+        <span class="kicker kicker--sell"><i></i>STOCK DETECTED AUTOMATICALLY</span>
+        <h2 style="font-size:15px;margin-top:6px">Incoming order items update this catalogue for you.</h2>
+        <p class="tiny muted" style="margin-top:4px">Each order line is matched to a product and its stock moves down. When a customer or the shop declines the order, the same item is put straight back.</p>
+      </div>
+      <div class="row gap-6 wrap">${pill(`${lines.filter((l) => l.matched).length}/${lines.length} matched`, lines.length === lines.filter((l) => l.matched).length ? 'green' : 'amber')}${restored ? pill(`${restored} restored`, 'violet') : ''}</div>
+    </div>
+    <div class="rows" style="border:1px solid var(--line);border-radius:12px;overflow:hidden">
+      ${lines.map((l) => `<div class="list-row">
+        <span class="cartline__visual" style="width:34px;height:34px;font-size:16px">${l.emoji}</span>
+        <div class="list-row__main"><b>${esc(l.name)}</b><small>Order ${esc(l.order)} · × ${l.qty} · ${l.matched ? 'matched in catalogue' : 'new line — add it to the catalogue'}</small></div>
+        <div class="list-row__end">${l.cancelled ? pill('Restored to stock', 'violet') : pill('Stock reduced', 'blue')}</div>
+      </div>`).join('') || emptyState('package', 'No order lines yet', 'The next customer order will appear here with its catalogue match.')}
+    </div>
+  </section>`;
+}
 function sellCatalogue() {
   const q = (ui.sellQuery || '').toLowerCase();
   const rows = shopProducts().filter((p) => !q || `${p.name} ${p.id} ${p.cat}`.toLowerCase().includes(q));
   return `<div class="page">
     ${pageHead('SELLER HUB · CATALOGUE', 'Products & catalogue', `${shopProducts().length} products live on the customer storefront.`, `<button class="btn btn--primary btn--sm" data-act="add-product">${icon('plus')} Add product</button>`)}
+    ${catalogueAutoDetect()}
     <div class="grid grid--kpi">
       ${kpi({ label: 'Live products', value: shopProducts().filter((p) => p.stock > 0).length, icon: 'package', foot: 'visible nearby' })}
       ${kpi({ label: 'Categories', value: new Set(shopProducts().map((p) => p.cat)).size, icon: 'grid', foot: 'on the storefront' })}
@@ -2137,27 +2222,43 @@ function sellInventory() {
   </div>`;
 }
 function sellDelivery() {
-  const delivery = sellerOrders().filter((o) => o.method === 'Delivery' && o.status !== 'Delivered');
-  const pickup = sellerOrders().filter((o) => o.method === 'Pickup' && o.status !== 'Delivered');
+  const delivery = sellerOrders().filter((o) => o.method === 'Delivery' && !['Delivered', 'Cancelled', 'Returned'].includes(o.status));
+  const pickup = sellerOrders().filter((o) => o.method === 'Pickup' && !['Delivered', 'Cancelled', 'Returned'].includes(o.status));
   const tasks = state.tasks.filter((t) => t.shopId === SELLER.shopId);
+  const runnerSide = delivery.filter((o) => fulfilmentOf(o) === 'runner');
+  const selfSide = delivery.filter((o) => fulfilmentOf(o) === 'self');
+  const undecided = delivery.filter((o) => !fulfilmentOf(o));
+  const deliveryRow = (o) => {
+    const task = o.taskId ? taskById(o.taskId) : null;
+    const f = fulfilmentOf(o);
+    return `<div class="list-row">
+      <span class="table__thumb">${icon(f === 'self' ? 'store' : 'truck')}</span>
+      <div class="list-row__main"><b>${esc(o.id)} · ${esc(o.customer)}</b><small>${esc(o.area)} · ${money(o.total)} · ${f === 'runner' ? (task ? `task ${esc(task.id)} · ${esc(task.status)}` : 'runner requested') : f === 'self' ? 'own shop delivery · no runner payout' : 'no delivery choice yet'}</small></div>
+      <div class="list-row__end">${statusPill(orderStatusLabel(o))}${f === 'self' && o.status === 'Ready' ? `<button class="btn btn--primary btn--xs" data-act="deliver-order" data-id="${o.id}">${icon('check', 'sm')} Mark delivered</button>` : f === 'self' ? `<button class="btn btn--ghost btn--xs" data-act="view-order" data-id="${o.id}" aria-label="View order ${esc(o.id)}">${icon('eye', 'sm')}</button>` : f === 'runner' ? `<button class="btn btn--ghost btn--xs" data-act="view-order" data-id="${o.id}" aria-label="View order ${esc(o.id)}">${icon('eye', 'sm')}</button>` : `<button class="btn btn--ghost btn--xs" data-act="request-runner" data-id="${o.id}">${icon('truck', 'sm')} Assign runner</button><button class="btn btn--ghost btn--xs" data-act="own-delivery" data-id="${o.id}">${icon('store', 'sm')} Deliver myself</button>`}</div>
+    </div>`;
+  };
   return `<div class="page">
-    ${pageHead('SELLER HUB · DELIVERY & PICKUP', 'Delivery & pickup', 'Hand orders to a nearby runner, or get them ready for collection.', `<button class="btn btn--ghost btn--sm" data-act="switch" data-surface="deliver">${icon('truck')} Open Runner workspace</button>`)}
+    ${pageHead('SELLER HUB · DELIVERY & PICKUP', 'Delivery & pickup', 'Assign a nearby runner to a delivery order, or send it out with your own staff.', `<button class="btn btn--ghost btn--sm" data-act="switch" data-surface="deliver">${icon('truck')} Open Runner workspace</button>`)}
     <div class="grid grid--kpi">
-      ${kpi({ label: 'Delivery orders open', value: delivery.length, icon: 'truck', foot: 'runner delivery' })}
-      ${kpi({ label: 'Ready for pickup', value: pickup.filter((o) => ['Ready', 'Runner requested'].includes(o.status)).length, icon: 'store', foot: 'waiting in store' })}
-      ${kpi({ label: 'Runner tasks live', value: tasks.filter((t) => t.status !== 'Delivered').length, icon: 'pin', foot: 'in the network' })}
-      ${kpi({ label: 'Avg. handover', value: '18 min', icon: 'clock', foot: 'demo average' })}
+      ${kpi({ label: 'Delivery orders open', value: delivery.length, icon: 'truck', foot: 'runner or own staff' })}
+      ${kpi({ label: 'With a runner', value: runnerSide.length, icon: 'pin', foot: 'NearBuy partner' })}
+      ${kpi({ label: 'Own delivery', value: selfSide.length, icon: 'store', foot: 'shop staff' })}
+      ${kpi({ label: 'Store pickup', value: pickup.length, icon: 'bag', foot: 'waiting in store' })}
     </div>
+    <section class="card card--pad mb-18">
+      <div class="between wrap mb-14"><div><span class="kicker"><i></i>CHOOSE FOR EACH ORDER</span><h2 style="font-size:17px">Runner, or your own rider?</h2><p class="tiny muted" style="margin-top:4px">${undecided.length ? `${undecided.length} delivery orders still need a choice.` : 'Every open delivery order has a delivery choice.'}</p></div><span class="live-dot"><i></i>Live demo loop</span></div>
+      <div class="rows" style="border:1px solid var(--line);border-radius:12px;overflow:hidden">
+        ${delivery.length ? delivery.map(deliveryRow).join('') : emptyState('truck', 'No delivery orders open', 'New delivery orders will appear here with both choices.')}
+      </div>
+    </section>
     <div class="grid grid--2 mb-18">
       <section class="card card--flush">
-        <div class="card__head"><div><h2>Runner deliveries</h2><p>Request a runner once the order is ready.</p></div>${pill(`${delivery.length} open`, 'blue')}</div>
-        <div class="rows">${delivery.map((o) => {
-          const task = o.taskId ? taskById(o.taskId) : null;
-          return `<div class="list-row">
-            <span class="table__thumb">${icon('truck')}</span>
-            <div class="list-row__main"><b>${esc(o.id)} · ${esc(o.customer)}</b><small>${esc(o.area)} · ${money(o.total)} · ${task ? `task ${esc(task.id)} · ${esc(task.status)}` : 'no runner requested'}</small></div>
-            <div class="list-row__end">${statusPill(orderStatusLabel(o))}${!task && o.status === 'Ready' ? `<button class="btn btn--primary btn--xs" data-act="request-runner" data-id="${o.id}">${icon('truck', 'sm')} Request runner</button>` : `<button class="btn btn--ghost btn--xs" data-act="view-order" data-id="${o.id}" aria-label="View order ${esc(o.id)}">${icon('eye', 'sm')}</button>`}</div>
-          </div>`; }).join('') || emptyState('truck', 'No delivery orders open', 'New delivery orders will appear here.')}</div>
+        <div class="card__head"><div><h2>Runner tasks</h2><p>Requests visible to the Deliver workspace.</p></div>${pill(`${tasks.filter((t) => !['Delivered', 'Returned', 'Cancelled'].includes(t.status)).length} live`, 'blue')}</div>
+        <div class="rows">${tasks.map((t) => `<div class="list-row">
+          <span class="table__thumb">${icon('truck')}</span>
+          <div class="list-row__main"><b>${esc(t.id)} · ${esc(t.customer)}</b><small>${esc(t.shopArea)} → ${esc(t.area)} · ${t.distance} km · ${money(t.payout)}${t.partnerName ? ` · ${esc(t.partnerName)}` : ''}</small></div>
+          <div class="list-row__end">${statusPill(t.status)}</div>
+        </div>`).join('') || emptyState('truck', 'No runner tasks yet', 'Assign a runner to a delivery order to see it here.')}</div>
       </section>
       <section class="card card--flush">
         <div class="card__head"><div><h2>Store pickup</h2><p>Prepare the bag and wait for your neighbour.</p></div>${pill(`${pickup.length} open`, 'violet')}</div>
@@ -2169,9 +2270,9 @@ function sellDelivery() {
       </section>
     </div>
     <section class="card card--pad">
-      <div class="between wrap mb-14"><div><span class="kicker"><i></i>HOW HANDOVER WORKS</span><h2 style="font-size:17px">One request, three workspaces.</h2></div><span class="live-dot"><i></i>Live demo loop</span></div>
+      <div class="between wrap mb-14"><div><span class="kicker"><i></i>HOW HANDOVER WORKS</span><h2 style="font-size:17px">Two ways out of the shop.</h2></div><span class="live-dot"><i></i>Live demo loop</span></div>
       <div class="grid grid--4">
-        ${[['store', '1 · Shop marks ready', 'The order enters the runner queue as a request.'], ['truck', '2 · Runner accepts', 'A nearby runner takes the task and arrives at the shop.'], ['scan', '3 · Pickup OTP', 'The shop shares a demo pickup code to confirm the handover.'], ['checkCircle', '4 · Delivered', 'The customer OTP confirms delivery and earnings are recorded.']].map(([ic, t, s]) => `<div class="mini-stat"><span class="kpi__icon">${icon(ic)}</span><div><b>${t}</b><small>${s}</small></div></div>`).join('')}
+        ${[['store', '1 · Shop marks ready', 'The order is packed and both choices open.'], ['truck', '2 · Assign a runner', 'A nearby partner accepts the task and comes to the counter.'], ['scan', '3 · Pickup OTP', 'The demo pickup code confirms the handover at the shop.'], ['checkCircle', '4 · Delivered', 'The customer code closes the order — or your own rider marks it delivered.']].map(([ic, t, s]) => `<div class="mini-stat"><span class="kpi__icon">${icon(ic)}</span><div><b>${t}</b><small>${s}</small></div></div>`).join('')}
       </div>
     </section>
   </div>`;
@@ -2953,10 +3054,11 @@ function profileSaveAccount(fd) {
   if (!/^[6-9]\d{9}$/.test(mobile.replace(/\D/g, '').slice(-10))) return 'Enter a valid 10-digit mobile number.';
   if (!/^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(email)) return 'Enter a valid email address.';
   const changed = [];
+  if (name !== a.fullName) changed.push('name');
   if (mobile !== a.mobile) { a.loginMobile = mobile; changed.push('mobile'); }
   if (email !== a.email) { a.loginEmail = email; changed.push('email'); }
   a.fullName = name; a.mobile = mobile; a.email = email;
-  if (!changed.length) return null;
+  if (!changed.length) { toast('Account details saved.', 'checkCircle'); return null; }
   pfAddChange({ module: 'Account details', field: changed.join(' & '), from: 'Previous contact details', to: 'Updated', status: 'Approved' });
   audit('Profile updated', `Account details · ${changed.join(', ')}`, 'Seller owner');
   notify('sell', 'Account details updated', 'Login mobile and email are updated for this shop.');
@@ -3196,7 +3298,7 @@ function taskCard(t, actions = true) {
       <div class="payout">${money(t.payout)}<small>sample earning</small></div>
       ${actions ? `<div class="row gap-6">
         <button class="btn btn--ghost btn--xs" data-act="task-detail" data-id="${t.id}">${icon('eye', 'sm')} Details</button>
-        <button class="btn btn--ghost btn--xs" data-act="pass-task" data-id="${t.id}">Pass</button>
+        <button class="btn btn--ghost btn--xs" data-act="decline-task" data-id="${t.id}">${icon('x', 'sm')} Decline</button>
         <button class="btn btn--primary btn--xs" data-act="accept-task" data-id="${t.id}">${icon('check', 'sm')} Accept</button>
       </div>` : ''}
     </div>
@@ -3221,21 +3323,12 @@ function deliverOverview() {
       ${kpi({ label: 'Your mode', value: r.mode, icon: r.mode === 'Walking' ? 'walk' : 'bike', foot: `${r.maxKm} km radius` })}
     </div>
 
-    ${whyDeliverSection()}
-    ${deliverHowStrip()}
-
-    ${active ? `<section class="card card--pad mb-18" style="background:linear-gradient(150deg,#fff,#eef4fe);border-color:#d8e3f8">
-      <div class="between wrap mb-14">
-        <div><span class="kicker" style="margin:0"><i></i>ACTIVE DELIVERY · ${esc(active.id)}</span><h2 style="font-size:20px">${esc(active.shop)} → ${esc(active.customer)}</h2><p class="tiny muted">${esc(active.area)} · ${active.distance} km · ${money(active.payout)} sample earning</p></div>
-        <button class="btn btn--primary btn--sm" data-act="nav" data-surface="deliver" data-view="active">${icon('zap')} Continue delivery</button>
-      </div>
-      ${stepper(['Accepted', 'At shop', 'Picked up', 'On the way', 'Delivered'], clamp(RUNNER_FLOW.indexOf(active.status) - 1, 1, 4))}
-    </section>` : ''}
+    ${runnerFocusPanel()}
 
     <div class="grid grid--main mb-18">
       <section class="card card--flush">
         <div class="card__head"><div><h2>Requests for you</h2><p>Nearby, within your distance and parcel preferences.</p></div><button class="link" data-act="nav" data-surface="deliver" data-view="requests">All requests ${icon('arrowRight')}</button></div>
-        <div class="card__body stack">${queue.length ? queue.slice(0, 2).map((t) => taskCard(t)).join('') : emptyState('inbox', 'No requests right now', `We will only show tasks within ${r.maxKm} km that match your preferences.`)}</div>
+        <div class="card__body stack">${queue.length ? queue.slice(0, 2).map((t) => taskCard(t)).join('') : emptyState('inbox', active ? 'One delivery at a time' : 'No requests right now', active ? `Finish ${active.id} before accepting another request.` : `We will only show tasks within ${r.maxKm} km that match your preferences.`)}</div>
       </section>
       <div class="stack">
         ${card({ title: 'This week', sub: 'Sample earnings', body: barChart([12, 28, 0, 32, 20, 45, earningsFor(r.id) || 32], ['M', 'T', 'W', 'T', 'F', 'S', 'S'], { height: 104, format: (v) => `₹${v}` }) })}
@@ -3246,59 +3339,74 @@ function deliverOverview() {
     ${deliverFeatures()}
   </div>`;
 }
-/* ---- "Why Become a NearBuy Delivery Partner?" band ---- */
-const WHY_DELIVER = [
-  { icon: 'pin', title: 'Nearby delivery opportunities', copy: 'Receive eligible short-distance requests from participating shops around your service area.', state: 'In demo', view: 'requests', link: 'See requests' },
-  { icon: 'clock', title: 'Flexible availability', copy: 'Go online or offline whenever you like, and pass any request without a penalty.', state: 'In demo', view: 'profile', link: 'Set availability' },
-  { icon: 'rupee', title: 'Transparent earnings', copy: 'See the payout for a delivery before you accept it, and a statement of completed tasks.', state: 'In demo', view: 'earnings', link: 'Open earnings' },
-  { icon: 'scan', title: 'Easy parcel pickup', copy: 'Verify each parcel with the shop at handover, so the wrong bag never leaves the counter.', state: 'In demo', view: 'active', link: 'Pickup flow' },
-  { icon: 'truck', title: 'Simple delivery process', copy: 'One clear sequence from accepting a request to confirming the delivery at the door.', state: 'In demo', view: 'active', link: 'See the steps' },
-  { icon: 'package', title: 'Easy task tracking', copy: 'Assigned deliveries, pickup details, the destination and live status in one place.', state: 'In demo', view: 'requests', link: 'Your tasks' },
-  { icon: 'help', title: 'Support when needed', copy: 'Get help with delivery issues, customers, shopkeepers, payments and account questions.', state: 'Partly', view: 'support', link: 'Support & safety' },
-  { icon: 'shield', title: 'Safety and verification', copy: 'Verified accounts, delivery confirmation and safety-first operating procedures.', state: 'In demo', view: 'safety', link: 'Safety centre' }
-];
-
-function whyDeliverSection() {
-  return `<section class="why-block why-deliver" aria-labelledby="whyDeliverTitle">
-    <div class="why-block__head">
-      <div class="why-block__copy">
-        <span class="kicker kicker--deliver"><i></i>WHY BECOME A NEARBUY DELIVERY PARTNER?</span>
-        <p class="why-deliver__message">Your neighbourhood. Your delivery journey.</p>
-        <h2 id="whyDeliverTitle">Deliver locally. Earn fairly. Grow with NearBuy.</h2>
-        <p>Become part of your neighbourhood's delivery network. Connect local shops with nearby customers through convenient, short-distance deliveries.</p>
-      </div>
-      <div class="why-block__actions">
-        <button class="btn btn--primary btn--sm" data-act="nav" data-surface="deliver" data-view="register">${icon('plus')} Join as Delivery Partner</button>
-        <span class="tiny muted">Already registered? You are signed in — no second account needed.</span>
-      </div>
-    </div>
-
-    <div class="why-grid">
-      ${WHY_DELIVER.map((b) => `<article class="why-card">
-        <span class="why-card__icon">${icon(b.icon)}</span>
-        <div class="why-card__body">
-          <div class="why-card__title"><b>${b.title}</b>${pill(b.state, b.state === 'In demo' ? 'green' : 'neutral')}</div>
-          <small>${b.copy}</small>
-          <button class="link why-card__link" data-act="nav" data-surface="deliver" data-view="${b.view}">${b.link} ${icon('arrowRight')}</button>
+/* One delivery at a time: the runner accepts or declines the single open offer, and
+   cannot pick up another until the current one is delivered. */
+function offerForRunner(r) {
+  const offer = state.tasks.find((t) => t.status === 'Requested' && !(t.declinedBy || []).includes(r.id));
+  return offer ? { task: offer, locked: true, kind: 'offer' } : { task: null, locked: false, kind: 'none' };
+}
+function runnerFocusTaskCard(t, kind) {
+  const isActive = kind === 'active';
+  return `<div class="runner-focus">
+      <div class="runner-focus__main">
+        <div class="between wrap mb-8">
+          <span class="task-card__id">${esc(t.id)} <span class="muted" style="font-weight:500;font-family:var(--body);font-size:11px">· ${esc(t.createdAt)}</span></span>
+          ${statusPill(isActive ? (t.status === 'Assigned' ? 'Accepted' : t.status) : 'Requested')}
         </div>
-      </article>`).join('')}
-    </div>
+        <div class="task-card__route">
+          <div class="route-stop"><i class="dot-a"></i><div><b>${esc(t.shop)}</b><small>Pickup · ${esc(t.shopArea)} · ${t.pickupDistance} km to shop</small></div></div>
+          <div class="route-stop"><i class="dot-b"></i><div><b>${esc(t.customer)}</b><small>Drop · ${esc(t.area)} · ${t.distance} km route</small></div></div>
+        </div>
+        <div class="row gap-8 wrap mt-10">
+          <span class="pill pill--outline">${icon(t.category === 'Stationery' ? 'book' : 'bag', 'sm')} ${esc(t.category)}</span>
+          <span class="pill pill--outline">${t.items} items</span>
+          <span class="pill pill--outline">${t.weight} kg</span>
+          <span class="pill pill--outline">${t.distance} km</span>
+        </div>
+      </div>
+      <div class="runner-focus__side">
+        <div class="payout">${money(t.payout)}<small>sample earning</small></div>
+        ${isActive
+          ? `<div class="stack-sm mt-10">
+              <button class="btn btn--primary btn--sm btn--block" data-act="nav" data-surface="deliver" data-view="active">${icon('zap')} Continue delivery</button>
+              <p class="tiny muted" style="text-align:center">New offers stay locked until this task is delivered.</p>
+            </div>`
+          : `<div class="stack-sm mt-10">
+              <button class="btn btn--primary btn--sm btn--block" data-act="accept-task" data-id="${esc(t.id)}">${icon('check', 'sm')} Accept this delivery</button>
+              <button class="btn btn--ghost btn--sm btn--block" data-act="decline-task" data-id="${esc(t.id)}">${icon('x', 'sm')} Decline · pass to another runner</button>
+              <p class="tiny muted" style="text-align:center">Declining never carries a penalty in this demo.</p>
+            </div>`}
+      </div>
+    </div>`;
+}
 
-    <div class="why-deliver__cta">
+function runnerFocusPanel() {
+  const r = me();
+  const active = activeDelivery();
+  const offer = offerForRunner(r).task;
+  const offers = state.tasks.filter((x) => x.status === 'Requested').length;
+  const headline = offer ? 'Accept or decline this request.' : active ? 'Finish this delivery before the next offer.' : 'No request waiting right now.';
+  const sub = offer
+    ? 'One delivery at a time: accept this request, or decline it and it moves to another nearby runner.'
+    : active ? 'One delivery at a time: the next request unlocks as soon as this one is delivered.' : 'Requests you decline move to another nearby runner.';
+  return `<section class="card card--pad mb-18 fulfill-runner" aria-labelledby="runnerFocusTitle">
+    <div class="between wrap mb-14">
       <div>
-        <b>Ready to deliver with NearBuy?</b>
-        <small>Join the local delivery network and become an important part of your neighbourhood's shopping experience.</small>
+        <span class="kicker kicker--deliver"><i></i>DELIVERY OFFER · ONE AT A TIME</span>
+        <h2 id="runnerFocusTitle" style="font-size:17px;margin-top:6px">${headline}</h2>
+        <p class="tiny muted" style="margin-top:4px">${sub}</p>
       </div>
-      <div class="why-deliver__cta-actions">
-        <button class="btn btn--primary btn--sm" data-act="nav" data-surface="deliver" data-view="register">Join as Delivery Partner ${icon('arrowRight')}</button>
-        <button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="earnings">See how earnings work</button>
-      </div>
+      <div class="row gap-6 wrap">${pill(r.online ? 'Online' : 'Offline', r.online ? 'green' : 'neutral', true)}${pill(`${offers} open in the network`, 'blue')}</div>
     </div>
-
-    <div class="why-block__foot">
-      ${icon('shield')}
-      <p><b>No guaranteed orders, fixed earnings or speed incentives.</b> Verified adults aged 18 and over only at launch; every request is yours to accept or decline. Pickup and delivery are confirmed at each handover, payouts are shown before you accept, and settlement details live in Earnings. <span class="why-legend"><i class="why-dot why-dot--green"></i> In demo — working in this prototype</span> <span class="why-legend"><i class="why-dot"></i> Partly — some of it is still planned</span></p>
-    </div>
+    ${active ? `<div class="runner-focus-group">
+      <div class="runner-focus-label">${pill('On the road now', 'blue', true)}<span class="tiny muted">Accepting a second task stays locked until this is delivered.</span></div>
+      ${runnerFocusTaskCard(active, 'active')}
+    </div>` : ''}
+    ${offer ? `<div class="runner-focus-group">
+      <div class="runner-focus-label">${pill('Next offer for you', 'amber', true)}<span class="tiny muted">${active ? 'Ready the moment your current delivery closes.' : 'Accept or decline — it is entirely your call.'}</span></div>
+      ${runnerFocusTaskCard(offer, 'offer')}
+    </div>` : ''}
+    ${!active && !offer ? emptyState('inbox', 'Nothing to accept yet', `We will offer one task at a time within ${r.maxKm} km. Go online to see the next request.`, `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="requests">Browse the queue ${icon('arrowRight')}</button>`) : ''}
   </section>`;
 }
 
@@ -3352,14 +3460,18 @@ function deliverFeatures() {
 
 function deliverRequests() {
   const r = me();
-  const queue = state.tasks.filter((t) => t.status === 'Requested' && !(t.skippedBy || []).includes(r.id));
+  const active = activeDelivery();
+  const queue = state.tasks.filter((t) => t.status === 'Requested' && !(t.skippedBy || []).includes(r.id) && !(t.declinedBy || []).includes(r.id));
   const eligible = queue.filter((t) => t.distance <= r.maxKm && (!r.categories?.length || r.categories.includes(t.category)));
   return `<div class="page">
-    ${pageHead('DELIVERY REQUESTS', `${queue.length} request${queue.length === 1 ? '' : 's'} nearby`, `Only tasks within ${r.maxKm} km and your chosen categories are offered. Passing never carries a penalty.`, `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="profile">${icon('sliders')} Preferences</button>`)}
+    ${pageHead('DELIVERY REQUESTS', active ? 'Finish your current delivery first' : `${queue.length} request${queue.length === 1 ? '' : 's'} nearby`, active ? `${active.id} is still on the road. Accepting a second task unlocks once it is delivered.` : `Only tasks within ${r.maxKm} km and your chosen categories are offered. Accept or decline each request — declining never carries a penalty.`, `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="profile">${icon('sliders')} Preferences</button>`)}
+    ${active ? `<div class="notice notice--info mb-18">${icon('zap')}<span><b>One delivery at a time.</b> ${esc(active.id)} is active — requests below wait until it is delivered.</span><div style="margin-left:auto"><button class="btn btn--ghost btn--xs" data-act="nav" data-surface="deliver" data-view="active">Open ${esc(active.id)}</button></div></div>` : ''}
     ${!r.online ? `<div class="notice mb-18">${icon('alert')}<span><b>You are offline.</b> Go online to accept new delivery requests.</span></div>` : ''}
     <div class="grid grid--aside">
       <div class="stack">
-        ${eligible.length ? eligible.map((t) => taskCard(t)).join('') : card({ body: emptyState('pin', 'No matching requests', 'Try widening your distance preference, or check back in a moment.', `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="profile">Adjust preferences</button>`) })}
+        ${eligible.length ? eligible.map((t) => taskCard(t, !active)).join('') : card({ body: active
+          ? emptyState('zap', 'Your next delivery unlocks after this one', `Deliver ${active.id} first. One active delivery at a time keeps the handover clear.`, `<button class="btn btn--primary btn--sm" data-act="nav" data-surface="deliver" data-view="active">Open ${esc(active.id)} ${icon('arrowRight')}</button>`)
+          : emptyState('pin', 'No matching requests', 'Try widening your distance preference, or check back in a moment.', `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="profile">Adjust preferences</button>`) })}
         ${queue.filter((t) => !eligible.includes(t)).length ? `<p class="tiny muted">${queue.filter((t) => !eligible.includes(t)).length} request(s) are outside your distance or category preferences.</p>` : ''}
       </div>
       <aside class="stack">
@@ -3587,7 +3699,7 @@ function fleetTeam() {
           <div class="spread small"><span class="muted">Sample earnings</span><b>${money(earningsFor(r.id))}</b></div>
         </div>
         <hr class="hr" />
-        <div class="row gap-6 wrap"><button class="btn btn--ghost btn--xs" data-act="runner-online" data-id="${r.id}">${icon(r.online ? 'pause' : 'zap', 'sm')} ${r.online ? 'Set offline' : 'Set online'}</button><button class="btn btn--ghost btn--xs" data-act="nav" data-surface="deliver" data-view="profile">${icon('eye', 'sm')} Profile</button></div>
+        <div class="row gap-6 wrap"><button class="btn btn--ghost btn--xs" data-act="runner-online" data-id="${r.id}">${icon(r.online ? 'pause' : 'zap', 'sm')} ${r.online ? 'Set offline' : 'Set online'}</button><button class="btn btn--ghost btn--xs" data-act="switch" data-surface="deliver" data-view="profile">${icon('eye', 'sm')} Profile</button></div>
         <p class="hint mt-10">Eligibility, identity and work status are not verified in this demo.</p>
       </section>`).join('')}
     </div>
@@ -3639,7 +3751,7 @@ function fleetReports() {
 }
 function fleetSettings() {
   return `<div class="page">
-    ${pageHead('FLEET · ACCOUNT & SAFETY', 'Account & safety', 'The rules this demo fleet operates under.', `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="ops" data-view="incidents">${icon('alert')} Open incidents</button>`)}
+    ${pageHead('FLEET · ACCOUNT & SAFETY', 'Account & safety', 'The rules this demo fleet operates under.', `<button class="btn btn--ghost btn--sm" data-act="switch" data-surface="ops" data-view="incidents">${icon('alert')} Open incidents</button>`)}
     <div class="grid grid--aside">
       <div class="stack">
         ${card({ title: 'Business profile', body: `<div class="form-grid"><div class="form-grid form-grid--2"><label class="field"><span>Business name</span><input class="input" type="text" value="Hauz Khas Neighbourhood Fleet" /></label><label class="field"><span>Contact</span><input class="input" type="text" value="fleet@nearbuy.demo" /></label></div><label class="field"><span>Service area</span><input class="input" type="text" value="Hauz Khas, Green Park, Saket · Delhi" /></label><div class="notice notice--plain">${icon('shield')}<span>Business verification, insurance and worker arrangements are out of scope for this demo.</span></div></div>` })}
@@ -3779,7 +3891,7 @@ function opsAreas() {
 }
 function opsPricing() {
   return `<div class="page">
-    ${pageHead('OPS · PRICING BANDS', 'Pricing bands', 'Proposed sample partner pay by distance. These are not promised rates.', `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="earnings">${icon('rupee')} Runner view</button>`)}
+    ${pageHead('OPS · PRICING BANDS', 'Pricing bands', 'Proposed sample partner pay by distance. These are not promised rates.', `<button class="btn btn--ghost btn--sm" data-act="switch" data-surface="deliver" data-view="earnings">${icon('rupee')} Runner view</button>`)}
     <div class="grid grid--aside">
       <section class="card card--flush">
         <div class="card__head"><div><h2>Distance bands</h2><p>Edit a sample amount and every workspace reflects it.</p></div></div>
@@ -3886,6 +3998,29 @@ const TASK_TO_ORDER = {
   Assigned: 'Runner assigned', 'At shop': 'Runner at shop', 'Picked up': 'Out for delivery',
   'En route': 'Out for delivery', Delivered: 'Delivered', Returned: 'Returned'
 };
+/* Placing an order leaves stock once. Cancelling it puts exactly that quantity back. */
+function restockForOrder(order) {
+  (order.items || []).forEach((i) => {
+    const p = productById(i.id);
+    if (!p) return;
+    p.stock = clamp(Number(p.stock || 0) + Number(i.qty || 0), 0, 999);
+    p.sold = Math.max(0, Number(p.sold || 0) - Number(i.qty || 0));
+  });
+}
+function cancelOrderAndRestock(order, status = 'Cancelled') {
+  if (!order || order.stockReturned) return;
+  restockForOrder(order);
+  order.stockReturned = true;
+  order.status = status;
+  order.timeline = order.timeline || [];
+  order.timeline.push({ label: status === 'Returned' ? 'Returned — items back in stock' : 'Cancelled — items back in stock', at: nowLabel() });
+  order.fulfilment = order.fulfilment || '';
+  if (order.taskId) {
+    const t = taskById(order.taskId);
+    if (t) { t.status = status; t.fulfilmentClosed = status; addTaskEvent(t, status === 'Returned' ? 'Returned to shop' : 'Cancelled with order'); }
+  }
+  return order;
+}
 function syncOrderFromTask(t) {
   const order = t.orderId ? orderById(t.orderId) : null;
   if (!order) return;
@@ -3917,6 +4052,7 @@ function requestRunnerFor(order) {
   };
   state.tasks.unshift(task);
   order.taskId = task.id;
+  order.fulfilment = 'runner';
   order.status = 'Runner requested';
   order.timeline.push({ label: 'Runner requested', at: nowLabel() });
   notify('deliver', `New delivery request · ${task.id}`, `${shop.name} · ${distance} km · ${money(task.payout)}`);
@@ -3975,6 +4111,7 @@ function acceptTask(id) {
   const t = taskById(id);
   const r = me();
   if (!t || t.status !== 'Requested') { toast('That request is no longer available.', 'clock'); return; }
+  if (activeDelivery()) { toast('One delivery at a time — finish your current delivery first.', 'clock'); return; }
   if (!r.online) { toast('Go online before accepting a request.', 'alert'); return; }
   if (t.distance > r.maxKm) { toast('This request is outside your distance preference.', 'alert'); return; }
   t.partnerId = r.id; t.partnerName = r.name; t.status = 'Assigned';
@@ -3984,7 +4121,19 @@ function acceptTask(id) {
   notify('ops', `Task accepted · ${t.id}`, `${r.name} · ${t.distance} km`);
   audit('Task accepted', `${t.id} by ${r.name}`, 'Runner demo');
   save(); go('deliver', 'active');
-  toast(`Accepted ${t.id}. Take your time and stay safe.`, 'checkCircle');
+  toast(`Accepted ${t.id}. It is now your only active delivery.`, 'checkCircle');
+}
+function declineTask(id) {
+  const t = taskById(id);
+  if (!t) return;
+  if (t.status !== 'Requested') { toast('You can only decline a request that is still waiting.', 'clock'); return; }
+  t.declinedBy = [...(t.declinedBy || []), me().id];
+  t.skippedBy = [...(t.skippedBy || []), me().id];
+  addTaskEvent(t, `Declined · ${me().name}`);
+  notify('ops', `Task declined · ${t.id}`, `${me().name} declined. It stays open for another runner.`);
+  audit('Task declined', `${t.id} by ${me().name}`, 'Runner demo');
+  save(); paint();
+  toast(`${t.id} declined. It stays open for another nearby runner — no penalty.`, 'x');
 }
 function verifyPin(kind) {
   const t = taskById(ui.otpTask);
@@ -4048,8 +4197,8 @@ function openAccount() {
         ${pill('Signed in', 'green', true)}
       </div>
       <div class="stack-sm mt-14">
-        ${route.surface === 'shop' ? `<button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="account" onclick="closeModal()">${icon('user')} Account &amp; addresses</button>
-        <button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="orders" onclick="closeModal()">${icon('package')} Orders &amp; tracking</button>` : ''}
+        ${route.surface === 'shop' ? `<button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="account">${icon('user')} Account &amp; addresses</button>
+        <button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="orders">${icon('package')} Orders &amp; tracking</button>` : ''}
         <button class="btn btn--ghost btn--sm btn--block" data-act="palette">${icon('command')} Search everything · ⌘K</button>
         <a class="btn btn--ghost btn--sm btn--block" href="/help/">${icon('help')} Help centre</a>
         <button class="btn btn--ghost btn--sm btn--block" data-act="reset">${icon('refresh')} Reset demo data</button>
@@ -4114,15 +4263,20 @@ function openOrderModal(id) {
       <div class="rows mt-14" style="border:1px solid var(--line);border-radius:12px;overflow:hidden">${o.items.map((i) => `<div class="row gap-10" style="padding:9px 12px;border-bottom:1px solid var(--line-soft)"><span class="table__thumb">${i.emoji}</span><span class="flex1 small">${esc(i.name)} <span class="muted">× ${i.qty}</span></span><b class="small">${money(i.price * i.qty)}</b></div>`).join('')}</div>
       <div class="stack-sm mt-14">
         <div class="spread small"><span class="muted">Address</span><b style="text-align:right;max-width:60%">${esc(o.address)}</b></div>
-        ${task ? `<div class="spread small"><span class="muted">Runner task</span><b>${esc(task.id)} · ${esc(task.status)}</b></div>` : ''}
-        <div class="spread small"><span class="muted">Timeline entries</span><b>${o.timeline.length}</b></div>
-      </div>
+      ${task ? `<div class="spread small"><span class="muted">Runner task</span><b>${esc(task.id)} · ${esc(task.status)}</b></div>` : ''}
+      ${o.method === 'Delivery' ? `<div class="spread small"><span class="muted">Delivery choice</span><b>${fulfilmentOf(o) === 'runner' ? 'NearBuy Runner' : fulfilmentOf(o) === 'self' ? 'Own shop delivery' : 'Not chosen yet'}</b></div>` : ''}
+      <div class="spread small"><span class="muted">Timeline entries</span><b>${o.timeline.length}</b></div>
     </div>
-    <div class="modal__foot">
-      ${action.act && action.act !== 'view-order' ? `<button class="btn btn--primary btn--sm" data-act="${action.act}" data-id="${o.id}">${icon(action.icon, 'sm')} ${action.label}</button>` : ''}
-      ${o.status === 'Preparing' || o.status === 'New' ? `<button class="btn btn--danger btn--sm" data-act="cancel-order" data-id="${o.id}">Cancel order</button>` : ''}
-      <button class="btn btn--ghost btn--sm" data-act="close">Close</button>
-    </div>`);
+    ${o.method === 'Delivery' && !['Delivered', 'Cancelled', 'Returned'].includes(o.status) ? `<div class="notice notice--info mt-14">${icon('truck')}<span>This delivery can go either way: assign a nearby runner, or hand it to your own staff.</span></div>` : ''}
+  </div>
+  <div class="modal__foot">
+    ${o.method === 'Delivery' && !['Delivered', 'Cancelled', 'Returned'].includes(o.status) ? `
+      <button class="btn btn--ghost btn--sm" data-act="request-runner" data-id="${o.id}" ${fulfilmentOf(o) === 'runner' ? 'disabled' : ''}>${icon('truck', 'sm')} Assign runner</button>
+      <button class="btn btn--ghost btn--sm" data-act="own-delivery" data-id="${o.id}" ${fulfilmentOf(o) === 'self' ? 'disabled' : ''}>${icon('store', 'sm')} Deliver myself</button>` : ''}
+    ${action.act && action.act !== 'view-order' ? `<button class="btn btn--primary btn--sm" data-act="${action.act}" data-id="${o.id}">${icon(action.icon, 'sm')} ${action.label}</button>` : ''}
+    ${['Preparing', 'New', 'Ready'].includes(o.status) ? `<button class="btn btn--danger btn--sm" data-act="cancel-order" data-id="${o.id}">Decline order</button>` : ''}
+    <button class="btn btn--ghost btn--sm" data-act="close">Close</button>
+  </div>`);
 }
 function openTaskModal(id) {
   const t = taskById(id);
@@ -4524,7 +4678,6 @@ function handleAction(act, ds, el, event) {
     case 'clear-filters': resetExploreFilters(); refreshPage(); break;
     case 'discover-all': resetExploreFilters(); go('shop', 'explore'); break;
     case 'discover-deals': resetExploreFilters(); ui.exploreDeals = true; go('shop', 'explore'); break;
-    case 'quick-search': resetExploreFilters(); ui.query = ds.q; go('shop', 'explore'); break;
     case 'category': resetExploreFilters(); ui.category = ds.cat; go('shop', 'explore'); break;
     case 'discover-offer': {
       state.coupon = 'LOCAL10';
@@ -4543,7 +4696,35 @@ function handleAction(act, ds, el, event) {
     }
     case 'account-tab': ui.accountTab = ds.tab; refreshPage(); break;
     case 'address-demo': toast('Demo address saved to this account.', 'pin'); break;
-    case 'profile-save': break;
+    case 'profile-save': {
+      if (el && (el.name === 'name' || el.name === 'phone')) {
+        const val = String(el.value || '').trim();
+        if (val) {
+          CUSTOMER[el.name] = val;
+          if (el.name === 'name') {
+            CUSTOMER.initials = val.split(/\s+/).map((x) => x[0]).join('').slice(0, 2).toUpperCase() || 'RS';
+          }
+          state.customer = { name: CUSTOMER.name, phone: CUSTOMER.phone };
+          save(); paint();
+          toast('Demo profile updated.', 'checkCircle');
+        }
+      }
+      break;
+    }
+    case 'area-set': {
+      if (el && el.value) {
+        state.area = el.value;
+        CUSTOMER.area = el.value;
+        save(); paint();
+        toast(`Delivering to ${el.value}.`, 'pin');
+      }
+      break;
+    }
+    case 'ob-payout-method': {
+      captureStep('runner', el && el.closest('form'));
+      refreshPage();
+      break;
+    }
     case 'accept-order': {
       const o = orderById(ds.id); if (!o) break;
       o.status = 'Preparing';
@@ -4570,14 +4751,35 @@ function handleAction(act, ds, el, event) {
     }
     case 'request-runner': { const o = orderById(ds.id); if (!o) break; requestRunnerFor(o); save(); closeModal(); paint(); break; }
     case 'view-order': openOrderModal(ds.id); break;
+    case 'own-delivery': {
+      const o = orderById(ds.id); if (!o) break;
+      o.fulfilment = 'self';
+      o.timeline.push({ label: 'Own delivery chosen', at: nowLabel() });
+      notify('shop', `Own delivery · ${o.id}`, 'Your shop staff will deliver this order.');
+      audit('Own delivery chosen', `${o.id} · ${o.customer}`, 'Seller demo');
+      save(); closeModal(); paint();
+      toast(`${o.id} set to own delivery. Mark it delivered when it reaches the door.`, 'store');
+      break;
+    }
+    case 'deliver-order': {
+      const o = orderById(ds.id); if (!o) break;
+      if (o.status !== 'Ready' && o.status !== 'Out for delivery') { toast('Mark the order ready before handing it to a rider.', 'clock'); break; }
+      o.fulfilment = 'self';
+      o.status = 'Delivered';
+      o.timeline.push({ label: 'Delivered by shop staff', at: nowLabel() });
+      notify('shop', `Order delivered · ${o.id}`, `${o.customer} received the order.`);
+      audit('Own delivery completed', `${o.id} · ${o.customer}`, 'Seller demo');
+      save(); closeModal(); paint();
+      toast(`${o.id} delivered by your own staff.`, 'checkCircle');
+      break;
+    }
     case 'cancel-order': {
       const o = orderById(ds.id); if (!o) break;
-      o.status = 'Cancelled';
-      o.timeline.push({ label: 'Cancelled', at: nowLabel() });
-      if (o.taskId) { const t = taskById(o.taskId); if (t) { t.status = 'Cancelled'; addTaskEvent(t, 'Cancelled with order'); } }
-      notify('sell', `Order cancelled · ${o.id}`, `${o.customer} cancelled the order.`);
-      audit('Order cancelled', `${o.id}`, 'Shop demo');
-      save(); closeModal(); paint(); toast(`Order ${o.id} cancelled.`, 'x');
+      cancelOrderAndRestock(o, 'Cancelled');
+      notify('sell', `Order declined · ${o.id}`, `${o.customer} declined the order. Every item is back in the catalogue stock.`);
+      notify('deliver', `Order declined · ${o.id}`, 'The order was declined, so this delivery task is closed.');
+      audit('Order declined', `${o.id} · items restored`, 'Shop demo');
+      save(); closeModal(); paint(); toast(`Order ${o.id} declined. Items are back in stock.`, 'x');
       break;
     }
     case 'order-filter': ui.orderFilter = ds.filter; refreshPage(); break;
@@ -4630,12 +4832,7 @@ function handleAction(act, ds, el, event) {
       break;
     }
     case 'accept-task': acceptTask(ds.id); break;
-    case 'pass-task': {
-      const t = taskById(ds.id); if (!t) break;
-      t.skippedBy = [...(t.skippedBy || []), me().id];
-      save(); paint(); toast('Request passed. No penalty in this demo.', 'checkCircle');
-      break;
-    }
+    case 'decline-task': case 'pass-task': { declineTask(ds.id); break; }
     case 'task-detail': openTaskModal(ds.id); break;
     case 'arrive-shop': {
       const t = taskById(ds.id); if (!t) break;
@@ -4826,7 +5023,7 @@ function portalLabel(surface) { return (PORTALS[surface] || { label: 'NearBuy' }
 function adminLockPage() {
   return `<div class="page">
     <div class="admin-lock card">
-      <span class="admin-lock__icon">${icon('lock')}</span>
+      <div class="nb-modal-brand"><img src="/public/assets/nearbuy-logo.png" width="76" height="76" alt="NearBuy" /></div>
       <span class="kicker"><i></i>PROTECTED INTERNAL CONSOLE</span>
       <h1>Operations is not a public portal</h1>
       <p class="small muted">The NearBuy control tower is an internal workspace for verification, dispatch, pricing and audit. It is deliberately gated and is not linked as a fourth customer portal.</p>
@@ -4848,7 +5045,7 @@ function adminLockPage() {
 
 /* --------------------------------- pieces ---------------------------------- */
 function portalPath(surface) {
-  return { shop: '/customer/', sell: '/seller/', deliver: '/runner/', fleet: '/portal.html#/fleet/overview', ops: '/admin/' }[surface] || '/';
+  return { shop: '/customer/', sell: '/seller/', deliver: '/runner/', fleet: '/fleet/', ops: '/admin/' }[surface] || '/';
 }
 
 function portalSignInPage(surface) {
@@ -4856,7 +5053,7 @@ function portalSignInPage(surface) {
   const meta = SURFACES[surface];
   return `<div class="page">
     <div class="portal-gate card">
-      <span class="portal-gate__icon">${icon(p.icon)}</span>
+      <div class="nb-modal-brand"><img src="/public/assets/nearbuy-logo.png" width="76" height="76" alt="NearBuy" /></div>
       <span class="kicker"><i></i>${esc(p.label.toUpperCase())} PORTAL</span>
       <h1>Sign in to the ${esc(p.label)} portal</h1>
       <p class="small muted">${esc(p.blurb)}. Every NearBuy portal signs in separately and carries its own permissions, so a customer session can never open seller, partner or operations tools.</p>
@@ -4923,8 +5120,8 @@ function obF(name, label, value, opts = {}) {
   ].filter(Boolean).join(' ');
   return `<label class="field"><span>${label}</span><input class="input" type="${type}" name="${name}" value="${esc(value ?? '')}" ${attrs} />${opts.hint ? `<small class="hint">${opts.hint}</small>` : ''}</label>`;
 }
-function obS(name, label, value, options, hint = '') {
-  return `<label class="field"><span>${label}</span><select class="select" name="${name}">${options.map((o) => `<option ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>${hint ? `<small class="hint">${hint}</small>` : ''}</label>`;
+function obS(name, label, value, options, hint = '', act = '') {
+  return `<label class="field"><span>${label}</span><select class="select" name="${name}"${act ? ` data-act="${act}"` : ''}>${options.map((o) => `<option ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>${hint ? `<small class="hint">${hint}</small>` : ''}</label>`;
 }
 function obCheck(name, label, checked, hint = '') {
   return `<label class="ob-check"><input type="checkbox" name="${name}" ${checked ? 'checked' : ''} /><span>${label}${hint ? `<small class="tiny muted">${hint}</small>` : ''}</span></label>`;
@@ -5238,7 +5435,7 @@ function runnerStepBody(step, app) {
           ${obS('maxKm', 'Maximum delivery distance', String(app.maxKm), ['1', '2', '3'], 'Kilometres you are willing to travel for one task.')}
         </div>`;
     case 4:
-      return `${obS('payoutMethod', 'Payout method', app.payoutMethod, ['UPI', 'Bank account'])}
+      return `${obS('payoutMethod', 'Payout method', app.payoutMethod, ['UPI', 'Bank account'], '', 'ob-payout-method')}
         ${app.payoutMethod === 'UPI'
           ? obF('upi', 'UPI ID', app.upi, { ph: 'name@bank' })
           : `${obF('bankAcc', 'Bank account number', app.bankAcc, { inputmode: 'numeric', maxlength: 18 })}
@@ -5697,6 +5894,8 @@ function handleSubmit(form, event) {
       t.status = 'Returned'; t.returnReason = reason; t.returnNote = fd.get('note'); t.completedAt = nowLabel();
       addTaskEvent(t, `Returned · ${reason}`);
       syncOrderFromTask(t);
+      const linked = t.orderId ? orderById(t.orderId) : null;
+      if (linked) { restockForOrder(linked); linked.stockReturned = true; linked.timeline.push({ label: `Returned — items back in stock · ${reason}`, at: nowLabel() }); notify('sell', `Return · ${linked.id}`, `${reason} · items are back in the catalogue stock.`); }
       state.returns.unshift({ id: uid('RT'), order: t.orderId || t.id, customer: t.customer, product: t.items + ' items', reason, status: 'Needs review', amount: t.payout, date: 'Just now' });
       notify('ops', `Return recorded · ${t.id}`, `${me().name} · ${reason}`);
       audit('Return recorded', `${t.id} · ${reason}`, 'Runner demo');
@@ -5804,7 +6003,7 @@ document.addEventListener('error', (event) => {
   if (fallback?.hasAttribute('data-image-fallback')) fallback.hidden = false;
 }, true);
 document.addEventListener('click', (e) => {
-  const el = e.target.closest('[data-act]');
+  const el = e.target?.closest?.('[data-act]');
   if (!el) return;
   // Do not cancel native controls inside a modal just because its backdrop has an action.
   if (el.dataset.act === 'backdrop' && e.target !== el) return;
@@ -5815,7 +6014,7 @@ document.addEventListener('click', (e) => {
   handleAction(el.dataset.act, el.dataset, el, e);
 });
 document.addEventListener('change', (e) => {
-  const el = e.target.closest('[data-act]');
+  const el = e.target?.closest?.('[data-act]');
   if (!el) return;
   const act = el.dataset.act, ds = el.dataset;
   if (act === 'sort') { ui.sort = el.value; refreshPage(); return; }
@@ -5862,7 +6061,7 @@ document.addEventListener('click', (e) => {
     hint.classList.toggle('show', false);
   }
 });
-window.addEventListener('hashchange', () => { ui.drawer = false; ui.cartDrawer = false; paint(); });
+window.addEventListener('hashchange', () => { ui.drawer = false; ui.cartDrawer = false; ui.modal = null; ui.palette = null; paint(); });
 window.addEventListener('storage', (e) => { if (e.key === KEY) { toast('Demo data updated in another tab.', 'refresh'); } });
 document.addEventListener('keydown', (e) => {
   const mod = e.metaKey || e.ctrlKey;
@@ -5908,6 +6107,13 @@ document.addEventListener('keydown', (e) => {
 
 /* ---------------------------------- boot ---------------------------------- */
 (function boot() {
+  if (state.customer && typeof state.customer === 'object') {
+    if (state.customer.name) {
+      CUSTOMER.name = state.customer.name;
+      CUSTOMER.initials = state.customer.name.split(/\s+/).map((x) => x[0]).join('').slice(0, 2).toUpperCase() || 'RS';
+    }
+    if (state.customer.phone) CUSTOMER.phone = state.customer.phone;
+  }
   state.area = state.area || 'Hauz Khas';
   state.coupon = state.coupon || '';
   state.followed = state.followed || ['greenbasket'];
