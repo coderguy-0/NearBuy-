@@ -79,7 +79,9 @@ const PATHS = {
   book: '<path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17.5H6.5A2.5 2.5 0 0 0 4 22z"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>',
   leaf: '<path d="M20 4c-9 0-15 3.5-15 10a6 6 0 0 0 6 6c6.5 0 9-6 9-16z"/><path d="M4 21c2-5 6-9 12-12"/>',
   bread: '<path d="M5.5 12a5.5 5.5 0 0 1 1.1-10.3 5.8 5.8 0 0 1 10.8 0A5.5 5.5 0 0 1 18.5 12v6.5a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" transform="translate(0 1)"/>',
-  gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M5 12v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8"/><path d="M12 8v13"/><path d="M12 8S9.5 8 8.2 6.6a2.3 2.3 0 1 1 3.2-3.2C12 4.5 12 8 12 8z"/><path d="M12 8s2.5 0 3.8-1.4a2.3 2.3 0 1 0-3.2-3.2C12 4.5 12 8 12 8z"/>'
+  gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M5 12v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8"/><path d="M12 8v13"/><path d="M12 8S9.5 8 8.2 6.6a2.3 2.3 0 1 1 3.2-3.2C12 4.5 12 8 12 8z"/><path d="M12 8s2.5 0 3.8-1.4a2.3 2.3 0 1 0-3.2-3.2C12 4.5 12 8 12 8z"/>',
+  command: '<path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"/>',
+  key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8"/><path d="m17 6 3 3"/><path d="m14.5 8.5 2.5 2.5"/>'
 };
 function icon(name, cls = '') {
   const d = PATHS[name] || PATHS.grid;
@@ -557,13 +559,7 @@ function viewTitle() {
 }
 
 /* --------------------------------- chrome ---------------------------------- */
-const LOGO = `<svg class="mark" viewBox="0 0 44 44" aria-hidden="true">
-  <defs><linearGradient id="nbMark" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#24467f"/><stop offset="1" stop-color="#0f2a55"/></linearGradient>
-  <linearGradient id="nbSwoosh" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ff9a3d"/><stop offset="1" stop-color="#ef6c0a"/></linearGradient></defs>
-  <path d="M22 4.5c-7.7 0-14 6.1-14 13.6 0 9.6 11 20.4 13.3 22.4a1 1 0 0 0 1.4 0C25 38.5 36 27.7 36 18.1 36 10.6 29.7 4.5 22 4.5Z" fill="url(#nbMark)"/>
-  <circle cx="22" cy="18" r="7.4" fill="none" stroke="#fff" stroke-width="3.4"/>
-  <path d="M6.5 25.5c5.5 4.6 15 6.6 30.5-1.4" fill="none" stroke="url(#nbSwoosh)" stroke-width="3.6" stroke-linecap="round"/>
-</svg>`;
+const LOGO = `<img class="mark" src="/public/assets/nearbuy-logo.png" width="42" height="42" alt="" decoding="async" />`;
 
 function personaFor(surface) {
   switch (surface) {
@@ -917,7 +913,7 @@ function paletteIndex() {
 function paletteMatches() {
   const q = (ui.palette?.q || '').trim().toLowerCase();
   const all = paletteIndex();
-  if (!q) return all.filter((i) => ['Go to Shop', 'Go to Sell', 'Go to Deliver', 'Go to Ops'].includes(i.group)).slice(0, 14);
+  if (!q) return all.filter((i) => i.group.startsWith('Go to ')).slice(0, 14);
   return all.filter((i) => `${i.label} ${i.sub} ${i.group}`.toLowerCase().includes(q)).slice(0, 12);
 }
 function paletteHtml() {
@@ -989,8 +985,12 @@ function stepper(steps, currentIndex) {
     <div class="stepper__step ${i < currentIndex ? 'done' : i === currentIndex ? 'now' : ''}"><i></i><small>${esc(s)}</small></div>`).join('')}</div>`;
 }
 function orderTimeline(order) {
+  if (order.status === 'Cancelled' || order.status === 'Returned') {
+    return `<div class="notice notice--plain">${icon('alert')}<span>Order ${esc(order.status.toLowerCase())}.</span></div>`;
+  }
   const steps = ['New', 'Preparing', 'Runner assigned', 'Out for delivery', 'Delivered'];
-  const idx = Math.max(0, steps.indexOf(order.status === 'Ready' ? 'Runner assigned' : order.status));
+  const mapped = ['Ready', 'Runner requested', 'Runner at shop'].includes(order.status) ? 'Runner assigned' : order.status;
+  const idx = Math.max(0, steps.indexOf(mapped));
   return stepper(['Placed', 'Preparing', order.method === 'Pickup' ? 'Ready' : 'Runner', order.method === 'Pickup' ? 'Pickup' : 'On the way', 'Delivered'], order.status === 'Delivered' ? 5 : clamp(idx, 1, 4));
 }
 
@@ -1965,7 +1965,7 @@ function sellOverview() {
         </table></div>
       </section>
       <div class="stack">
-        ${card({ title: 'Runner network', sub: 'Requests from this shop', action: `<button class="link" data-act="nav" data-surface="deliver" data-view="requests">Open Deliver ${icon('arrowUpRight')}</button>`, body: `<div class="stack-sm">${state.tasks.filter((t) => t.shopId === SELLER.shopId && t.status !== 'Delivered').slice(0, 3).map((t) => `<div class="task-card ${t.status !== 'Requested' ? 'task-card--live' : ''}" style="padding:11px 12px">
+        ${card({ title: 'Runner network', sub: 'Requests from this shop', action: `<button class="link" data-act="switch" data-surface="deliver" data-view="requests">Open Deliver ${icon('arrowUpRight')}</button>`, body: `<div class="stack-sm">${state.tasks.filter((t) => t.shopId === SELLER.shopId && t.status !== 'Delivered').slice(0, 3).map((t) => `<div class="task-card ${t.status !== 'Requested' ? 'task-card--live' : ''}" style="padding:11px 12px">
             <div class="task-card__top"><span class="task-card__id">${esc(t.id)}</span>${statusPill(t.status)}</div>
             <div class="tiny muted">${esc(t.customer)} · ${esc(t.area)} · ${t.distance} km</div>
             <div class="task-card__foot" style="padding-top:6px"><span class="tiny">${t.partnerName ? `${icon('user', 'sm')} ${esc(t.partnerName)}` : `<span class="muted">No partner yet</span>`}</span><b class="small">${money(t.payout)}</b></div>
@@ -2953,10 +2953,11 @@ function profileSaveAccount(fd) {
   if (!/^[6-9]\d{9}$/.test(mobile.replace(/\D/g, '').slice(-10))) return 'Enter a valid 10-digit mobile number.';
   if (!/^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(email)) return 'Enter a valid email address.';
   const changed = [];
+  if (name !== a.fullName) changed.push('name');
   if (mobile !== a.mobile) { a.loginMobile = mobile; changed.push('mobile'); }
   if (email !== a.email) { a.loginEmail = email; changed.push('email'); }
   a.fullName = name; a.mobile = mobile; a.email = email;
-  if (!changed.length) return null;
+  if (!changed.length) { toast('Account details saved.', 'checkCircle'); return null; }
   pfAddChange({ module: 'Account details', field: changed.join(' & '), from: 'Previous contact details', to: 'Updated', status: 'Approved' });
   audit('Profile updated', `Account details · ${changed.join(', ')}`, 'Seller owner');
   notify('sell', 'Account details updated', 'Login mobile and email are updated for this shop.');
@@ -3587,7 +3588,7 @@ function fleetTeam() {
           <div class="spread small"><span class="muted">Sample earnings</span><b>${money(earningsFor(r.id))}</b></div>
         </div>
         <hr class="hr" />
-        <div class="row gap-6 wrap"><button class="btn btn--ghost btn--xs" data-act="runner-online" data-id="${r.id}">${icon(r.online ? 'pause' : 'zap', 'sm')} ${r.online ? 'Set offline' : 'Set online'}</button><button class="btn btn--ghost btn--xs" data-act="nav" data-surface="deliver" data-view="profile">${icon('eye', 'sm')} Profile</button></div>
+        <div class="row gap-6 wrap"><button class="btn btn--ghost btn--xs" data-act="runner-online" data-id="${r.id}">${icon(r.online ? 'pause' : 'zap', 'sm')} ${r.online ? 'Set offline' : 'Set online'}</button><button class="btn btn--ghost btn--xs" data-act="switch" data-surface="deliver" data-view="profile">${icon('eye', 'sm')} Profile</button></div>
         <p class="hint mt-10">Eligibility, identity and work status are not verified in this demo.</p>
       </section>`).join('')}
     </div>
@@ -3639,7 +3640,7 @@ function fleetReports() {
 }
 function fleetSettings() {
   return `<div class="page">
-    ${pageHead('FLEET · ACCOUNT & SAFETY', 'Account & safety', 'The rules this demo fleet operates under.', `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="ops" data-view="incidents">${icon('alert')} Open incidents</button>`)}
+    ${pageHead('FLEET · ACCOUNT & SAFETY', 'Account & safety', 'The rules this demo fleet operates under.', `<button class="btn btn--ghost btn--sm" data-act="switch" data-surface="ops" data-view="incidents">${icon('alert')} Open incidents</button>`)}
     <div class="grid grid--aside">
       <div class="stack">
         ${card({ title: 'Business profile', body: `<div class="form-grid"><div class="form-grid form-grid--2"><label class="field"><span>Business name</span><input class="input" type="text" value="Hauz Khas Neighbourhood Fleet" /></label><label class="field"><span>Contact</span><input class="input" type="text" value="fleet@nearbuy.demo" /></label></div><label class="field"><span>Service area</span><input class="input" type="text" value="Hauz Khas, Green Park, Saket · Delhi" /></label><div class="notice notice--plain">${icon('shield')}<span>Business verification, insurance and worker arrangements are out of scope for this demo.</span></div></div>` })}
@@ -3779,7 +3780,7 @@ function opsAreas() {
 }
 function opsPricing() {
   return `<div class="page">
-    ${pageHead('OPS · PRICING BANDS', 'Pricing bands', 'Proposed sample partner pay by distance. These are not promised rates.', `<button class="btn btn--ghost btn--sm" data-act="nav" data-surface="deliver" data-view="earnings">${icon('rupee')} Runner view</button>`)}
+    ${pageHead('OPS · PRICING BANDS', 'Pricing bands', 'Proposed sample partner pay by distance. These are not promised rates.', `<button class="btn btn--ghost btn--sm" data-act="switch" data-surface="deliver" data-view="earnings">${icon('rupee')} Runner view</button>`)}
     <div class="grid grid--aside">
       <section class="card card--flush">
         <div class="card__head"><div><h2>Distance bands</h2><p>Edit a sample amount and every workspace reflects it.</p></div></div>
@@ -4048,8 +4049,8 @@ function openAccount() {
         ${pill('Signed in', 'green', true)}
       </div>
       <div class="stack-sm mt-14">
-        ${route.surface === 'shop' ? `<button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="account" onclick="closeModal()">${icon('user')} Account &amp; addresses</button>
-        <button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="orders" onclick="closeModal()">${icon('package')} Orders &amp; tracking</button>` : ''}
+        ${route.surface === 'shop' ? `<button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="account">${icon('user')} Account &amp; addresses</button>
+        <button class="btn btn--ghost btn--sm btn--block" data-act="nav" data-surface="shop" data-view="orders">${icon('package')} Orders &amp; tracking</button>` : ''}
         <button class="btn btn--ghost btn--sm btn--block" data-act="palette">${icon('command')} Search everything · ⌘K</button>
         <a class="btn btn--ghost btn--sm btn--block" href="/help/">${icon('help')} Help centre</a>
         <button class="btn btn--ghost btn--sm btn--block" data-act="reset">${icon('refresh')} Reset demo data</button>
@@ -4524,7 +4525,6 @@ function handleAction(act, ds, el, event) {
     case 'clear-filters': resetExploreFilters(); refreshPage(); break;
     case 'discover-all': resetExploreFilters(); go('shop', 'explore'); break;
     case 'discover-deals': resetExploreFilters(); ui.exploreDeals = true; go('shop', 'explore'); break;
-    case 'quick-search': resetExploreFilters(); ui.query = ds.q; go('shop', 'explore'); break;
     case 'category': resetExploreFilters(); ui.category = ds.cat; go('shop', 'explore'); break;
     case 'discover-offer': {
       state.coupon = 'LOCAL10';
@@ -4543,7 +4543,35 @@ function handleAction(act, ds, el, event) {
     }
     case 'account-tab': ui.accountTab = ds.tab; refreshPage(); break;
     case 'address-demo': toast('Demo address saved to this account.', 'pin'); break;
-    case 'profile-save': break;
+    case 'profile-save': {
+      if (el && (el.name === 'name' || el.name === 'phone')) {
+        const val = String(el.value || '').trim();
+        if (val) {
+          CUSTOMER[el.name] = val;
+          if (el.name === 'name') {
+            CUSTOMER.initials = val.split(/\s+/).map((x) => x[0]).join('').slice(0, 2).toUpperCase() || 'RS';
+          }
+          state.customer = { name: CUSTOMER.name, phone: CUSTOMER.phone };
+          save(); paint();
+          toast('Demo profile updated.', 'checkCircle');
+        }
+      }
+      break;
+    }
+    case 'area-set': {
+      if (el && el.value) {
+        state.area = el.value;
+        CUSTOMER.area = el.value;
+        save(); paint();
+        toast(`Delivering to ${el.value}.`, 'pin');
+      }
+      break;
+    }
+    case 'ob-payout-method': {
+      captureStep('runner', el && el.closest('form'));
+      refreshPage();
+      break;
+    }
     case 'accept-order': {
       const o = orderById(ds.id); if (!o) break;
       o.status = 'Preparing';
@@ -4826,7 +4854,7 @@ function portalLabel(surface) { return (PORTALS[surface] || { label: 'NearBuy' }
 function adminLockPage() {
   return `<div class="page">
     <div class="admin-lock card">
-      <span class="admin-lock__icon">${icon('lock')}</span>
+      <div class="nb-modal-brand"><img src="/public/assets/nearbuy-logo.png" width="76" height="76" alt="NearBuy" /></div>
       <span class="kicker"><i></i>PROTECTED INTERNAL CONSOLE</span>
       <h1>Operations is not a public portal</h1>
       <p class="small muted">The NearBuy control tower is an internal workspace for verification, dispatch, pricing and audit. It is deliberately gated and is not linked as a fourth customer portal.</p>
@@ -4848,7 +4876,7 @@ function adminLockPage() {
 
 /* --------------------------------- pieces ---------------------------------- */
 function portalPath(surface) {
-  return { shop: '/customer/', sell: '/seller/', deliver: '/runner/', fleet: '/portal.html#/fleet/overview', ops: '/admin/' }[surface] || '/';
+  return { shop: '/customer/', sell: '/seller/', deliver: '/runner/', fleet: '/fleet/', ops: '/admin/' }[surface] || '/';
 }
 
 function portalSignInPage(surface) {
@@ -4856,7 +4884,7 @@ function portalSignInPage(surface) {
   const meta = SURFACES[surface];
   return `<div class="page">
     <div class="portal-gate card">
-      <span class="portal-gate__icon">${icon(p.icon)}</span>
+      <div class="nb-modal-brand"><img src="/public/assets/nearbuy-logo.png" width="76" height="76" alt="NearBuy" /></div>
       <span class="kicker"><i></i>${esc(p.label.toUpperCase())} PORTAL</span>
       <h1>Sign in to the ${esc(p.label)} portal</h1>
       <p class="small muted">${esc(p.blurb)}. Every NearBuy portal signs in separately and carries its own permissions, so a customer session can never open seller, partner or operations tools.</p>
@@ -4923,8 +4951,8 @@ function obF(name, label, value, opts = {}) {
   ].filter(Boolean).join(' ');
   return `<label class="field"><span>${label}</span><input class="input" type="${type}" name="${name}" value="${esc(value ?? '')}" ${attrs} />${opts.hint ? `<small class="hint">${opts.hint}</small>` : ''}</label>`;
 }
-function obS(name, label, value, options, hint = '') {
-  return `<label class="field"><span>${label}</span><select class="select" name="${name}">${options.map((o) => `<option ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>${hint ? `<small class="hint">${hint}</small>` : ''}</label>`;
+function obS(name, label, value, options, hint = '', act = '') {
+  return `<label class="field"><span>${label}</span><select class="select" name="${name}"${act ? ` data-act="${act}"` : ''}>${options.map((o) => `<option ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>${hint ? `<small class="hint">${hint}</small>` : ''}</label>`;
 }
 function obCheck(name, label, checked, hint = '') {
   return `<label class="ob-check"><input type="checkbox" name="${name}" ${checked ? 'checked' : ''} /><span>${label}${hint ? `<small class="tiny muted">${hint}</small>` : ''}</span></label>`;
@@ -5238,7 +5266,7 @@ function runnerStepBody(step, app) {
           ${obS('maxKm', 'Maximum delivery distance', String(app.maxKm), ['1', '2', '3'], 'Kilometres you are willing to travel for one task.')}
         </div>`;
     case 4:
-      return `${obS('payoutMethod', 'Payout method', app.payoutMethod, ['UPI', 'Bank account'])}
+      return `${obS('payoutMethod', 'Payout method', app.payoutMethod, ['UPI', 'Bank account'], '', 'ob-payout-method')}
         ${app.payoutMethod === 'UPI'
           ? obF('upi', 'UPI ID', app.upi, { ph: 'name@bank' })
           : `${obF('bankAcc', 'Bank account number', app.bankAcc, { inputmode: 'numeric', maxlength: 18 })}
@@ -5804,7 +5832,7 @@ document.addEventListener('error', (event) => {
   if (fallback?.hasAttribute('data-image-fallback')) fallback.hidden = false;
 }, true);
 document.addEventListener('click', (e) => {
-  const el = e.target.closest('[data-act]');
+  const el = e.target?.closest?.('[data-act]');
   if (!el) return;
   // Do not cancel native controls inside a modal just because its backdrop has an action.
   if (el.dataset.act === 'backdrop' && e.target !== el) return;
@@ -5815,7 +5843,7 @@ document.addEventListener('click', (e) => {
   handleAction(el.dataset.act, el.dataset, el, e);
 });
 document.addEventListener('change', (e) => {
-  const el = e.target.closest('[data-act]');
+  const el = e.target?.closest?.('[data-act]');
   if (!el) return;
   const act = el.dataset.act, ds = el.dataset;
   if (act === 'sort') { ui.sort = el.value; refreshPage(); return; }
@@ -5862,7 +5890,7 @@ document.addEventListener('click', (e) => {
     hint.classList.toggle('show', false);
   }
 });
-window.addEventListener('hashchange', () => { ui.drawer = false; ui.cartDrawer = false; paint(); });
+window.addEventListener('hashchange', () => { ui.drawer = false; ui.cartDrawer = false; ui.modal = null; ui.palette = null; paint(); });
 window.addEventListener('storage', (e) => { if (e.key === KEY) { toast('Demo data updated in another tab.', 'refresh'); } });
 document.addEventListener('keydown', (e) => {
   const mod = e.metaKey || e.ctrlKey;
@@ -5908,6 +5936,13 @@ document.addEventListener('keydown', (e) => {
 
 /* ---------------------------------- boot ---------------------------------- */
 (function boot() {
+  if (state.customer && typeof state.customer === 'object') {
+    if (state.customer.name) {
+      CUSTOMER.name = state.customer.name;
+      CUSTOMER.initials = state.customer.name.split(/\s+/).map((x) => x[0]).join('').slice(0, 2).toUpperCase() || 'RS';
+    }
+    if (state.customer.phone) CUSTOMER.phone = state.customer.phone;
+  }
   state.area = state.area || 'Hauz Khas';
   state.coupon = state.coupon || '';
   state.followed = state.followed || ['greenbasket'];

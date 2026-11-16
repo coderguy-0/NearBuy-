@@ -150,9 +150,22 @@ test('unknown paths get the styled 404 page', async () => {
   assert.match(html, /Back to NearBuy home/);
 });
 
-test('path traversal is refused', async () => {
-  const res = await fetch(`${BASE}/%2e%2e%2fpackage.json`, { redirect: 'manual' });
-  assert.ok(res.status === 400 || res.status === 404, `traversal should be refused, got ${res.status}`);
+test('path traversal and internal server files are refused', async () => {
+  const blocked = [
+    '/%2e%2e%2fpackage.json',
+    '/.gitignore',
+    '/package.json',
+    '/package-lock.json',
+    '/server/index.js',
+    '/server/orders.js',
+    '/tools/render-logo.mjs',
+    '/tests/site.test.cjs'
+  ];
+  for (const p of blocked) {
+    const res = await fetch(`${BASE}${p}`, { redirect: 'manual' });
+    assert.ok(res.status === 400 || res.status === 404, `${p} should be refused, got ${res.status}`);
+    await res.body?.cancel();
+  }
 });
 
 test('every asset referenced in the markup exists on disk', () => {
@@ -194,3 +207,61 @@ test('the public checklist keeps all 84 items', () => {
   const items = (src.match(/class="rl-item"/g) || []).length;
   assert.equal(items, 84, `expected 84 checklist items, found ${items}`);
 });
+
+test('every HTML surface uses the universal logo and declares a favicon', () => {
+  const htmlFiles = [
+    'index.html',
+    'portal.html',
+    'classic.html',
+    'seller.html',
+    'partner.html',
+    'business.html',
+    'delivery-admin.html',
+    'about/index.html',
+    'help/index.html',
+    'roadmap/index.html',
+    'customer/index.html',
+    'customer/login/index.html',
+    'seller/index.html',
+    'seller/register/index.html',
+    'runner/index.html',
+    'runner/register/index.html',
+    'fleet/index.html',
+    'admin/index.html',
+    'control-tower/index.html'
+  ];
+  for (const f of htmlFiles) {
+    const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
+    assert.match(src, /rel=["']icon["']/, `${f} should declare a favicon`);
+    assert.match(src, /(?:\/public\/assets\/nearbuy-logo\.png|\/delivery\/logo\.svg)/, `${f} should reference universal logo`);
+    assert.doesNotMatch(src, /M22 4\.5/, `${f} should not contain the legacy pin vector`);
+  }
+  const svgSrc = fs.readFileSync(path.join(ROOT, 'delivery', 'logo.svg'), 'utf8');
+  assert.match(svgSrc, /data:image\/png;base64,/, 'delivery/logo.svg should embed universal badge PNG');
+});
+
+test('all NearBuy One icons and action hooks are registered', () => {
+  const nbJs = fs.readFileSync(path.join(ROOT, 'nearbuy.js'), 'utf8');
+  const portalHtml = fs.readFileSync(path.join(ROOT, 'portal.html'), 'utf8');
+
+  const pathsBlock = nbJs.match(/const PATHS = \{([\s\S]*?)\n\};/);
+  assert.ok(pathsBlock, 'PATHS icon map should exist in nearbuy.js');
+  const registeredIcons = new Set([...pathsBlock[1].matchAll(/^\s*([a-zA-Z0-9_]+)\s*:/gm)].map((m) => m[1]));
+  const missingIcons = [];
+  for (const m of nbJs.matchAll(/\bicon\(\s*['"]([a-zA-Z0-9_]+)['"]/g)) {
+    if (!registeredIcons.has(m[1])) missingIcons.push(m[1]);
+  }
+  assert.deepEqual([...new Set(missingIcons)], [], 'every icon() literal must exist in PATHS');
+
+  const usedActs = new Set([...(nbJs + '\n' + portalHtml).matchAll(/data-act=["']([a-zA-Z0-9_-]+)["']/g)].map((m) => m[1]));
+  const handledActs = new Set([
+    ...[...nbJs.matchAll(/case\s+['"]([a-zA-Z0-9_-]+)['"]\s*:/g)].map((m) => m[1]),
+    ...[...nbJs.matchAll(/act\s*===\s*['"]([a-zA-Z0-9_-]+)['"]/g)].map((m) => m[1]),
+    ...[...nbJs.matchAll(/dataset\.act\s*===\s*['"]([a-zA-Z0-9_-]+)['"]/g)].map((m) => m[1]),
+    ...[...nbJs.matchAll(/\[data-act=["']([a-zA-Z0-9_-]+)["']\]/g)].map((m) => m[1])
+  ]);
+  const unhandledActs = [...usedActs].filter((a) => !handledActs.has(a));
+  assert.deepEqual(unhandledActs, [], `unhandled data-act attributes: ${unhandledActs.join(', ')}`);
+});
+
+

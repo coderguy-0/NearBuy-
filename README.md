@@ -441,7 +441,7 @@ tests/                node:test regression suite over routes and assets (npm tes
 Nothing here is required to run the site; these exist so the committed output stays reproducible:
 
 ```bash
-node tools/render-logo.mjs          # public/assets/nearbuy-logo.png from the brand vector
+node tools/render-logo.mjs          # syncs public/assets/nearbuy-logo.png and delivery/logo.svg
 node tools/build-pages.mjs          # the portal front doors (customer/, seller/, runner/, …)
 node tools/build-public-pages.mjs   # about/ · help/ · roadmap/
 ```

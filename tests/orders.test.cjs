@@ -33,5 +33,34 @@ test('orders are scoped to participants and transitions and assignments are vali
     assert.equal((await request('/api/orders', runner.token))[1][0].id, order.id);
     assert.ok((await request('/api/notifications', buyer.token))[1].some(n => n.message === 'Runner Assigned'));
     assert.equal((await fetch(base + '/data/orders.sqlite')).status, 400);
+
+    // Malformed / non-object / wrong-type inputs return 400 rather than crashing SQLite (500)
+    for (const raw of ['null', '[]', '"hello"', '42', '{bad']) {
+      const r = await fetch(base + '/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw });
+      assert.equal(r.status, 400, `expected 400 for body ${raw}`);
+    }
+    assert.equal((await request('/api/orders', buyer.token, { sellerId: { bad: 1 }, address: '123 Main', method: 'pickup', items: [{ name: 'Tea', quantity: 1 }] }))[0], 400);
+    assert.equal((await request('/api/orders', buyer.token, { sellerId: seller.id, address: '123 Main', method: 'pickup', items: ['not-an-object'] }))[0], 400);
+
+    let [s2, o2] = await request('/api/orders', buyer.token, {
+      sellerId: seller.id,
+      address: 'हौज़ ख़ास मार्केट · ₹150 lane',
+      method: 'delivery',
+      items: [{ name: 'मसाला चाय · Masala Chai', quantity: 2 }]
+    });
+    assert.equal(s2, 201);
+    assert.equal(o2.address, 'हौज़ ख़ास मार्केट · ₹150 lane');
+    assert.equal(o2.items[0].name, 'मसाला चाय · Masala Chai');
+    for (const next of ['Order Accepted', 'Order Processing', 'Ready for Pickup']) {
+      assert.equal((await request(`/api/orders/${o2.id}/transition`, seller.token, { status: next }))[0], 200);
+    }
+    assert.equal((await request(`/api/orders/${o2.id}/transition`, seller.token, { status: 'Delivery Method Selected', deliveryMethod: 'runner' }))[0], 200);
+    assert.equal((await request(`/api/orders/${o2.id}/transition`, seller.token, { status: 'Runner Requested' }))[0], 200);
+    assert.equal((await request(`/api/orders/${o2.id}/assign`, seller.token, { runnerId: { bad: true } }))[0], 400);
+
+    // Payloads larger than 64 KiB receive a clean HTTP 413 response
+    const huge = JSON.stringify({ pad: 'x'.repeat(70000) });
+    const tooLarge = await fetch(base + '/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: huge });
+    assert.equal(tooLarge.status, 413);
   } finally { child.kill(); fs.rmSync(dir, {recursive:true, force:true}); }
 });

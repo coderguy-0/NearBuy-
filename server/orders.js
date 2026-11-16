@@ -17,10 +17,53 @@ CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, 
 `);
 const hash = s => createHash('sha256').update(s).digest('hex');
 const now = () => new Date().toISOString();
-const send = (res, code, body) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); res.end(JSON.stringify(body)); };
+const send = (res, code, body) => {
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
+  if (code === 413) headers.Connection = 'close';
+  res.writeHead(code, headers);
+  res.end(JSON.stringify(body));
+};
 const fail = (code, message) => { const e = new Error(message); e.code = code; throw e; };
 const text = (v, max = 200) => typeof v === 'string' && v.trim().length > 0 && v.trim().length <= max;
-function body(req) { return new Promise((resolve, reject) => { let data = ''; req.on('data', c => { data += c; if (data.length > 32768) { reject(Object.assign(new Error('Request too large'), {code:413})); req.destroy(); } }); req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch { reject(Object.assign(new Error('Invalid JSON'), {code:400})); } }); req.on('error', reject); }); }
+function body(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    req.on('data', c => {
+      if (settled) return;
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      total += buf.length;
+      if (total > 32768) {
+        settled = true;
+        req.resume();
+        reject(Object.assign(new Error('Request too large'), { code: 413 }));
+        return;
+      }
+      chunks.push(buf);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        const parsed = JSON.parse(raw || '{}');
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          reject(Object.assign(new Error('JSON object required'), { code: 400 }));
+          return;
+        }
+        resolve(parsed);
+      } catch {
+        reject(Object.assign(new Error('Invalid JSON'), { code: 400 }));
+      }
+    });
+    req.on('error', err => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+}
 function account(req) {
   const token = (req.headers.authorization || '').match(/^Bearer ([a-f0-9]{64})$/)?.[1];
   if (!token) fail(401, 'Authentication required');
@@ -69,7 +112,7 @@ async function handle(req, res) {
     if (req.method === 'GET' && pathname === '/api/runners') { if (user.role !== 'seller') fail(403, 'Seller access required'); send(res, 200, db.prepare("SELECT id,name FROM users WHERE role='runner' AND id NOT IN (SELECT runner_id FROM orders WHERE runner_id IS NOT NULL AND status NOT IN ('Delivered','Cancelled','Order Rejected','Runner Rejected')) ORDER BY name").all()); return true; }
     if (req.method === 'POST' && pathname === '/api/orders') {
       if (user.role !== 'buyer') fail(403, 'Buyer access required'); const b = await body(req);
-      if (!db.prepare("SELECT id FROM users WHERE id=? AND role='seller'").get(b.sellerId || '') || !text(b.address, 500) || !['delivery','pickup'].includes(b.method) || !Array.isArray(b.items) || !b.items.length || b.items.length > 100 || b.items.some(i => !i || !text(i.name, 200) || !Number.isSafeInteger(i.quantity) || i.quantity < 1 || i.quantity > 1000)) fail(400, 'Valid seller, address, method and items required');
+      if (typeof b.sellerId !== 'string' || !db.prepare("SELECT id FROM users WHERE id=? AND role='seller'").get(b.sellerId) || !text(b.address, 500) || !['delivery','pickup'].includes(b.method) || !Array.isArray(b.items) || !b.items.length || b.items.length > 100 || b.items.some(i => !i || typeof i !== 'object' || !text(i.name, 200) || !Number.isSafeInteger(i.quantity) || i.quantity < 1 || i.quantity > 1000)) fail(400, 'Valid seller, address, method and items required');
       const order = { id: randomUUID(), buyer_id:user.id, seller_id:b.sellerId, runner_id:null, status:'Order Received', method:b.method, address:b.address.trim(), items:JSON.stringify(b.items.map(i => ({name:i.name.trim(), quantity:i.quantity}))), payment:'Not processed', created:now() };
       transaction(() => { db.prepare('INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?)').run(...Object.values(order)); event(order, 'Order Placed'); event(order, 'Order Received'); });
       send(res, 201, publicOrder(order)); return true;
@@ -82,7 +125,7 @@ async function handle(req, res) {
         if (match[2] === 'assign') {
           if (user.role !== 'seller' || o.seller_id !== user.id) fail(403, 'Not your order');
           if (o.status !== 'Runner Requested' || o.runner_id) fail(409, 'Order is not awaiting assignment');
-          const r = db.prepare("SELECT id FROM users WHERE id=? AND role='runner'").get(b.runnerId || ''); if (!r) fail(400, 'Runner not found');
+          const r = typeof b.runnerId === 'string' ? db.prepare("SELECT id FROM users WHERE id=? AND role='runner'").get(b.runnerId) : null; if (!r) fail(400, 'Runner not found');
           if (db.prepare("SELECT id FROM orders WHERE runner_id=? AND status NOT IN ('Delivered','Cancelled','Order Rejected','Runner Rejected')").get(r.id)) fail(409, 'Runner is busy');
           o.runner_id = r.id; o.status = 'Runner Assigned'; db.prepare('UPDATE orders SET runner_id=?,status=? WHERE id=?').run(o.runner_id,o.status,o.id); event(o,o.status); return publicOrder(o);
         }

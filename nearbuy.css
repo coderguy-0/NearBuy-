@@ -117,7 +117,7 @@ ul, ol { padding: 0; list-style: none; }
 .rail > * { position: relative; z-index: 1; }
 
 .rail__brand { display: flex; align-items: center; gap: 10px; padding: 2px 8px 4px; }
-.rail__brand .mark { width: 34px; height: 34px; flex: 0 0 auto; filter: drop-shadow(0 6px 12px rgba(0, 0, 0, .35)); }
+.rail__brand .mark { width: 40px; height: 40px; flex: 0 0 auto; object-fit: contain; border-radius: 50%; display: block; filter: drop-shadow(0 6px 12px rgba(0, 0, 0, .35)); }
 .rail__brand .word { display: flex; flex-direction: column; line-height: 1; }
 .rail__brand .word b { font-family: var(--display); font-size: 19px; font-weight: 800; letter-spacing: -.035em; color: #fff; }
 .rail__brand .word b em { font-style: normal; color: #ff9a3d; }
@@ -1775,8 +1775,11 @@ body.shop-storefront .app {
   line-height: 1;
 }
 .nb-brand-mark .mark {
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
+  display: block;
+  object-fit: contain;
+  border-radius: 50%;
   filter: drop-shadow(0 6px 12px rgba(0, 0, 0, .35));
 }
 .nb-brand-copy {
@@ -2849,8 +2852,11 @@ body.shop-storefront .app {
   color: #fff;
 }
 .nb-footer-brand .mark {
-  width: 26px;
-  height: 26px;
+  width: 36px;
+  height: 36px;
+  display: block;
+  object-fit: contain;
+  border-radius: 50%;
 }
 .nb-footer-brand em {
   font-style: normal;
@@ -3097,15 +3103,16 @@ body.shop-storefront .app {
 }
 
 .nb-modal-brand {
-  height: 46px;
-  overflow: hidden;
-  margin-bottom: 10px;
+  display: flex;
+  justify-content: center;
+  margin-bottom: 12px;
 }
 .nb-modal-brand img {
-  width: 154px;
-  height: auto;
-  transform: translateY(-14px);
-  mix-blend-mode: multiply;
+  width: 78px;
+  height: 78px;
+  object-fit: contain;
+  display: block;
+  filter: drop-shadow(0 8px 18px rgba(12, 26, 51, .14));
 }
 
 /* --- Responsive Storefront Breakpoints --- */
