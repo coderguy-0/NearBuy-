@@ -3,98 +3,103 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="theme-color" content="#081428" />
-<title>Register your shop · NearBuy</title>
+<meta name="theme-color" content="#063B78" />
+<meta name="description" content="Register your neighbourhood shop with NearBuy. Applications are reviewed by platform operations." />
+<title>Seller registration · NearBuy</title>
 <link rel="icon" href="/public/assets/nearbuy-logo.png" />
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet" />
-<style>
-  :root { --accent: #2b8a66; color-scheme: light; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 28px;
-    background:
-      radial-gradient(1100px 520px at 12% -10%, rgba(244,119,24,.14), transparent 60%),
-      radial-gradient(900px 480px at 92% 8%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 62%),
-      #fbf7f0;
-    color: #223350;
-    font: 400 16px/1.6 'DM Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-  }
-  main {
-    width: min(520px, 100%); background: #fffdfa; border: 1px solid #e9e2d5; border-radius: 26px;
-    padding: 40px 36px; text-align: center;
-    box-shadow: 0 30px 70px rgba(12, 26, 51, .14);
-  }
-  .mark { width: 88px; height: 88px; margin: 0 auto 16px; display: block; filter: drop-shadow(0 10px 22px rgba(12, 26, 51, .14)); }
-  .mark img, .mark svg { width: 100%; height: 100%; display: block; object-fit: contain; }
-  .kicker {
-    display: inline-flex; align-items: center; gap: 8px; margin-bottom: 14px;
-    font: 700 11px/1 'Manrope', system-ui, sans-serif; letter-spacing: .14em; text-transform: uppercase;
-    color: var(--accent);
-  }
-  .kicker i { width: 18px; height: 2px; border-radius: 2px; background: var(--accent); display: inline-block; }
-  h1 { font: 800 32px/1.15 'Manrope', system-ui, sans-serif; color: #0c1a33; margin: 0 0 10px; }
-  p.lead { margin: 0 auto 24px; max-width: 40ch; color: #6f7b8f; }
-  a.cta {
-    display: inline-block; padding: 13px 26px; border-radius: 999px; text-decoration: none;
-    background: var(--accent); color: #fff; font: 700 15px/1 'Manrope', system-ui, sans-serif;
-    box-shadow: 0 12px 26px color-mix(in srgb, var(--accent) 34%, transparent);
-  }
-  a.cta:hover { filter: brightness(.94); }
-  .creds {
-    margin: 24px auto 0; padding: 14px 16px; max-width: 340px;
-    background: #f7f3ea; border: 1px dashed #e0d7c4; border-radius: 14px;
-    font-size: 13.5px; color: #4b5a72; text-align: left;
-  }
-  .creds b { display: block; margin-bottom: 6px; font: 700 11px/1 'Manrope', system-ui, sans-serif;
-    letter-spacing: .1em; text-transform: uppercase; color: #6f7b8f; }
-  .creds code { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #0c1a33; }
-  .handoff { margin: 22px 0 0; font-size: 13px; color: #939cae; }
-  .handoff b { color: #4b5a72; font-weight: 600; }
-  .handoff button {
-    border: 0; background: none; padding: 0; margin-left: 6px; cursor: pointer;
-    color: var(--accent); font: inherit; text-decoration: underline;
-  }
-  .home { display: inline-block; margin-top: 18px; font-size: 13px; color: #6f7b8f; text-decoration: none; }
-  .home:hover { color: #0c1a33; }
-  .bar { height: 3px; width: 0%; margin: 14px auto 0; border-radius: 3px; background: var(--accent);
-    transition: width .2s linear; }
-</style>
+<link rel="stylesheet" href="/partner/app.css" />
 </head>
 <body>
-<main>
-  <span class="mark"><img src="/public/assets/nearbuy-logo.png" width="88" height="88" alt="NearBuy" decoding="async" /></span>
-  <span class="kicker"><i></i>Sell on NearBuy</span>
-  <h1>Register your shop</h1>
-  <p class="lead">A guided seven-step application: business, store, location, operations and payout details.</p>
-  <a class="cta" href="/portal.html#/sell/register">Start the seller application</a>
-  
-  
-  <div class="creds"><b>Public route</b>Registration is public — you do not need an account to apply.</div>
-  <p class="handoff">Opening the seller application in <b id="t">6</b>s<button id="stop" type="button">stay here</button></p>
-  <div class="bar" id="bar" role="presentation"></div>
-  <a class="home" href="/">&larr; Back to NearBuy home</a>
-  <noscript><p class="handoff">JavaScript is off, so use the button above to continue.</p></noscript>
+<main class="content" style="max-width:820px;margin:0 auto;padding:28px 18px 60px">
+  <div class="row" style="margin-bottom:18px">
+    <img src="/public/assets/nearbuy-logo.png" alt="NearBuy" width="44" height="44" style="border-radius:12px;background:#fff" />
+    <div><b style="font-size:19px;color:var(--deep)">NearBuy</b>
+      <div class="small muted">Shop Local. Live Better.</div></div>
+    <span class="spacer" style="flex:1"></span>
+    <a class="btn btn-sm" href="/seller/">Partner sign-in</a>
+  </div>
+
+  <div class="card">
+    <div class="small strong" style="letter-spacing:.12em;text-transform:uppercase;color:var(--blue)">Sell workspace</div>
+    <h1 style="margin:6px 0 6px">Bring your shop online</h1>
+    <p class="muted">Tell platform operations about your shop. Applications are stored in the NearBuy database and appear in the
+      Admin Portal → contact enquiries queue, where a reviewer approves the shop, sets its delivery radius and links your seller account.</p>
+
+    <form id="apply" class="stack" novalidate style="margin-top:16px">
+      <div class="grid g2">
+        <div class="field"><label for="name">Your name</label><input class="input" id="name" required minlength="2" autocomplete="name" /></div>
+        <div class="field"><label for="shop">Shop name</label><input class="input" id="shop" required minlength="2" /></div>
+        <div class="field"><label for="contact">Email or mobile</label><input class="input" id="contact" required minlength="5" autocomplete="email" /></div>
+        <div class="field"><label for="locality">Locality and PIN code</label><input class="input" id="locality" required placeholder="Hauz Khas, 110016" /></div>
+      </div>
+      <div class="field"><label for="message">What do you sell, and would you deliver or offer store pickup?</label>
+        <textarea class="textarea" id="message" required minlength="10" placeholder="Daily groceries and household items. Home delivery inside 4 km, free store pickup too."></textarea></div>
+      <div class="form-error hidden" id="err" role="alert"></div>
+      <div class="row"><button class="btn btn-primary" type="submit" id="submit">Send application</button>
+        <span class="muted small">No document upload is needed for this step.</span></div>
+    </form>
+
+    <div id="done" class="hidden" style="margin-top:16px">
+      <div class="banner-note info" id="done-text" role="status"></div>
+      <div class="row" style="margin-top:12px">
+        <a class="btn btn-primary" href="/customer/">Browse the storefront</a>
+        <a class="btn" href="/">Back to NearBuy home</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>Already selling here?</h3>
+    <p class="muted small">Demo sellers can sign in at <a href="/seller/">the Seller Hub</a> with
+      <code>owner@nearbuy.demo</code> / <code>Seller123!</code>. Every order, stock change and handover you make there is the same
+      record the customer sees.</p>
+  </div>
 </main>
+
 <script>
-  (function () {
-    var target = "/portal.html#/sell/register";
-    var total = 6000;
-    var left = total;
-    var t = document.getElementById('t');
-    var bar = document.getElementById('bar');
-    var timer = setInterval(function () {
-      left -= 100;
-      t.textContent = Math.max(0, Math.ceil(left / 1000));
-      bar.style.width = ((total - left) / total) * 100 + '%';
-      if (left <= 0) { clearInterval(timer); location.replace(target); }
-    }, 100);
-    document.getElementById('stop').addEventListener('click', function () {
-      clearInterval(timer);
-      this.closest('p').innerHTML = 'Automatic hand-off stopped.';
-    });
-  })();
+(function () {
+  var form = document.getElementById('apply');
+  var err = document.getElementById('err');
+  var submit = document.getElementById('submit');
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    err.classList.add('hidden');
+    var name = document.getElementById('name').value.trim();
+    var shop = document.getElementById('shop').value.trim();
+    var contact = document.getElementById('contact').value.trim();
+    var locality = document.getElementById('locality').value.trim();
+    var message = document.getElementById('message').value.trim();
+    if (name.length < 2 || shop.length < 2 || contact.length < 5 || !locality || message.length < 10) {
+      err.textContent = 'Please complete every field — the message needs at least 10 characters.';
+      err.classList.remove('hidden');
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = 'Sending…';
+    try {
+      var res = await fetch('/api/customer/enquiry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-NearBuy-Request': '1' },
+        body: JSON.stringify({
+          name: name,
+          contact: contact,
+          topic: 'Seller application',
+          message: 'Shop: ' + shop + '\nLocality: ' + locality + '\n\n' + message
+        })
+      });
+      var data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'The application could not be saved.');
+      document.getElementById('done-text').textContent = data.message + ' Operations reviews applications before a shop goes live.';
+      form.classList.add('hidden');
+      document.getElementById('done').classList.remove('hidden');
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.classList.remove('hidden');
+      submit.disabled = false;
+      submit.textContent = 'Send application';
+    }
+  });
+})();
 </script>
 </body>
 </html>

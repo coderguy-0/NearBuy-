@@ -1345,6 +1345,8 @@ code, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
 .auth-lead { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
 .auth-form { display: flex; flex-direction: column; gap: 13px; }
 .auth-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.auth-or { display: flex; align-items: center; gap: 10px; margin: 18px 0 12px; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.auth-or::before, .auth-or::after { content: ""; flex: 1; height: 1px; background: var(--line, #DCE8F5); }
 .auth-alt { text-align: center; font-size: 13px; color: var(--muted); margin: 20px 0 10px; }
 .auth-alt a { font-weight: 800; }
 .demo-box { background: #FFF9EC; border: 1px dashed #E8CFA0; border-radius: 12px; padding: 12px 14px; margin-top: 16px; }

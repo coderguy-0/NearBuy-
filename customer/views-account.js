@@ -66,6 +66,9 @@
             <div class="form-error" id="loginError" hidden></div>
             <button class="btn btn--primary btn--lg btn--block" type="submit" id="loginBtn">Sign in</button>
           </form>
+          <div class="auth-or" role="separator">or</div>
+          <button class="btn btn--block" type="button" id="googleBtn">Continue with Google</button>
+          <div class="fineprint" id="googleNote" hidden>${NB.icon('info')} Google sign-in is not configured on this deployment, so no third-party account is created. Add <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code> and register <code>/api/customer/auth/google/callback</code> to switch it on. Email or mobile sign-in works now.</div>
           ${demoBox()}
           <div class="auth-alt">New to NearBuy? <a href="#/register?next=${encodeURIComponent(next)}">Create an account</a></div>
           <p class="fineprint">${NB.icon('lock')} Passwords are hashed with scrypt. Your session is an HttpOnly cookie and every request is checked on the server.</p>
@@ -79,6 +82,12 @@
         const form = NB.$('#loginForm', root);
         const fill = NB.$('#fillDemo', root);
         if (fill) fill.addEventListener('click', () => { form.identifier.value = NB.state.demoAccounts.customer.email; form.password.value = NB.state.demoAccounts.customer.password; form.identifier.focus(); });
+        const googleBtn = NB.$('#googleBtn', root);
+        if (googleBtn) googleBtn.addEventListener('click', () => {
+          const note = NB.$('#googleNote', root);
+          note.hidden = !note.hidden;
+          googleBtn.setAttribute('aria-expanded', String(!note.hidden));
+        });
         NB.$$('[data-toggle-pw]', root).forEach((b) => b.addEventListener('click', () => {
           const input = NB.$('#' + b.dataset.togglePw, root);
           input.type = input.type === 'password' ? 'text' : 'password';

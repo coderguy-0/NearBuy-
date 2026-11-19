@@ -3,99 +3,35 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#063B78" />
 <meta name="robots" content="noindex" />
-<meta name="theme-color" content="#081428" />
-<title>Operations console · NearBuy</title>
+<meta name="description" content="NearBuy Admin Portal — customers, shops, catalogue, service areas, orders, deliveries, refunds, support, reviews, coupons, banners and audit logs." />
+<title>Admin Portal · NearBuy</title>
 <link rel="icon" href="/public/assets/nearbuy-logo.png" />
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet" />
-<style>
-  :root { --accent: #0ca678; color-scheme: light; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 28px;
-    background:
-      radial-gradient(1100px 520px at 12% -10%, rgba(244,119,24,.14), transparent 60%),
-      radial-gradient(900px 480px at 92% 8%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 62%),
-      #fbf7f0;
-    color: #223350;
-    font: 400 16px/1.6 'DM Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-  }
-  main {
-    width: min(520px, 100%); background: #fffdfa; border: 1px solid #e9e2d5; border-radius: 26px;
-    padding: 40px 36px; text-align: center;
-    box-shadow: 0 30px 70px rgba(12, 26, 51, .14);
-  }
-  .mark { width: 88px; height: 88px; margin: 0 auto 16px; display: block; filter: drop-shadow(0 10px 22px rgba(12, 26, 51, .14)); }
-  .mark img, .mark svg { width: 100%; height: 100%; display: block; object-fit: contain; }
-  .kicker {
-    display: inline-flex; align-items: center; gap: 8px; margin-bottom: 14px;
-    font: 700 11px/1 'Manrope', system-ui, sans-serif; letter-spacing: .14em; text-transform: uppercase;
-    color: var(--accent);
-  }
-  .kicker i { width: 18px; height: 2px; border-radius: 2px; background: var(--accent); display: inline-block; }
-  h1 { font: 800 32px/1.15 'Manrope', system-ui, sans-serif; color: #0c1a33; margin: 0 0 10px; }
-  p.lead { margin: 0 auto 24px; max-width: 40ch; color: #6f7b8f; }
-  a.cta {
-    display: inline-block; padding: 13px 26px; border-radius: 999px; text-decoration: none;
-    background: var(--accent); color: #fff; font: 700 15px/1 'Manrope', system-ui, sans-serif;
-    box-shadow: 0 12px 26px color-mix(in srgb, var(--accent) 34%, transparent);
-  }
-  a.cta:hover { filter: brightness(.94); }
-  .creds {
-    margin: 24px auto 0; padding: 14px 16px; max-width: 340px;
-    background: #f7f3ea; border: 1px dashed #e0d7c4; border-radius: 14px;
-    font-size: 13.5px; color: #4b5a72; text-align: left;
-  }
-  .creds b { display: block; margin-bottom: 6px; font: 700 11px/1 'Manrope', system-ui, sans-serif;
-    letter-spacing: .1em; text-transform: uppercase; color: #6f7b8f; }
-  .creds code { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #0c1a33; }
-  .handoff { margin: 22px 0 0; font-size: 13px; color: #939cae; }
-  .handoff b { color: #4b5a72; font-weight: 600; }
-  .handoff button {
-    border: 0; background: none; padding: 0; margin-left: 6px; cursor: pointer;
-    color: var(--accent); font: inherit; text-decoration: underline;
-  }
-  .home { display: inline-block; margin-top: 18px; font-size: 13px; color: #6f7b8f; text-decoration: none; }
-  .home:hover { color: #0c1a33; }
-  .bar { height: 3px; width: 0%; margin: 14px auto 0; border-radius: 3px; background: var(--accent);
-    transition: width .2s linear; }
-</style>
+<link rel="stylesheet" href="/partner/app.css" />
 </head>
 <body>
-<main>
-  <span class="mark"><img src="/public/assets/nearbuy-logo.png" width="88" height="88" alt="NearBuy" decoding="async" /></span>
-  <span class="kicker"><i></i>Internal · not indexed</span>
-  <h1>Operations console</h1>
-  <p class="lead">The gated internal control tower. A session plus the operations access code is required.</p>
-  <a class="cta" href="/portal.html#/ops/overview">Go to the operations gate</a>
-  
-  <div class="creds"><b>Operations access code</b><code>NB-OPS-2026</code></div>
-  
-  <p class="handoff">Taking you to the operations gate in <b id="t">6</b>s<button id="stop" type="button">stay here</button></p>
-  <div class="bar" id="bar" role="presentation"></div>
-  <a class="home" href="/">&larr; Back to NearBuy home</a>
-  <noscript><p class="handoff">JavaScript is off, so use the button above to continue.</p></noscript>
-</main>
-<script>
-  (function () {
-    var target = "/portal.html#/ops/overview";
-    var total = 6000;
-    var left = total;
-    var t = document.getElementById('t');
-    var bar = document.getElementById('bar');
-    var timer = setInterval(function () {
-      left -= 100;
-      t.textContent = Math.max(0, Math.ceil(left / 1000));
-      bar.style.width = ((total - left) / total) * 100 + '%';
-      if (left <= 0) { clearInterval(timer); location.replace(target); }
-    }, 100);
-    document.getElementById('stop').addEventListener('click', function () {
-      clearInterval(timer);
-      this.closest('p').innerHTML = 'Automatic hand-off stopped.';
-    });
-  })();
-</script>
+<div class="shell" aria-busy="true">
+  <aside class="side">
+    <span class="brand"><img src="/public/assets/nearbuy-logo.png" alt="NearBuy" width="40" height="40" />
+      <span><b>NearBuy</b><span>Admin Portal</span></span></span>
+  </aside>
+  <div class="main">
+    <header class="topbar"><span class="title">Admin Portal</span></header>
+    <main class="content">
+      <div class="card"><div class="skeleton line" style="width:35%"></div><div class="skeleton line" style="width:65%"></div><div class="skeleton line" style="width:50%"></div></div>
+      <p class="muted small">Checking your administrator session…</p>
+    </main>
+  </div>
+</div>
+<noscript>
+  <div class="card" style="margin:24px">
+    <h1>Admin Portal needs JavaScript</h1>
+    <p>Administration is role-protected on the NearBuy API. Enable JavaScript, or use
+      <a href="/portal.html#/ops/overview">the offline demo shell</a>.</p>
+  </div>
+</noscript>
+<script src="/partner/core.js"></script>
+<script src="/partner/admin.js"></script>
 </body>
 </html>

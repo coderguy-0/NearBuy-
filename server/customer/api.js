@@ -200,6 +200,7 @@ const clampInt = (v, min, max) => {
   return Math.min(max, Math.max(min, Math.trunc(n)));
 };
 const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+const NB_SLUG = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
 /* ------------------------------------------------------------------ */
 /* Serialisers                                                         */
@@ -252,7 +253,7 @@ function shopCard(row, location) {
     opensAt: row.opens_at, closesAt: row.closes_at, prepMinutes: row.prep_minutes,
     deliveryEnabled: Boolean(row.delivery_enabled), pickupEnabled: Boolean(row.pickup_enabled),
     deliveryFee: row.delivery_fee_paise, freeDeliveryOver: row.free_delivery_over_paise,
-    pickupFee: row.pickup_fee_paise, minOrder: row.min_order_paise,
+    pickupFee: row.pickup_fee_paise, minOrder: row.min_order_paise, radiusKm: row.radius_km,
     address: row.address, locality: row.locality, city: row.city, pincode: row.pincode,
     lat: row.lat, lng: row.lng, distanceKm, serviceable, servicePincodes: row.service_pincodes,
     badge: row.badge, productCount: Number(counts?.total || 0), inStockCount: Number(counts?.in_stock || 0)
@@ -932,12 +933,16 @@ async function handle(req, res) {
     if (!['GET', 'HEAD'].includes(method)) checkMutation(req, authPath ? null : (session || partnerSession || adminSession));
     const base = path.startsWith('/api/customer') ? '/api/customer' : path.startsWith('/api/partner') ? '/api/partner' : '/api/admin';
     const route = path.slice(base.length) || '/';
+    /* Customer routes only match /api/customer/*, so an admin or partner path with
+     * the same tail (for example /api/admin/orders) can never fall into a customer
+     * handler that expects a customer session. */
+    const custRoute = base === '/api/customer' ? route : '\u0000';
 
     const page = clampInt(q.get('page') || 1, 1, 1000);
     const limit = clampInt(q.get('limit') || 12, 1, 48);
 
     /* ---------------------------- auth ----------------------------- */
-    if (method === 'POST' && route === '/auth/register') {
+    if (method === 'POST' && custRoute === '/auth/register') {
       rateLimit(`register:${clientIp(req)}`, 12, 3600e3);
       const name = String(payload.name || '').trim();
       const email = String(payload.email || '').trim().toLowerCase();
@@ -972,7 +977,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/auth/login') {
+    if (method === 'POST' && custRoute === '/auth/login') {
       rateLimit(`login:${clientIp(req)}`, 30, 900e3);
       const identifier = String(payload.identifier || payload.email || payload.phone || '').trim();
       rateLimit(`login-id:${sha(identifier.toLowerCase()).slice(0, 16)}`, 8, 900e3);
@@ -991,13 +996,13 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/auth/logout') {
+    if (method === 'POST' && custRoute === '/auth/logout') {
       if (session) db.prepare('DELETE FROM nb_sessions WHERE token_hash=?').run(sha(session.token));
       send(res, 200, { ok: true }, { 'Set-Cookie': `${SESSION_COOKIE}=; ${cookieAttrs(req)}; Max-Age=0` });
       return true;
     }
 
-    if (method === 'GET' && route === '/auth/me') {
+    if (method === 'GET' && custRoute === '/auth/me') {
       if (!session || session.role !== 'customer') {
         send(res, 200, { user: null, config: publicConfig() });
         return true;
@@ -1006,7 +1011,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/auth/verify/request') {
+    if (method === 'POST' && custRoute === '/auth/verify/request') {
       const s = requireCustomer(req);
       rateLimit(`verify:${s.user_id}`, 6, 600e3);
       const channel = payload.channel === 'phone' ? 'phone' : 'email';
@@ -1022,7 +1027,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/auth/verify/confirm') {
+    if (method === 'POST' && custRoute === '/auth/verify/confirm') {
       const s = requireCustomer(req);
       const channel = payload.channel === 'phone' ? 'phone' : 'email';
       const code = String(payload.code || '');
@@ -1040,7 +1045,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/auth/forgot') {
+    if (method === 'POST' && custRoute === '/auth/forgot') {
       rateLimit(`forgot:${clientIp(req)}`, 8, 3600e3);
       const email = String(payload.email || '').trim().toLowerCase();
       const generic = { message: 'If an account exists for that email, a password reset link has been created. Check your inbox.' };
@@ -1061,7 +1066,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/auth/reset') {
+    if (method === 'POST' && custRoute === '/auth/reset') {
       rateLimit(`reset:${clientIp(req)}`, 10, 3600e3);
       const token = String(payload.token || '');
       if (!/^[a-f0-9]{48}$/.test(token)) fail(400, 'This reset link is not valid.');
@@ -1080,7 +1085,7 @@ async function handle(req, res) {
     }
 
     /* -------------------------- bootstrap -------------------------- */
-    if (method === 'GET' && route === '/bootstrap') {
+    if (method === 'GET' && custRoute === '/bootstrap') {
       const customer = session && session.role === 'customer' ? session : null;
       const cart = customer ? priceCart(customer.user_id) : { itemCount: 0, total: 0, items: 0 };
       const wishlist = customer ? db.prepare('SELECT COUNT(*) AS n FROM nb_wishlist WHERE user_id=?').get(customer.user_id) : { n: 0 };
@@ -1101,7 +1106,7 @@ async function handle(req, res) {
     }
 
     /* --------------------------- home ------------------------------ */
-    if (method === 'GET' && route === '/home') {
+    if (method === 'GET' && custRoute === '/home') {
       const location = locationFromQuery(q);
       const banners = db.prepare('SELECT * FROM nb_banners WHERE active=1 ORDER BY sort, id').all().map((b) => ({
         id: b.id, title: b.title, subtitle: b.subtitle, eyebrow: b.eyebrow, ctaLabel: b.cta_label,
@@ -1134,12 +1139,12 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/categories') {
+    if (method === 'GET' && custRoute === '/categories') {
       send(res, 200, { categories: categoryList() });
       return true;
     }
 
-    if (method === 'GET' && route === '/localities') {
+    if (method === 'GET' && custRoute === '/localities') {
       const search = String(q.get('q') || '').toLowerCase();
       const rows = db.prepare(`SELECT pincode, locality, city, lat, lng FROM nb_service_areas WHERE active=1
         ${search ? 'AND (LOWER(locality) LIKE ? OR pincode LIKE ?)' : ''} ORDER BY locality LIMIT 20`)
@@ -1148,7 +1153,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/serviceability') {
+    if (method === 'GET' && custRoute === '/serviceability') {
       const pincode = String(q.get('pincode') || '');
       if (!pincodeOk(pincode)) fail(400, 'Enter a valid 6-digit pincode.');
       const area = pincodeArea(pincode);
@@ -1165,7 +1170,7 @@ async function handle(req, res) {
     }
 
     /* --------------------------- shops ----------------------------- */
-    if (method === 'GET' && route === '/shops') {
+    if (method === 'GET' && custRoute === '/shops') {
       const location = locationFromQuery(q);
       const out = queryShops({
         location, category: q.get('category') || '', q: q.get('q') || '',
@@ -1177,7 +1182,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && (route.match(/^\/shops\/([a-z0-9-]+)$/))) {
+    if (method === 'GET' && (custRoute.match(/^\/shops\/([a-z0-9-]+)$/))) {
       const slug = route.split('/')[2];
       const row = db.prepare('SELECT * FROM nb_shops WHERE slug=?').get(slug);
       if (!row) fail(404, 'Shop not found');
@@ -1209,7 +1214,7 @@ async function handle(req, res) {
     }
 
     /* -------------------------- products --------------------------- */
-    if (method === 'GET' && route === '/products') {
+    if (method === 'GET' && custRoute === '/products') {
       const location = locationFromQuery(q);
       const out = queryProducts({
         location, q: q.get('q') || '', category: q.get('category') || '', shop: q.get('shop') || '',
@@ -1224,7 +1229,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route.match(/^\/products\/([a-zA-Z0-9_-]+)\/compare$/)) {
+    if (method === 'GET' && custRoute.match(/^\/products\/([a-zA-Z0-9_-]+)\/compare$/)) {
       const id = route.split('/')[2];
       const product = db.prepare('SELECT * FROM nb_products WHERE id=?').get(id);
       if (!product) fail(404, 'Product not found');
@@ -1254,11 +1259,13 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route.match(/^\/products\/([a-zA-Z0-9_-]+)$/)) {
+    if (method === 'GET' && custRoute.match(/^\/products\/([a-zA-Z0-9_-]+)$/)) {
       const id = route.split('/')[2];
       const row = db.prepare('SELECT * FROM nb_products WHERE id=?').get(id);
-      if (!row) fail(404, 'Product not found');
+      /* Admin moderation hides a listing from the storefront without deleting it. */
+      if (!row || !row.active) fail(404, 'Product not found');
       const shop = db.prepare('SELECT * FROM nb_shops WHERE id=?').get(row.shop_id);
+      if (!shop) fail(404, 'Product not found');
       const location = locationFromQuery(q);
       const images = db.prepare('SELECT url FROM nb_product_images WHERE product_id=? ORDER BY sort').all(id).map((i) => i.url);
       const reviews = db.prepare(`SELECT r.*, u.name AS customer_name FROM nb_reviews r JOIN nb_users u ON u.id=r.customer_id
@@ -1291,7 +1298,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/search/suggest') {
+    if (method === 'GET' && custRoute === '/search/suggest') {
       const term = String(q.get('q') || '').trim();
       if (term.length < 2) { send(res, 200, { products: [], shops: [], categories: [] }); return true; }
       const like = `%${term.toLowerCase()}%`;
@@ -1306,7 +1313,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/offers') {
+    if (method === 'GET' && custRoute === '/offers') {
       const location = locationFromQuery(q);
       const offers = activeOffers(location);
       const eligibleProducts = db.prepare('SELECT p.* FROM nb_products p JOIN nb_shops s ON s.id=p.shop_id WHERE p.active=1 AND p.mrp_paise>p.price_paise ORDER BY ((p.mrp_paise-p.price_paise)*100/p.mrp_paise) DESC LIMIT 8')
@@ -1315,12 +1322,12 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/faqs') {
+    if (method === 'GET' && custRoute === '/faqs') {
       send(res, 200, { faqs: db.prepare('SELECT * FROM nb_faqs ORDER BY sort').all() });
       return true;
     }
 
-    if (method === 'GET' && route === '/reviews') {
+    if (method === 'GET' && custRoute === '/reviews') {
       const productId = q.get('productId');
       const shopSlug = q.get('shop');
       let rows;
@@ -1343,7 +1350,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/enquiry') {
+    if (method === 'POST' && custRoute === '/enquiry') {
       rateLimit(`enquiry:${clientIp(req)}`, 6, 3600e3);
       if (!str(payload.name, 2, 80)) fail(400, 'Please tell us your name.');
       if (!str(payload.contact, 5, 120)) fail(400, 'Add an email address or mobile number so we can reply.');
@@ -1358,13 +1365,13 @@ async function handle(req, res) {
     }
 
     /* -------------------------- addresses -------------------------- */
-    if (method === 'GET' && route === '/addresses') {
+    if (method === 'GET' && custRoute === '/addresses') {
       const s = requireCustomer(req);
       send(res, 200, { addresses: addressList(s.user_id), areas: db.prepare('SELECT pincode, locality, city FROM nb_service_areas WHERE active=1 ORDER BY locality').all() });
       return true;
     }
 
-    if (method === 'POST' && route === '/addresses') {
+    if (method === 'POST' && custRoute === '/addresses') {
       const s = requireCustomer(req);
       const count = db.prepare('SELECT COUNT(*) AS n FROM nb_addresses WHERE user_id=?').get(s.user_id);
       if (Number(count.n) >= 10) fail(409, 'You can save up to 10 addresses. Remove one first.');
@@ -1400,7 +1407,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'PATCH' && route.match(/^\/addresses\/[a-zA-Z0-9-]+$/)) {
+    if (method === 'PATCH' && custRoute.match(/^\/addresses\/[a-zA-Z0-9-]+$/)) {
       const s = requireCustomer(req);
       const id = route.split('/')[2];
       const existing = db.prepare('SELECT * FROM nb_addresses WHERE id=? AND user_id=?').get(id, s.user_id);
@@ -1432,7 +1439,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'DELETE' && route.match(/^\/addresses\/[a-zA-Z0-9-]+$/)) {
+    if (method === 'DELETE' && custRoute.match(/^\/addresses\/[a-zA-Z0-9-]+$/)) {
       const s = requireCustomer(req);
       const id = route.split('/')[2];
       const existing = db.prepare('SELECT * FROM nb_addresses WHERE id=? AND user_id=?').get(id, s.user_id);
@@ -1448,7 +1455,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route.match(/^\/addresses\/[a-zA-Z0-9-]+\/default$/)) {
+    if (method === 'POST' && custRoute.match(/^\/addresses\/[a-zA-Z0-9-]+\/default$/)) {
       const s = requireCustomer(req);
       const id = route.split('/')[2];
       if (!db.prepare('SELECT 1 FROM nb_addresses WHERE id=? AND user_id=?').get(id, s.user_id)) fail(404, 'Address not found');
@@ -1461,13 +1468,13 @@ async function handle(req, res) {
     }
 
     /* ----------------------------- cart ---------------------------- */
-    if (method === 'GET' && route === '/cart') {
+    if (method === 'GET' && custRoute === '/cart') {
       const s = requireCustomer(req);
       send(res, 200, { cart: priceCart(s.user_id), addresses: addressList(s.user_id) });
       return true;
     }
 
-    if (method === 'POST' && route === '/cart/items') {
+    if (method === 'POST' && custRoute === '/cart/items') {
       const s = requireCustomer(req);
       const productId = String(payload.productId || '');
       const addQty = clampInt(payload.qty || 1, 1, 20);
@@ -1495,7 +1502,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'PATCH' && route.match(/^\/cart\/items\/[a-zA-Z0-9_-]+$/)) {
+    if (method === 'PATCH' && custRoute.match(/^\/cart\/items\/[a-zA-Z0-9_-]+$/)) {
       const s = requireCustomer(req);
       const productId = route.split('/')[3];
       const item = db.prepare('SELECT ci.*, p.name, p.stock, p.reserved FROM nb_cart_items ci JOIN nb_products p ON p.id=ci.product_id WHERE ci.user_id=? AND ci.product_id=?').get(s.user_id, productId);
@@ -1513,7 +1520,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'DELETE' && route === '/cart/items') {
+    if (method === 'DELETE' && custRoute === '/cart/items') {
       const s = requireCustomer(req);
       db.prepare('DELETE FROM nb_cart_items WHERE user_id=?').run(s.user_id);
       db.prepare('UPDATE nb_carts SET coupon_code=NULL,updated_at=? WHERE user_id=?').run(now(), s.user_id);
@@ -1521,7 +1528,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'DELETE' && route.match(/^\/cart\/items\/[a-zA-Z0-9_-]+$/)) {
+    if (method === 'DELETE' && custRoute.match(/^\/cart\/items\/[a-zA-Z0-9_-]+$/)) {
       const s = requireCustomer(req);
       const productId = route.split('/')[3];
       db.prepare('DELETE FROM nb_cart_items WHERE user_id=? AND product_id=?').run(s.user_id, productId);
@@ -1529,7 +1536,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/cart/merge') {
+    if (method === 'POST' && custRoute === '/cart/merge') {
       const s = requireCustomer(req);
       const items = Array.isArray(payload.items) ? payload.items.slice(0, 40) : [];
       let added = 0;
@@ -1553,7 +1560,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/cart/coupon') {
+    if (method === 'POST' && custRoute === '/cart/coupon') {
       const s = requireCustomer(req);
       const code = String(payload.code || '').trim().toUpperCase();
       if (!/^[A-Z0-9-]{3,24}$/.test(code)) fail(400, 'Enter a valid coupon code.');
@@ -1567,7 +1574,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'DELETE' && route === '/cart/coupon') {
+    if (method === 'DELETE' && custRoute === '/cart/coupon') {
       const s = requireCustomer(req);
       getCartRow(s.user_id, true);
       db.prepare('UPDATE nb_carts SET coupon_code=NULL,updated_at=? WHERE user_id=?').run(now(), s.user_id);
@@ -1575,7 +1582,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/checkout/quote') {
+    if (method === 'POST' && custRoute === '/checkout/quote') {
       const s = requireCustomer(req);
       const quote = quoteFor(s.user_id, payload);
       send(res, 200, { quote });
@@ -1583,7 +1590,7 @@ async function handle(req, res) {
     }
 
     /* ---------------------------- orders --------------------------- */
-    if (method === 'POST' && route === '/orders') {
+    if (method === 'POST' && custRoute === '/orders') {
       const s = requireCustomer(req);
       rateLimit(`checkout:${s.user_id}`, 12, 300e3);
       const idempotencyKey = typeof payload.idempotencyKey === 'string' && payload.idempotencyKey.length >= 8 && payload.idempotencyKey.length <= 80
@@ -1671,7 +1678,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/orders') {
+    if (method === 'GET' && custRoute === '/orders') {
       const s = requireCustomer(req);
       const filter = String(q.get('filter') || 'all');
       const search = String(q.get('q') || '').toLowerCase();
@@ -1699,7 +1706,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route.match(/^\/orders\/[A-Za-z0-9-]+\/receipt$/)) {
+    if (method === 'GET' && custRoute.match(/^\/orders\/[A-Za-z0-9-]+\/receipt$/)) {
       const s = requireCustomer(req);
       const code = decodeURIComponent(route.split('/')[2]);
       const order = orderByCode(code, s.user_id);
@@ -1714,7 +1721,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route.match(/^\/orders\/[A-Za-z0-9-]+$/)) {
+    if (method === 'GET' && custRoute.match(/^\/orders\/[A-Za-z0-9-]+$/)) {
       const s = requireCustomer(req);
       const code = decodeURIComponent(route.split('/')[2]);
       const order = orderByCode(code, s.user_id);
@@ -1722,7 +1729,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route.match(/^\/orders\/[A-Za-z0-9-]+\/cancel$/)) {
+    if (method === 'POST' && custRoute.match(/^\/orders\/[A-Za-z0-9-]+\/cancel$/)) {
       const s = requireCustomer(req);
       const code = decodeURIComponent(route.split('/')[2]);
       const order = orderByCode(code, s.user_id);
@@ -1751,7 +1758,7 @@ async function handle(req, res) {
       return images.slice(0, 3).filter((v) => typeof v === 'string' && /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/.test(v) && v.length < 180000);
     };
 
-    if (method === 'POST' && route.match(/^\/orders\/[A-Za-z0-9-]+\/returns$/)) {
+    if (method === 'POST' && custRoute.match(/^\/orders\/[A-Za-z0-9-]+\/returns$/)) {
       const s = requireCustomer(req);
       const code = decodeURIComponent(route.split('/')[2]);
       const order = orderByCode(code, s.user_id);
@@ -1790,7 +1797,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/returns') {
+    if (method === 'GET' && custRoute === '/returns') {
       const s = requireCustomer(req);
       const rows = db.prepare(`SELECT r.*, o.code AS order_code, so.code AS seller_order_code, s.name AS shop_name, s.slug AS shop_slug,
           i.name AS item_name, i.emoji AS item_emoji, i.qty AS item_qty
@@ -1811,7 +1818,7 @@ async function handle(req, res) {
     }
 
     /* ---------------------------- reviews -------------------------- */
-    if (method === 'POST' && route === '/reviews') {
+    if (method === 'POST' && custRoute === '/reviews') {
       const s = requireCustomer(req);
       const order = orderByCode(String(payload.orderCode || ''), s.user_id);
       const so = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=? AND id=?').get(order.id, String(payload.sellerOrderId || ''));
@@ -1846,7 +1853,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/reviews/mine') {
+    if (method === 'GET' && custRoute === '/reviews/mine') {
       const s = requireCustomer(req);
       const rows = db.prepare(`SELECT r.*, s.name AS shop_name, s.slug AS shop_slug, p.name AS product_name, p.emoji AS product_emoji
         FROM nb_reviews r LEFT JOIN nb_shops s ON s.id=r.shop_id LEFT JOIN nb_products p ON p.id=r.product_id
@@ -1860,7 +1867,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route.match(/^\/reviews\/[a-zA-Z0-9-]+\/report$/)) {
+    if (method === 'POST' && custRoute.match(/^\/reviews\/[a-zA-Z0-9-]+\/report$/)) {
       const s = requireCustomer(req);
       const id = route.split('/')[2];
       const review = db.prepare('SELECT * FROM nb_reviews WHERE id=?').get(id);
@@ -1873,7 +1880,7 @@ async function handle(req, res) {
     }
 
     /* ---------------------------- wishlist ------------------------- */
-    if (method === 'GET' && route === '/wishlist') {
+    if (method === 'GET' && custRoute === '/wishlist') {
       const s = requireCustomer(req);
       const location = locationFromQuery(q);
       const rows = db.prepare(`SELECT p.* FROM nb_wishlist w JOIN nb_products p ON p.id=w.product_id
@@ -1882,7 +1889,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route.match(/^\/wishlist\/[a-zA-Z0-9_-]+$/)) {
+    if (method === 'POST' && custRoute.match(/^\/wishlist\/[a-zA-Z0-9_-]+$/)) {
       const s = requireCustomer(req);
       const productId = route.split('/')[2];
       if (!db.prepare('SELECT 1 FROM nb_products WHERE id=? AND active=1').get(productId)) fail(404, 'Product not found');
@@ -1891,7 +1898,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'DELETE' && route.match(/^\/wishlist\/[a-zA-Z0-9_-]+$/)) {
+    if (method === 'DELETE' && custRoute.match(/^\/wishlist\/[a-zA-Z0-9_-]+$/)) {
       const s = requireCustomer(req);
       const productId = route.split('/')[2];
       db.prepare('DELETE FROM nb_wishlist WHERE user_id=? AND product_id=?').run(s.user_id, productId);
@@ -1900,7 +1907,7 @@ async function handle(req, res) {
     }
 
     /* --------------------------- account --------------------------- */
-    if (method === 'GET' && route === '/account') {
+    if (method === 'GET' && custRoute === '/account') {
       const s = requireCustomer(req);
       const userId = s.user_id;
       const orders = db.prepare('SELECT * FROM nb_orders WHERE customer_id=? ORDER BY created_at DESC').all(userId).map((o) => orderSummary(o));
@@ -1924,7 +1931,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'PATCH' && route === '/account') {
+    if (method === 'PATCH' && custRoute === '/account') {
       const s = requireCustomer(req);
       const user = db.prepare('SELECT * FROM nb_users WHERE id=?').get(s.user_id);
       const name = payload.name !== undefined ? String(payload.name).trim() : user.name;
@@ -1939,7 +1946,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/account/password') {
+    if (method === 'POST' && custRoute === '/account/password') {
       const s = requireCustomer(req);
       const user = db.prepare('SELECT * FROM nb_users WHERE id=?').get(s.user_id);
       if (!checkPassword(payload.current || '', user.password_hash)) fail(400, 'Your current password is not correct.');
@@ -1954,7 +1961,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && (route === '/account/email/request' || route === '/account/phone/request')) {
+    if (method === 'POST' && (custRoute === '/account/email/request' || custRoute === '/account/phone/request')) {
       const s = requireCustomer(req);
       rateLimit(`contact-change:${s.user_id}`, 6, 600e3);
       const isEmail = route.includes('/email/');
@@ -1974,7 +1981,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && (route === '/account/email/confirm' || route === '/account/phone/confirm')) {
+    if (method === 'POST' && (custRoute === '/account/email/confirm' || custRoute === '/account/phone/confirm')) {
       const s = requireCustomer(req);
       const isEmail = route.includes('/email/');
       const channel = isEmail ? 'email' : 'phone';
@@ -1993,7 +2000,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route === '/account/sessions') {
+    if (method === 'GET' && custRoute === '/account/sessions') {
       const s = requireCustomer(req);
       const rows = db.prepare('SELECT token_hash,created_at,expires_at,user_agent FROM nb_sessions WHERE user_id=? ORDER BY created_at DESC').all(s.user_id);
       send(res, 200, { sessions: rows.map((r) => ({
@@ -2003,7 +2010,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/account/sessions/revoke') {
+    if (method === 'POST' && custRoute === '/account/sessions/revoke') {
       const s = requireCustomer(req);
       if (payload.all === true) {
         db.prepare('DELETE FROM nb_sessions WHERE user_id=?').run(s.user_id);
@@ -2018,7 +2025,7 @@ async function handle(req, res) {
     }
 
     /* ------------------------- notifications ----------------------- */
-    if (method === 'GET' && route === '/notifications') {
+    if (method === 'GET' && custRoute === '/notifications') {
       const s = requireCustomer(req);
       const rows = db.prepare('SELECT * FROM nb_notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100').all(s.user_id);
       send(res, 200, {
@@ -2028,7 +2035,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/notifications/read') {
+    if (method === 'POST' && custRoute === '/notifications/read') {
       const s = requireCustomer(req);
       if (payload.all === true) db.prepare('UPDATE nb_notifications SET is_read=1 WHERE user_id=?').run(s.user_id);
       else if (Array.isArray(payload.ids)) {
@@ -2043,7 +2050,7 @@ async function handle(req, res) {
     /* --------------------------- support --------------------------- */
     const TICKET_CATEGORIES = ['order', 'payment', 'delivery', 'missing', 'damaged', 'wrong', 'return', 'shop', 'account', 'other'];
 
-    if (method === 'GET' && route === '/tickets') {
+    if (method === 'GET' && custRoute === '/tickets') {
       const s = requireCustomer(req);
       const rows = db.prepare('SELECT * FROM nb_tickets WHERE customer_id=? ORDER BY created_at DESC').all(s.user_id);
       send(res, 200, { tickets: rows.map((t) => ({
@@ -2053,7 +2060,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route === '/tickets') {
+    if (method === 'POST' && custRoute === '/tickets') {
       const s = requireCustomer(req);
       rateLimit(`ticket:${s.user_id}`, 8, 3600e3);
       const category = TICKET_CATEGORIES.includes(payload.category) ? payload.category : null;
@@ -2079,7 +2086,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'GET' && route.match(/^\/tickets\/[A-Za-z0-9-]+$/)) {
+    if (method === 'GET' && custRoute.match(/^\/tickets\/[A-Za-z0-9-]+$/)) {
       const s = requireCustomer(req);
       const code = decodeURIComponent(route.split('/')[2]);
       const ticket = db.prepare('SELECT * FROM nb_tickets WHERE code=? AND customer_id=?').get(code, s.user_id);
@@ -2095,7 +2102,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route.match(/^\/tickets\/[A-Za-z0-9-]+\/messages$/)) {
+    if (method === 'POST' && custRoute.match(/^\/tickets\/[A-Za-z0-9-]+\/messages$/)) {
       const s = requireCustomer(req);
       const code = decodeURIComponent(route.split('/')[2]);
       const ticket = db.prepare('SELECT * FROM nb_tickets WHERE code=? AND customer_id=?').get(code, s.user_id);
@@ -2112,7 +2119,7 @@ async function handle(req, res) {
       return true;
     }
 
-    if (method === 'POST' && route.match(/^\/tickets\/[A-Za-z0-9-]+\/close$/)) {
+    if (method === 'POST' && custRoute.match(/^\/tickets\/[A-Za-z0-9-]+\/close$/)) {
       const s = requireCustomer(req);
       const code = decodeURIComponent(route.split('/')[2]);
       const ticket = db.prepare('SELECT * FROM nb_tickets WHERE code=? AND customer_id=?').get(code, s.user_id);
@@ -2631,7 +2638,7 @@ async function handle(req, res) {
     /* Payments                                                            */
     /* ================================================================== */
 
-    if (method === 'POST' && route === '/payments/intent') {
+    if (method === 'POST' && custRoute === '/payments/intent') {
       const s = requireCustomer(req);
       if (!GATEWAY.configured) fail(503, 'Online payment is not configured. This deployment has no Razorpay keys, so no payment can be started.');
       const order = orderByCode(String(payload.orderCode || ''), s.user_id);
@@ -2866,9 +2873,272 @@ async function handle(req, res) {
       return true;
     }
 
+    if (base === '/api/admin' && method === 'PATCH' && /^\/enquiries\/[A-Za-z0-9-]+$/.test(route)) {
+      const admin = requireAdmin();
+      const code = route.split('/')[2];
+      const status = String(payload.status || '');
+      if (!['open', 'in_review', 'closed'].includes(status)) fail(400, 'Unknown enquiry status.');
+      const row = db.prepare('SELECT * FROM nb_enquiries WHERE code = ?').get(code);
+      if (!row) fail(404, 'Enquiry not found.');
+      db.prepare('UPDATE nb_enquiries SET status = ? WHERE code = ?').run(status, code);
+      audit('admin', admin.user_id, 'enquiry_status', 'enquiry', code, `Enquiry ${code} → ${status}`);
+      send(res, 200, { message: `Enquiry ${code} marked ${status.replace('_', ' ')}.` });
+      return true;
+    }
+
     if (base === '/api/admin' && route === '/audit' && method === 'GET') {
       requireAdmin();
       send(res, 200, { logs: db.prepare('SELECT * FROM nb_audit_logs ORDER BY id DESC LIMIT 200').all() });
+      return true;
+    }
+
+    /* ================================================================== */
+    /* Seller shop profile + catalogue management                          */
+    /* ================================================================== */
+
+    if (base === '/api/partner' && route === '/seller/shop' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      send(res, 200, { shop: shopRow(shop) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/shop' && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const next = {
+        is_open: payload.isOpen === undefined ? shop.is_open : payload.isOpen ? 1 : 0,
+        delivery_enabled: payload.deliveryEnabled === undefined ? shop.delivery_enabled : payload.deliveryEnabled ? 1 : 0,
+        pickup_enabled: payload.pickupEnabled === undefined ? shop.pickup_enabled : payload.pickupEnabled ? 1 : 0,
+        prep_minutes: payload.prepMinutes === undefined ? shop.prep_minutes : clampInt(payload.prepMinutes, 1, 240),
+        delivery_fee_paise: payload.deliveryFee === undefined ? shop.delivery_fee_paise : clampInt(payload.deliveryFee, 0, 200000),
+        pickup_fee_paise: payload.pickupFee === undefined ? shop.pickup_fee_paise : clampInt(payload.pickupFee, 0, 200000),
+        min_order_paise: payload.minOrder === undefined ? shop.min_order_paise : clampInt(payload.minOrder, 0, 1000000),
+        radius_km: payload.radiusKm === undefined ? shop.radius_km : round2(Math.min(50, Math.max(0.5, Number(payload.radiusKm) || shop.radius_km))),
+        opens_at: str(payload.opensAt, 4, 5) ? payload.opensAt.trim() : shop.opens_at,
+        closes_at: str(payload.closesAt, 4, 5) ? payload.closesAt.trim() : shop.closes_at,
+        phone: str(payload.phone, 6, 20) ? normalPhone(payload.phone) : shop.phone
+      };
+      if (!next.delivery_enabled && !next.pickup_enabled) fail(400, 'Keep at least one fulfilment option enabled: home delivery or store pickup.');
+      if (!/^\d{1,2}:\d{2}$/.test(next.opens_at) || !/^\d{1,2}:\d{2}$/.test(next.closes_at)) fail(400, 'Opening and closing times must look like 09:00.');
+      db.prepare(`UPDATE nb_shops SET is_open=?,delivery_enabled=?,pickup_enabled=?,prep_minutes=?,delivery_fee_paise=?,
+        pickup_fee_paise=?,min_order_paise=?,radius_km=?,opens_at=?,closes_at=?,phone=? WHERE id=?`).run(
+        next.is_open, next.delivery_enabled, next.pickup_enabled, next.prep_minutes, next.delivery_fee_paise,
+        next.pickup_fee_paise, next.min_order_paise, next.radius_km, next.opens_at, next.closes_at, next.phone, shop.id
+      );
+      audit('seller', s.user_id, 'shop_updated', 'shop', shop.id, JSON.stringify(next).slice(0, 300));
+      const updated = db.prepare('SELECT * FROM nb_shops WHERE id=?').get(shop.id);
+      send(res, 200, { message: 'Shop settings saved. Customers see the change immediately.', shop: shopRow(updated) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/products' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const name = String(payload.name || '').trim();
+      if (!str(name, 2, 120)) fail(400, 'Give the product a name of 2–120 characters.');
+      const categorySlug = String(payload.category || shop.category_slug);
+      if (!db.prepare('SELECT 1 FROM nb_categories WHERE slug=?').get(categorySlug)) fail(400, 'Choose a valid category.');
+      const price = Math.round(Number(payload.price));
+      const mrp = payload.mrp === undefined || payload.mrp === null || payload.mrp === '' ? price : Math.round(Number(payload.mrp));
+      if (!Number.isFinite(price) || price < 100 || price > 1000000) fail(400, 'Price must be between ₹1 and ₹10,000.');
+      if (!Number.isFinite(mrp) || mrp < price) fail(400, 'MRP cannot be lower than the selling price.');
+      const stock = clampInt(payload.stock, 0, 100000);
+      const compareKey = payload.compareKey ? String(payload.compareKey).trim().slice(0, 60)
+        : `${NB_SLUG(name)}-${String(payload.unit || '1 pc').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+      const id = `${shop.slug}-${NB_SLUG(name).slice(0, 32)}-${randomBytes(3).toString('hex')}`;
+      db.prepare(`INSERT INTO nb_products(id,shop_id,category_slug,compare_key,name,brand,variant,description,highlights,specs,unit,pack_size,emoji,image_url,
+        price_paise,mrp_paise,tax_rate,stock,reserved,low_stock,return_days,rating,review_count,active,is_demo,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,0,0,1,0,?)`).run(
+        id, shop.id, categorySlug, compareKey, name, String(payload.brand || '').trim() || null,
+        String(payload.variant || '').trim() || null, String(payload.description || '').slice(0, 2000) || null,
+        '[]', '[]', String(payload.unit || '1 pc').slice(0, 40), String(payload.packSize || '').slice(0, 40) || null,
+        String(payload.emoji || '🛍️').slice(0, 8), String(payload.imageUrl || '').slice(0, 300) || null,
+        price, mrp, Math.min(28, Math.max(0, Number(payload.taxRate) || 0)), stock, clampInt(payload.lowStock ?? 5, 0, 1000),
+        clampInt(payload.returnDays ?? 0, 0, 30), now()
+      );
+      audit('seller', s.user_id, 'product_created', 'product', id, `${name} · ${price}`);
+      send(res, 201, { message: `${name} is live in your catalogue.`, productId: id });
+      return true;
+    }
+
+    /* ================================================================== */
+    /* Admin: catalogue, service areas, shops, deliveries, broadcast        */
+    /* ================================================================== */
+
+    if (base === '/api/admin' && route === '/categories' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT c.*, (SELECT COUNT(*) FROM nb_shops s WHERE s.category_slug=c.slug) AS shops,
+        (SELECT COUNT(*) FROM nb_products p WHERE p.category_slug=c.slug) AS products
+        FROM nb_categories c ORDER BY c.parent_slug IS NOT NULL, c.sort, c.name`).all();
+      send(res, 200, {
+        categories: rows.map((c) => ({
+          slug: c.slug, name: c.name, icon: c.icon, tone: c.tone, parentSlug: c.parent_slug,
+          sort: c.sort, active: Boolean(c.active), shops: Number(c.shops || 0), products: Number(c.products || 0)
+        }))
+      });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/categories' && method === 'POST') {
+      const admin = requireAdmin();
+      const name = String(payload.name || '').trim();
+      if (!str(name, 2, 60)) fail(400, 'Give the category a name of 2–60 characters.');
+      const slug = String(payload.slug || NB_SLUG(name)).toLowerCase();
+      if (!/^[a-z0-9-]{2,60}$/.test(slug)) fail(400, 'Slug may only contain letters, numbers and dashes.');
+      const parentSlug = payload.parentSlug ? String(payload.parentSlug).trim() : null;
+      if (parentSlug && !db.prepare('SELECT 1 FROM nb_categories WHERE slug=?').get(parentSlug)) fail(400, 'The parent category does not exist.');
+      if (parentSlug === slug) fail(400, 'A category cannot be its own parent.');
+      const existing = db.prepare('SELECT * FROM nb_categories WHERE slug=?').get(slug);
+      if (existing) {
+        db.prepare('UPDATE nb_categories SET name=?,icon=?,tone=?,parent_slug=?,sort=?,active=? WHERE slug=?').run(
+          name, String(payload.icon || existing.icon || '🏷️').slice(0, 8), String(payload.tone || existing.tone || 'blue').slice(0, 12),
+          parentSlug, clampInt(payload.sort ?? existing.sort, 0, 999), payload.active === undefined ? existing.active : payload.active ? 1 : 0, slug
+        );
+        audit('admin', admin.user_id, 'category_updated', 'category', slug, name);
+        send(res, 200, { message: `Category ${name} updated.`, slug });
+        return true;
+      }
+      db.prepare('INSERT INTO nb_categories(slug,name,icon,tone,parent_slug,sort,active) VALUES(?,?,?,?,?,?,?)').run(
+        slug, name, String(payload.icon || '🏷️').slice(0, 8), String(payload.tone || 'blue').slice(0, 12),
+        parentSlug, clampInt(payload.sort ?? 50, 0, 999), payload.active === false ? 0 : 1
+      );
+      audit('admin', admin.user_id, 'category_created', 'category', slug, name);
+      send(res, 201, { message: `Category ${name} created.`, slug });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/service-areas' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare('SELECT * FROM nb_service_areas ORDER BY pincode, locality').all();
+      send(res, 200, {
+        areas: rows.map((a) => ({ id: a.id, pincode: a.pincode, locality: a.locality, city: a.city, lat: a.lat, lng: a.lng, active: Boolean(a.active) }))
+      });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/service-areas' && method === 'POST') {
+      const admin = requireAdmin();
+      if (!pincodeOk(payload.pincode)) fail(400, 'Enter a valid 6-digit PIN code.');
+      if (!str(payload.locality, 2, 80)) fail(400, 'Enter the locality name.');
+      const lat = Number(payload.lat);
+      const lng = Number(payload.lng);
+      if (!Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lng) || Math.abs(lng) > 180) fail(400, 'Valid coordinates are required to place the area on the map.');
+      const existing = db.prepare('SELECT * FROM nb_service_areas WHERE pincode=? AND locality=?').get(String(payload.pincode), payload.locality.trim());
+      if (existing) {
+        db.prepare('UPDATE nb_service_areas SET city=?,lat=?,lng=?,active=? WHERE id=?').run(
+          String(payload.city || 'New Delhi').slice(0, 60), lat, lng, payload.active === false ? 0 : 1, existing.id
+        );
+        audit('admin', admin.user_id, 'service_area_updated', 'service_area', String(existing.id), payload.locality);
+        send(res, 200, { message: 'Service area updated.' });
+        return true;
+      }
+      db.prepare('INSERT INTO nb_service_areas(pincode,locality,city,lat,lng,active) VALUES(?,?,?,?,?,1)')
+        .run(String(payload.pincode), payload.locality.trim(), String(payload.city || 'New Delhi').slice(0, 60), lat, lng);
+      audit('admin', admin.user_id, 'service_area_created', 'service_area', null, `${payload.pincode} ${payload.locality}`);
+      send(res, 201, { message: `${payload.locality} is now serviceable.` });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/shops\/[a-z0-9-]+$/) && method === 'PATCH') {
+      const admin = requireAdmin();
+      const shop = db.prepare('SELECT * FROM nb_shops WHERE slug=?').get(route.split('/')[2]);
+      if (!shop) fail(404, 'Shop not found');
+      const verified = payload.verified === undefined ? shop.verified : payload.verified ? 1 : 0;
+      const openState = payload.isOpen === undefined ? shop.is_open : payload.isOpen ? 1 : 0;
+      const radius = payload.radiusKm === undefined ? shop.radius_km : round2(Math.min(50, Math.max(0.5, Number(payload.radiusKm) || shop.radius_km)));
+      const pincodes = payload.servicePincodes === undefined ? shop.service_pincodes
+        : (Array.isArray(payload.servicePincodes) ? payload.servicePincodes : String(payload.servicePincodes).split(','))
+          .map((p) => String(p).trim()).filter((p) => pincodeOk(p)).join(',');
+      if (payload.servicePincodes !== undefined && shop.service_pincodes && !pincodes) {
+        fail(400, 'Enter at least one valid 6-digit PIN code.');
+      }
+      db.prepare('UPDATE nb_shops SET verified=?,is_open=?,radius_km=?,service_pincodes=? WHERE id=?')
+        .run(verified, openState, radius, pincodes, shop.id);
+      audit('admin', admin.user_id, 'shop_updated', 'shop', shop.id, `verified ${shop.verified}→${verified}, open ${shop.is_open}→${openState}, radius ${shop.radius_km}→${radius}`);
+      const updated = db.prepare('SELECT * FROM nb_shops WHERE id=?').get(shop.id);
+      send(res, 200, { message: `${updated.name} updated.`, shop: shopCard(updated, null) });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/customers\/[a-zA-Z0-9-]+$/) && method === 'PATCH') {
+      const admin = requireAdmin();
+      const customer = db.prepare("SELECT * FROM nb_users WHERE id=? AND role='customer'").get(route.split('/')[2]);
+      if (!customer) fail(404, 'Customer not found');
+      if (!['active', 'suspended'].includes(payload.status)) fail(400, 'Choose active or suspended.');
+      db.prepare('UPDATE nb_users SET status=? WHERE id=?').run(payload.status, customer.id);
+      if (payload.status === 'suspended') {
+        db.prepare('DELETE FROM nb_sessions WHERE user_id=?').run(customer.id);
+        notify(customer.id, 'Account suspended', 'Your NearBuy account has been suspended. Contact support if you think this is a mistake.', 'account', '#/help');
+      }
+      audit('admin', admin.user_id, 'customer_status', 'user', customer.id, `${customer.status} → ${payload.status}`);
+      send(res, 200, { message: `${customer.name} is now ${payload.status}.` });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/products' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT p.id,p.name,p.brand,p.category_slug,p.price_paise,p.mrp_paise,p.stock,p.reserved,p.active,p.is_demo,
+        s.name AS shop_name, s.slug AS shop_slug FROM nb_products p JOIN nb_shops s ON s.id=p.shop_id
+        ORDER BY p.active, s.name, p.name LIMIT 400`).all();
+      send(res, 200, {
+        products: rows.map((p) => ({
+          id: p.id, name: p.name, brand: p.brand, category: p.category_slug, price: p.price_paise, mrp: p.mrp_paise,
+          stock: p.stock, reserved: p.reserved, available: Math.max(0, p.stock - p.reserved), active: Boolean(p.active),
+          shop: { name: p.shop_name, slug: p.shop_slug }
+        }))
+      });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/products\/[a-zA-Z0-9_-]+$/) && method === 'PATCH') {
+      const admin = requireAdmin();
+      const product = db.prepare('SELECT * FROM nb_products WHERE id=?').get(route.split('/')[2]);
+      if (!product) fail(404, 'Product not found');
+      if (payload.active === undefined) fail(400, 'Send active: true or false to moderate a listing.');
+      db.prepare('UPDATE nb_products SET active=? WHERE id=?').run(payload.active ? 1 : 0, product.id);
+      audit('admin', admin.user_id, 'product_moderated', 'product', product.id, `${product.active} → ${payload.active ? 1 : 0}`);
+      const shop = db.prepare('SELECT owner_user_id,name FROM nb_shops WHERE id=?').get(product.shop_id);
+      if (shop?.owner_user_id) notify(shop.owner_user_id, `Listing ${payload.active ? 'restored' : 'hidden'}`, `${product.name} was ${payload.active ? 'restored to' : 'removed from'} the customer storefront by platform operations.`, 'seller', '#/catalogue');
+      send(res, 200, { message: `${product.name} is now ${payload.active ? 'live' : 'hidden'}.` });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/deliveries' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT a.*, so.code AS order_code, so.status AS order_status, s.name AS shop_name, u.name AS runner_name
+        FROM nb_delivery_assignments a JOIN nb_seller_orders so ON so.id=a.seller_order_id
+        JOIN nb_shops s ON s.id=a.shop_id LEFT JOIN nb_users u ON u.id=a.runner_id
+        ORDER BY a.created_at DESC LIMIT 100`).all();
+      send(res, 200, {
+        deliveries: rows.map((a) => ({
+          id: a.id, orderCode: a.order_code, orderStatus: a.order_status, shop: a.shop_name, runner: a.runner_name,
+          status: a.status, payout: a.payout_paise, distanceKm: a.distance_km, createdAt: a.created_at,
+          expiresAt: a.expires_at, pickedUpAt: a.picked_up_at, deliveredAt: a.delivered_at
+        }))
+      });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/notifications' && method === 'POST') {
+      const admin = requireAdmin();
+      if (!str(payload.title, 3, 120)) fail(400, 'A notification title is required.');
+      if (!str(payload.body, 3, 400)) fail(400, 'Write the notification message.');
+      const audience = payload.audience === 'shop_customers' ? 'shop_customers' : payload.audience === 'sellers' ? 'sellers' : 'customers';
+      let users;
+      if (audience === 'sellers') users = db.prepare("SELECT id FROM nb_users WHERE role='seller' AND status='active'").all();
+      else if (audience === 'shop_customers' && payload.shopSlug) {
+        users = db.prepare(`SELECT DISTINCT o.customer_id AS id FROM nb_orders o JOIN nb_seller_orders so ON so.order_id=o.id
+          JOIN nb_shops s ON s.id=so.shop_id WHERE s.slug=?`).all(String(payload.shopSlug));
+      } else users = db.prepare("SELECT id FROM nb_users WHERE role='customer' AND status='active'").all();
+      transaction(() => {
+        for (const u of users) notify(u.id, payload.title.trim(), payload.body.trim(), 'platform', String(payload.link || '#/notifications').slice(0, 200));
+        audit('admin', admin.user_id, 'broadcast', 'notification', null, `${audience}: ${payload.title}`);
+      });
+      send(res, 201, {
+        message: `Notification stored for ${users.length} ${audience.replace('_', ' ')}. In-app delivery is immediate; no SMS or email provider is configured.`,
+        recipients: users.length
+      });
       return true;
     }
 
