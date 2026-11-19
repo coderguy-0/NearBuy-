@@ -29,6 +29,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const orderApi = require('./orders');
+const customerApi = require('./customer/api');
 
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -189,7 +190,12 @@ function redirect(res, to, code = 301) {
 
 const server = http.createServer(async (req, res) => {
   try {
-    if ((req.url || '').split('?')[0].startsWith('/api/')) { await orderApi.handle(req, res); return; }
+    if ((req.url || '').split('?')[0].startsWith('/api/')) {
+      const handled = await customerApi.handle(req, res);
+      if (handled) return;
+      await orderApi.handle(req, res);
+      return;
+    }
   } catch {
     if (!res.headersSent && !res.destroyed) {
       res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
