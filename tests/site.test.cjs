@@ -55,6 +55,7 @@ const PAGES = [
   '/business.html',
   '/delivery-admin.html',
   '/customer/',
+  '/customer/index.html',
   '/customer/login/',
   '/seller/',
   '/seller/register/',
@@ -74,6 +75,13 @@ const PAGES = [
 ];
 
 const ASSETS = [
+  '/customer/app.css',
+  '/customer/core.js',
+  '/customer/views-home.js',
+  '/customer/views-shop.js',
+  '/customer/views-cart.js',
+  '/customer/views-orders.js',
+  '/customer/views-account.js',
   '/home.css',
   '/home.js',
   '/nearbuy.css',
