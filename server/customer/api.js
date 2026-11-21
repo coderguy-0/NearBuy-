@@ -142,9 +142,9 @@ const cookieAttrs = (req) => {
 function startSession(req, user, cookieName = SESSION_COOKIE, hours = SESSION_HOURS) {
   const token = randomBytes(32).toString('hex');
   const csrf = randomBytes(24).toString('hex');
-  db.prepare('INSERT INTO nb_sessions(token_hash,user_id,role,csrf,created_at,expires_at,user_agent) VALUES(?,?,?,?,?,?,?)')
+  db.prepare('INSERT INTO nb_sessions(token_hash,user_id,role,csrf,created_at,expires_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)')
     .run(sha(token), user.id, user.role, csrf,
-      now(), new Date(Date.now() + hours * 3600e3).toISOString(), String(req.headers['user-agent'] || '').slice(0, 200));
+      now(), new Date(Date.now() + hours * 3600e3).toISOString(), String(req.headers['user-agent'] || '').slice(0, 200), clientIp(req));
   return { cookie: `${cookieName}=${token}; ${cookieAttrs(req)}; Max-Age=${hours * 3600}`, csrf, token };
 }
 
@@ -158,7 +158,7 @@ function sessionFor(req, cookieName = SESSION_COOKIE) {
     db.prepare('DELETE FROM nb_sessions WHERE token_hash=?').run(sha(token));
     return null;
   }
-  if (row.status !== 'active') return null;
+  if (row.status !== 'active' && !(cookieName === PARTNER_COOKIE && row.status === 'pending_verification')) return null;
   return { ...row, token };
 }
 
@@ -225,6 +225,13 @@ const STATUS_LABELS = {
   returned: 'Returned',
   payment_failed: 'Payment failed'
 };
+
+function insertRow(table, columns, values) {
+  if (columns.length !== values.length) {
+    throw new Error(`insertRow(${table}): ${values.length} values for ${columns.length} columns`);
+  }
+  db.prepare(`INSERT INTO ${table}(${columns.join(',')}) VALUES(${columns.map(() => '?').join(',')})`).run(...values);
+}
 
 function shopRow(row) {
   if (!row) return null;
@@ -421,8 +428,10 @@ function activeOffers(location) {
       shop: shop ? { name: shop.name, slug: shop.slug } : null,
       endsAt: c.ends_at, startsAt: c.starts_at, usedCount: Number(redemptions?.n || 0),
       usageLimit: c.usage_limit,
-      savingsLabel: c.type === 'percent' ? `${c.value}% off${c.max_discount_paise ? ' up to ₹' + Math.round(c.max_discount_paise / 100) : ''}`
-        : c.type === 'fixed' ? `₹${Math.round(c.value / 100)} off` : 'Free delivery',
+      savingsLabel: (c.promo_type === 'bogo' || c.type === 'bogo')
+        ? `Buy ${c.buy_qty || 1} get ${c.get_qty || 1} free`
+        : c.type === 'percent' ? `${c.value}% off${c.max_discount_paise ? ' up to ₹' + Math.round(c.max_discount_paise / 100) : ''}`
+          : c.type === 'fixed' ? `₹${Math.round(c.value / 100)} off` : 'Free delivery',
       expiringSoon: new Date(c.ends_at).getTime() - Date.now() < 3 * 864e5
     };
   });
@@ -449,6 +458,21 @@ function cartLines(userId) {
     WHERE ci.user_id=? ORDER BY s.name, ci.created_at`).all(userId);
 }
 
+function parseJsonArray(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v;
+  try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return String(v).split(',').map((s) => s.trim()).filter(Boolean); }
+}
+
+function couponEligibleRows(coupon, cartRows) {
+  let rows = coupon.shop_id ? cartRows.filter((r) => r.shop_id === coupon.shop_id) : cartRows.slice();
+  const productIds = parseJsonArray(coupon.product_ids);
+  const categorySlugs = parseJsonArray(coupon.category_slugs);
+  if (productIds.length) rows = rows.filter((r) => productIds.includes(r.id));
+  else if (categorySlugs.length) rows = rows.filter((r) => categorySlugs.includes(r.category_slug));
+  return rows;
+}
+
 function couponUsable(coupon, userId, cartRows, subtotal) {
   if (!coupon || !coupon.active) return { ok: false, message: 'This coupon is not valid.' };
   const at = Date.now();
@@ -460,12 +484,44 @@ function couponUsable(coupon, userId, cartRows, subtotal) {
   if (coupon.shop_id) {
     const has = cartRows.some((r) => r.shop_id === coupon.shop_id);
     if (!has) return { ok: false, message: 'This coupon only applies to items from a specific shop.' };
-    const shopSub = cartRows.filter((r) => r.shop_id === coupon.shop_id).reduce((t, r) => t + r.price_paise * r.qty, 0);
-    if (shopSub < coupon.min_order_paise) return { ok: false, message: `Add ₹${Math.ceil((coupon.min_order_paise - shopSub) / 100)} more from this shop to use ${coupon.code}.` };
-  } else if (subtotal < coupon.min_order_paise) {
-    return { ok: false, message: `Add ₹${Math.ceil((coupon.min_order_paise - subtotal) / 100)} more to use ${coupon.code}.` };
   }
-  return { ok: true };
+  const eligible = couponEligibleRows(coupon, cartRows);
+  const eligibleSubtotal = eligible.reduce((t, r) => t + r.price_paise * r.qty, 0);
+  const productIds = parseJsonArray(coupon.product_ids);
+  const categorySlugs = parseJsonArray(coupon.category_slugs);
+  if ((productIds.length || categorySlugs.length) && !eligible.length) {
+    return { ok: false, message: `This offer only applies to ${productIds.length ? 'selected products' : 'selected categories'}.` };
+  }
+  const baseForMin = (productIds.length || categorySlugs.length) ? eligibleSubtotal : (coupon.shop_id ? eligibleSubtotal : subtotal);
+  if (baseForMin < coupon.min_order_paise) {
+    const scope = coupon.shop_id ? ' from this shop' : '';
+    return { ok: false, message: `Add ₹${Math.ceil((coupon.min_order_paise - baseForMin) / 100)} more${scope} to use ${coupon.code}.` };
+  }
+  if (coupon.promo_type === 'bogo' || coupon.type === 'bogo') {
+    const buy = Number(coupon.buy_qty || 1);
+    const get = Number(coupon.get_qty || 1);
+    const units = [];
+    for (const r of eligible) for (let i = 0; i < r.qty; i++) units.push(r.price_paise);
+    units.sort((a, b) => a - b);
+    const groups = Math.floor(units.length / (buy + get));
+    if (groups < 1) return { ok: false, message: `Add ${buy + get} eligible items to use this buy-one-get-one offer.` };
+  }
+  return { ok: true, eligibleSubtotal };
+}
+
+function bogoDiscount(coupon, eligibleRows) {
+  const buy = Number(coupon.buy_qty || 1);
+  const get = Number(coupon.get_qty || 1);
+  const units = [];
+  for (const r of eligibleRows) for (let i = 0; i < r.qty; i++) units.push(r.price_paise);
+  units.sort((a, b) => a - b);
+  const groups = Math.floor(units.length / (buy + get));
+  let discount = 0;
+  for (let g = 0; g < groups; g++) {
+    for (let i = 0; i < get; i++) discount += units[g * (buy + get) + i] || 0;
+  }
+  if (coupon.max_discount_paise) discount = Math.min(discount, coupon.max_discount_paise);
+  return discount;
 }
 
 function priceCart(userId, opts = {}) {
@@ -486,9 +542,13 @@ function priceCart(userId, opts = {}) {
   }
 
   const shopCoupon = usableCoupon?.shop_id || null;
+  const eligibleSubtotal = couponCheck?.eligibleSubtotal != null ? couponCheck.eligibleSubtotal : subtotal;
+  const eligibleRows = usableCoupon ? couponEligibleRows(usableCoupon, rows) : [];
+  const isBogo = usableCoupon && (usableCoupon.promo_type === 'bogo' || usableCoupon.type === 'bogo');
   const platformDiscountTotal = usableCoupon && !shopCoupon && usableCoupon.type !== 'free_delivery'
-    ? Math.min(usableCoupon.type === 'percent' ? Math.floor((subtotal * usableCoupon.value) / 100) : usableCoupon.value,
-      usableCoupon.max_discount_paise || Infinity, subtotal)
+    ? (isBogo ? bogoDiscount(usableCoupon, eligibleRows)
+      : Math.min(usableCoupon.type === 'percent' ? Math.floor((eligibleSubtotal * usableCoupon.value) / 100) : usableCoupon.value,
+        usableCoupon.max_discount_paise || Infinity, eligibleSubtotal))
     : 0;
 
   const groups = [];
@@ -498,8 +558,11 @@ function priceCart(userId, opts = {}) {
     const fulfillment = fulfillmentMap[shopId] === 'pickup' ? 'pickup' : 'delivery';
     let discount = 0;
     if (usableCoupon && shopCoupon === shopId && usableCoupon.type !== 'free_delivery') {
-      discount = Math.min(usableCoupon.type === 'percent' ? Math.floor((shopSubtotal * usableCoupon.value) / 100) : usableCoupon.value,
-        usableCoupon.max_discount_paise || Infinity, shopSubtotal);
+      const shopEligible = eligibleRows.filter((r) => r.shop_id === shopId);
+      const shopEligibleSub = shopEligible.reduce((t, r) => t + r.price_paise * r.qty, 0);
+      discount = isBogo ? bogoDiscount(usableCoupon, shopEligible)
+        : Math.min(usableCoupon.type === 'percent' ? Math.floor((shopEligibleSub * usableCoupon.value) / 100) : usableCoupon.value,
+          usableCoupon.max_discount_paise || Infinity, shopEligibleSub);
     } else if (platformDiscountTotal > 0) {
       discount = subtotal > 0 ? Math.round((platformDiscountTotal * shopSubtotal) / subtotal) : 0;
     }
@@ -565,6 +628,7 @@ function priceCart(userId, opts = {}) {
     tax: taxTotal, total, groups, issues,
     coupon: usableCoupon ? {
       code: usableCoupon.code, title: usableCoupon.title, type: usableCoupon.type,
+      promoType: usableCoupon.promo_type || usableCoupon.type,
       value: usableCoupon.value, shopId: usableCoupon.shop_id,
       description: usableCoupon.description, endsAt: usableCoupon.ends_at
     } : null,
@@ -1364,6 +1428,103 @@ async function handle(req, res) {
       return true;
     }
 
+    /* ---------------------- seller registration -------------------- */
+    if (method === 'POST' && custRoute === '/seller/register') {
+      rateLimit(`seller-register:${clientIp(req)}`, 6, 3600e3);
+      const name = String(payload.name || '').trim();
+      const email = String(payload.email || '').trim().toLowerCase();
+      const phone = normalPhone(payload.mobile || payload.phone);
+      const businessName = String(payload.businessName || payload.shopName || '').trim();
+      const category = String(payload.category || '').trim();
+      const shopType = String(payload.shopType || 'retail').trim();
+      if (!str(name, 2, 80)) fail(400, 'Enter the owner’s full name.');
+      if (!emailOk(email)) fail(400, 'Enter a valid email address.');
+      if (!phoneOk(phone)) fail(400, 'Enter a valid 10-digit mobile number.');
+      if (typeof payload.password !== 'string' || payload.password.length < 8) fail(400, 'Password must be at least 8 characters.');
+      if (payload.password !== payload.confirmPassword) fail(400, 'Passwords do not match.');
+      if (!str(businessName, 2, 120)) fail(400, 'Enter your business name.');
+      if (!db.prepare('SELECT 1 FROM nb_categories WHERE slug=?').get(category)) fail(400, 'Choose a valid business category.');
+      if (payload.terms !== true) fail(400, 'Accept the terms and conditions to continue.');
+      if (db.prepare('SELECT id FROM nb_users WHERE email=?').get(email)) fail(409, 'An account with this email already exists. Sign in instead.');
+      if (db.prepare('SELECT id FROM nb_users WHERE phone=?').get(phone)) fail(409, 'An account with this mobile number already exists.');
+      const userId = uid();
+      const shopId = uid();
+      const slugBase = NB_SLUG(businessName) || 'shop';
+      let slug = slugBase;
+      let n = 1;
+      while (db.prepare('SELECT id FROM nb_shops WHERE slug=?').get(slug)) { slug = `${slugBase}-${++n}`; }
+      transaction(() => {
+        db.prepare(`INSERT INTO nb_users(id,role,name,email,phone,password_hash,email_verified,phone_verified,avatar,status,is_demo,created_at)
+          VALUES(?,?,?,?,?,?,0,0,'🧑‍💼','pending_verification',0,?)`).run(userId, 'seller', name, email, phone, makePassword(payload.password), now());
+        db.prepare(`INSERT INTO nb_shops(id,slug,owner_user_id,name,category_slug,tagline,description,emoji,tone,phone,address,locality,city,pincode,lat,lng,rating,review_count,verified,is_open,opens_at,closes_at,prep_minutes,delivery_enabled,pickup_enabled,delivery_fee_paise,free_delivery_over_paise,pickup_fee_paise,min_order_paise,radius_km,service_pincodes,badge,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          shopId, slug, userId, businessName, category, null, null, '🏪', 'blue', phone, 'Address pending KYC', 'Pending', 'New Delhi', '110016', 28.5494, 77.2001,
+          0, 0, 0, 0, '09:00', '21:00', 15, 1, 1, 0, null, 0, 0, 5, '', null, now()
+        );
+        db.prepare(`INSERT INTO nb_seller_verifications(id,user_id,shop_id,status,legal_name,business_category,shop_type,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?)`).run(uid(), userId, shopId, 'documents_pending', businessName, category, shopType, now(), now());
+        db.prepare(`INSERT INTO nb_seller_notification_prefs(user_id,updated_at) VALUES(?,?)`).run(userId, now());
+      });
+      audit('guest', null, 'seller_registered', 'seller', userId, `${businessName} · ${email}`);
+      send(res, 201, {
+        message: 'Account created. Complete Step 2 (business information) and Step 3 (KYC documents) — selling activates only after admin approval.',
+        sellerId: `NB-SELLER-${slug.toUpperCase().replace(/[^A-Z0-9]+/g, '-').slice(0, 12)}`,
+        shopId: `NB-SHOP-${slug.toUpperCase().replace(/[^A-Z0-9]+/g, '-').slice(0, 12)}`,
+        status: 'documents_pending',
+        next: 'Submit business information and KYC documents, then sign in to the Seller Hub to track verification.'
+      });
+      return true;
+    }
+
+    if (method === 'POST' && custRoute === '/seller/kyc') {
+      rateLimit(`seller-kyc:${clientIp(req)}`, 10, 3600e3);
+      const email = String(payload.email || '').trim().toLowerCase();
+      const user = db.prepare("SELECT * FROM nb_users WHERE email=? AND role='seller'").get(email);
+      if (!user) fail(404, 'No seller account found for this email. Complete Step 1 first.');
+      if (!checkPassword(payload.password || '', user.password_hash)) fail(401, 'Password does not match this seller account.');
+      const shop = db.prepare('SELECT * FROM nb_shops WHERE owner_user_id=?').get(user.id);
+      if (!shop) fail(404, 'No shop is linked to this seller account.');
+      const verification = db.prepare('SELECT * FROM nb_seller_verifications WHERE user_id=? ORDER BY created_at DESC LIMIT 1').get(user.id);
+      if (!verification) fail(404, 'Verification record not found.');
+      if (verification.status === 'approved') fail(409, 'This shop is already approved.');
+      const legalName = String(payload.legalName || payload.businessName || shop.name).trim();
+      const address = String(payload.address || '').trim();
+      const pincode = String(payload.pincode || '').trim();
+      const city = String(payload.city || '').trim();
+      if (!str(legalName, 2, 120)) fail(400, 'Enter the legal business name.');
+      if (!str(address, 5, 300)) fail(400, 'Enter the full shop address.');
+      if (!pincodeOk(pincode)) fail(400, 'Enter a valid 6-digit PIN code.');
+      if (!str(city, 2, 60)) fail(400, 'Enter the city.');
+      const docs = Array.isArray(payload.documents) ? payload.documents.filter((d) => d && d.fileName).slice(0, 10) : [];
+      if (!docs.length) fail(400, 'Upload at least one KYC document (PAN, GST, registration or ID proof).');
+      const lat = Number(payload.lat);
+      const lng = Number(payload.lng);
+      transaction(() => {
+        db.prepare(`UPDATE nb_seller_verifications SET status='submitted',legal_name=?,business_category=?,shop_type=?,description=?,address=?,pincode=?,city=?,state=?,country=?,lat=?,lng=?,contact_number=?,business_email=?,ownership_type=?,pan_number=?,gst_number=?,submitted_at=?,updated_at=? WHERE id=?`)
+          .run(legalName, String(payload.businessCategory || shop.category_slug), String(payload.shopType || 'retail'),
+            String(payload.description || '').slice(0, 2000) || null, address, pincode, city,
+            String(payload.state || 'Delhi').slice(0, 60), String(payload.country || 'India').slice(0, 60),
+            Number.isFinite(lat) ? lat : shop.lat, Number.isFinite(lng) ? lng : shop.lng,
+            normalPhone(payload.contactNumber || user.phone) || user.phone, String(payload.businessEmail || email).trim().toLowerCase(),
+            String(payload.ownershipType || 'sole_proprietorship').slice(0, 60),
+            String(payload.pan || '').trim().toUpperCase().slice(0, 20) || null,
+            String(payload.gst || '').trim().toUpperCase().slice(0, 20) || null,
+            now(), now(), verification.id);
+        db.prepare('UPDATE nb_shops SET name=?,address=?,pincode=?,city=?,lat=?,lng=?,phone=?,business_email=?,legal_name=?,ownership_type=?,description=? WHERE id=?')
+          .run(legalName, address, pincode, city, Number.isFinite(lat) ? lat : shop.lat, Number.isFinite(lng) ? lng : shop.lng,
+            normalPhone(payload.contactNumber || user.phone) || user.phone, String(payload.businessEmail || email).trim().toLowerCase(),
+            legalName, String(payload.ownershipType || 'sole_proprietorship').slice(0, 60), String(payload.description || '').slice(0, 2000) || null, shop.id);
+        for (const d of docs) {
+          db.prepare('INSERT INTO nb_seller_documents(id,verification_id,user_id,shop_id,doc_type,file_name,file_type,file_size,storage_ref,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+            .run(uid(), verification.id, user.id, shop.id, String(d.type || 'other').slice(0, 40), String(d.fileName).slice(0, 200),
+              String(d.fileType || '').slice(0, 80) || null, clampInt(d.fileSize || 0, 0, 10000000), String(d.storageRef || 'metadata-only').slice(0, 200), now());
+        }
+      });
+      audit('seller', user.id, 'kyc_submitted', 'verification', verification.id, `${legalName} · ${docs.length} document(s)`);
+      send(res, 201, { message: 'KYC submitted. Your application is now under review — you will see the decision in the Seller Hub.', status: 'submitted' });
+      return true;
+    }
+
     /* -------------------------- addresses -------------------------- */
     if (method === 'GET' && custRoute === '/addresses') {
       const s = requireCustomer(req);
@@ -2140,14 +2301,17 @@ async function handle(req, res) {
       const user = db.prepare("SELECT * FROM nb_users WHERE email=? AND role IN ('seller','runner')").get(email);
       const ok = user ? checkPassword(payload.password, user.password_hash) : checkPassword(payload.password, makePassword('invalid-password'));
       if (!user || !ok) fail(401, 'Those partner details do not match an account.');
-      if (user.status !== 'active') fail(403, 'This partner account is not active.');
+      if (user.status === 'suspended') fail(403, 'This partner account is suspended. Contact NearBuy support.');
+      if (!['active', 'pending_verification'].includes(user.status)) fail(403, 'This partner account is not active.');
       const sess = startSession(req, user, PARTNER_COOKIE);
-      const shop = user.role === 'seller' ? db.prepare('SELECT * FROM nb_shops WHERE owner_user_id=?').get(user.id) : null;
+      const shop = user.role === 'seller' ? (db.prepare('SELECT * FROM nb_shops WHERE owner_user_id=?').get(user.id)
+        || db.prepare('SELECT s.* FROM nb_shop_staff st JOIN nb_shops s ON s.id=st.shop_id WHERE st.user_id=? AND st.status=\'active\'').get(user.id)) : null;
       const runner = user.role === 'runner' ? db.prepare('SELECT * FROM nb_runners WHERE user_id=?').get(user.id) : null;
+      const verification = shop ? db.prepare('SELECT * FROM nb_seller_verifications WHERE user_id=? ORDER BY created_at DESC LIMIT 1').get(user.id) : null;
       audit(user.role, user.id, 'partner_login', 'user', user.id, `${user.role} signed in`);
       send(res, 200, {
-        user: { id: user.id, name: user.name, email: user.email, role: user.role, phone: user.phone, avatar: user.avatar, csrf: sess.csrf },
-        shop: shop ? { id: shop.id, slug: shop.slug, name: shop.name, emoji: shop.emoji, locality: shop.locality, isOpen: Boolean(shop.is_open), openAt: shop.opens_at, closeAt: shop.closes_at } : null,
+        user: { id: user.id, name: user.name, email: user.email, role: user.role, phone: user.phone, avatar: user.avatar, csrf: sess.csrf, status: user.status },
+        shop: shop ? { id: shop.id, slug: shop.slug, name: shop.name, emoji: shop.emoji, locality: shop.locality, isOpen: Boolean(shop.is_open), openAt: shop.opens_at, closeAt: shop.closes_at, verified: Boolean(shop.verified), verificationStatus: verification?.status || (shop.verified ? 'approved' : 'documents_pending') } : null,
         runner: runner ? { vehicle: runner.vehicle, status: runner.status, rating: runner.rating, completed: runner.completed } : null
       }, { 'Set-Cookie': sess.cookie });
       return true;
@@ -2156,11 +2320,14 @@ async function handle(req, res) {
     if (base === '/api/partner' && route === '/me' && method === 'GET') {
       const s = sessionFor(req, PARTNER_COOKIE);
       if (!s || !['seller', 'runner'].includes(s.role)) { send(res, 200, { user: null }); return true; }
-      const shop = s.role === 'seller' ? db.prepare('SELECT * FROM nb_shops WHERE owner_user_id=?').get(s.user_id) : null;
+      const shop = s.role === 'seller' ? (db.prepare('SELECT * FROM nb_shops WHERE owner_user_id=?').get(s.user_id)
+        || db.prepare('SELECT s.* FROM nb_shop_staff st JOIN nb_shops s ON s.id=st.shop_id WHERE st.user_id=? AND st.status=\'active\'').get(s.user_id)) : null;
       const runner = s.role === 'runner' ? db.prepare('SELECT * FROM nb_runners WHERE user_id=?').get(s.user_id) : null;
+      const verification = shop ? db.prepare('SELECT * FROM nb_seller_verifications WHERE user_id=? ORDER BY created_at DESC LIMIT 1').get(s.user_id) : null;
+      const userRow = db.prepare('SELECT status FROM nb_users WHERE id=?').get(s.user_id);
       send(res, 200, {
-        user: { id: s.user_id, name: s.name, email: s.email, phone: s.phone, avatar: s.avatar, role: s.role, csrf: s.csrf },
-        shop: shop ? { id: shop.id, slug: shop.slug, name: shop.name, emoji: shop.emoji, locality: shop.locality, isOpen: Boolean(shop.is_open), openAt: shop.opens_at, closeAt: shop.closes_at } : null,
+        user: { id: s.user_id, name: s.name, email: s.email, phone: s.phone, avatar: s.avatar, role: s.role, csrf: s.csrf, status: userRow?.status || 'active' },
+        shop: shop ? { id: shop.id, slug: shop.slug, name: shop.name, emoji: shop.emoji, locality: shop.locality, isOpen: Boolean(shop.is_open), openAt: shop.opens_at, closeAt: shop.closes_at, verified: Boolean(shop.verified), verificationStatus: verification?.status || (shop.verified ? 'approved' : 'documents_pending') } : null,
         runner: runner ? { vehicle: runner.vehicle, status: runner.status, rating: runner.rating, completed: runner.completed } : null
       });
       return true;
@@ -2179,10 +2346,107 @@ async function handle(req, res) {
       if (!roles.includes(s.role)) fail(403, 'This partner area is not available for your role');
       return s;
     }
-    function sellerShopContext(s) {
-      const shop = db.prepare('SELECT * FROM nb_shops WHERE owner_user_id=?').get(s.user_id);
+    const STAFF_ROLE_PERMS = {
+      owner: ['view_dashboard', 'manage_products', 'manage_inventory', 'accept_orders', 'prepare_orders', 'manage_settlements', 'manage_staff', 'manage_settings', 'manage_promotions', 'view_analytics', 'manage_scanner', 'view_customers', 'manage_returns', 'manage_support', 'view_revenue'],
+      manager: ['view_dashboard', 'manage_products', 'manage_inventory', 'accept_orders', 'prepare_orders', 'manage_promotions', 'view_analytics', 'manage_scanner', 'view_customers', 'manage_returns', 'manage_support', 'view_revenue'],
+      order_manager: ['view_dashboard', 'accept_orders', 'prepare_orders', 'view_customers', 'manage_support'],
+      inventory_manager: ['view_dashboard', 'manage_inventory', 'manage_scanner'],
+      sales_staff: ['view_dashboard', 'view_analytics', 'view_customers'],
+      packing_staff: ['view_dashboard', 'prepare_orders'],
+      delivery_staff: ['view_dashboard', 'prepare_orders', 'manage_support']
+    };
+    function sellerStaffRow(s, shop) {
+      if (!s || !shop) return null;
+      if (shop.owner_user_id === s.user_id) return { role: 'owner', permissions: STAFF_ROLE_PERMS.owner, isOwner: true, status: 'active' };
+      const row = db.prepare('SELECT * FROM nb_shop_staff WHERE user_id=? AND shop_id=?').get(s.user_id, shop.id);
+      if (!row || row.status !== 'active') return null;
+      let perms = [];
+      try { perms = JSON.parse(row.permissions_json || '[]'); } catch { perms = []; }
+      if (!Array.isArray(perms) || !perms.length) perms = STAFF_ROLE_PERMS[row.role] || [];
+      return { role: row.role, permissions: perms, isOwner: false, status: row.status, id: row.id };
+    }
+    function sellerCan(s, shop, perm) {
+      const staff = sellerStaffRow(s, shop);
+      return Boolean(staff && staff.permissions.includes(perm));
+    }
+    function requireSellerPerm(s, shop, perm, label) {
+      if (!sellerCan(s, shop, perm)) fail(403, `${label || 'This action'} needs the ${perm.replace(/_/g, ' ')} permission. Ask the shop owner.`);
+    }
+    function sellerShopContext(s, opts = {}) {
+      let shop = db.prepare('SELECT * FROM nb_shops WHERE owner_user_id=?').get(s.user_id);
+      if (!shop) {
+        const staff = db.prepare('SELECT s.* FROM nb_shop_staff st JOIN nb_shops s ON s.id=st.shop_id WHERE st.user_id=? AND st.status=\'active\'').get(s.user_id);
+        shop = staff || null;
+      }
       if (!shop) fail(403, 'No shop is linked to this seller account. Ask operations to link it.');
+      if (!opts.allowPending && !shop.verified) {
+        fail(403, 'Your shop verification is still pending. Complete KYC and wait for admin approval before selling.', { code: 'verification_pending' });
+      }
       return shop;
+    }
+    function sellerCodes(shop, userId) {
+      const slugPart = String(shop.slug || 'shop').toUpperCase().replace(/[^A-Z0-9]+/g, '-').slice(0, 12);
+      return {
+        sellerId: shop.seller_code || `NB-SELLER-${slugPart}`,
+        shopId: shop.shop_code || `NB-SHOP-${slugPart}`,
+        userId: userId || shop.owner_user_id || null
+      };
+    }
+    function recordInventory(shop, product, type, previousQty, newQty, delta, reason, actor) {
+      db.prepare('INSERT INTO nb_inventory_transactions(id,shop_id,product_id,actor_user_id,actor_name,type,previous_qty,new_qty,delta,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+        .run(uid(), shop.id, product.id, actor?.user_id || actor?.id || null, actor?.name || 'system', type, previousQty, newQty, delta, reason || null, now());
+      const available = Math.max(0, newQty - Number(product.reserved || 0));
+      if (available <= Number(product.low_stock || 0) && shop.owner_user_id) {
+        notify(shop.owner_user_id, 'Low stock alert', `${product.name} has ${available} left (reorder at ${product.low_stock}).`, 'stock', '#/inventory');
+      }
+    }
+    // Callers use a few friendly spellings for the same movement; normalise them once.
+    const INVENTORY_ACTION_ALIASES = {
+      returned_stock: 'returned', return_stock: 'returned', return: 'returned', restock_return: 'returned',
+      restock_purchase: 'add', purchase: 'add', restock: 'add', received: 'add',
+      damaged_stock: 'damaged', expired_stock: 'expired', write_off: 'damaged',
+      correction: 'set', count: 'set', stock_count: 'set', recount: 'set'
+    };
+    function normaliseInventoryAction(action) {
+      const key = String(action || 'add').trim().toLowerCase();
+      return INVENTORY_ACTION_ALIASES[key] || key;
+    }
+    function applyInventoryChange(shop, product, action, quantity, reason, actor) {
+      action = normaliseInventoryAction(action);
+      const prev = Number(product.stock || 0);
+      const reserved = Number(product.reserved || 0);
+      let next = prev;
+      let type = action;
+      if (action === 'add') next = prev + quantity;
+      else if (action === 'reduce' || action === 'damaged' || action === 'expired') {
+        if (prev - quantity < reserved) fail(400, `Only ${Math.max(0, prev - reserved)} unit(s) are available to ${action === 'reduce' ? 'reduce' : 'write off'}; the rest are reserved by open orders.`);
+        next = prev - quantity;
+      } else if (action === 'returned') next = prev + quantity;
+      else if (action === 'set') {
+        if (quantity < reserved) fail(400, `Stock cannot be set below ${reserved} reserved unit(s).`);
+        next = quantity;
+      } else if (action === 'opening') next = quantity;
+      else fail(400, 'Unknown inventory action.');
+      if (next < 0 || next > 1000000) fail(400, 'Stock quantity is out of range.');
+      const upd = db.prepare('UPDATE nb_products SET stock=? WHERE id=? AND shop_id=?').run(next, product.id, shop.id);
+      if (Number(upd.changes) !== 1) fail(404, 'Product not found in your catalogue');
+      recordInventory(shop, { ...product, stock: next }, type, prev, next, next - prev, reason, actor);
+      return { previousQty: prev, newQty: next, delta: next - prev };
+    }
+    function ensurePackingRows(so) {
+      const items = db.prepare('SELECT * FROM nb_order_items WHERE seller_order_id=? ORDER BY id').all(so.id);
+      for (const item of items) {
+        db.prepare('INSERT OR IGNORE INTO nb_packing_items(id,seller_order_id,order_item_id,product_id,ordered_qty,packed_qty,missing_qty,status,updated_at) VALUES(?,?,?,?,?,?,?, ?,?)')
+          .run(uid(), so.id, item.id, item.product_id, item.qty, item.packed_qty || 0, item.missing_qty || 0, item.packed_status || 'pending', now());
+      }
+      return db.prepare('SELECT pi.*, oi.name, oi.unit, oi.emoji FROM nb_packing_items pi JOIN nb_order_items oi ON oi.id=pi.order_item_id WHERE pi.seller_order_id=? ORDER BY oi.id').all(so.id);
+    }
+    function packingSummary(so) {
+      const rows = ensurePackingRows(so);
+      const ordered = rows.reduce((t, r) => t + Number(r.ordered_qty || 0), 0);
+      const packed = rows.reduce((t, r) => t + Number(r.packed_qty || 0), 0);
+      const missing = rows.reduce((t, r) => t + Number(r.missing_qty || 0), 0);
+      return { rows, ordered, packed, missing, complete: rows.length > 0 && rows.every((r) => Number(r.packed_qty || 0) + Number(r.missing_qty || 0) >= Number(r.ordered_qty || 0)) };
     }
     function sellerOrderOwned(code, shop) {
       const so = db.prepare('SELECT * FROM nb_seller_orders WHERE code=? AND shop_id=?').get(String(code), shop.id);
@@ -2213,18 +2477,33 @@ async function handle(req, res) {
         preparing: orders.filter((o) => ['accepted', 'preparing'].includes(o.status)).length,
         ready: orders.filter((o) => ['ready', 'runner_requested'].includes(o.status)).length,
         onTheWay: orders.filter((o) => ['runner_assigned', 'picked_up', 'out_for_delivery'].includes(o.status)).length,
-        completed: orders.filter((o) => ['delivered', 'completed'].includes(o.status)).length
+        completed: orders.filter((o) => ['delivered', 'completed'].includes(o.status)).length,
+        total: orders.length,
+        accepted: orders.filter((o) => o.status === 'accepted').length,
+        cancelled: orders.filter((o) => ['cancelled', 'rejected'].includes(o.status)).length
       };
       const revenue = orders.filter((o) => ['delivered', 'completed'].includes(o.status)).reduce((t, o) => t + o.total_paise, 0);
-      const lowStock = db.prepare('SELECT id,name,stock,low_stock,emoji FROM nb_products WHERE shop_id=? AND active=1 AND stock<=low_stock ORDER BY stock LIMIT 6').all(shop.id);
-      const recent = orders.slice(0, 5).map((so) => {
+      const grossSales = orders.filter((o) => !['cancelled', 'rejected'].includes(o.status)).reduce((t, o) => t + o.total_paise, 0);
+      const refunds = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n FROM nb_refunds r JOIN nb_seller_orders so ON so.order_id=r.order_id WHERE so.shop_id=? AND r.status='completed'`).get(shop.id);
+      const productStats = db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN stock-reserved>0 THEN 1 ELSE 0 END) AS inStock, SUM(CASE WHEN stock-reserved<=0 THEN 1 ELSE 0 END) AS outStock, SUM(CASE WHEN stock-reserved>0 AND stock-reserved<=low_stock THEN 1 ELSE 0 END) AS lowStock FROM nb_products WHERE shop_id=? AND active=1 AND COALESCE(archived,0)=0').get(shop.id);
+      const lowStock = db.prepare('SELECT id,name,stock,reserved,low_stock,emoji FROM nb_products WHERE shop_id=? AND active=1 AND COALESCE(archived,0)=0 AND stock-reserved<=low_stock ORDER BY stock-reserved LIMIT 6').all(shop.id);
+      const outStock = db.prepare('SELECT id,name,stock,reserved,emoji FROM nb_products WHERE shop_id=? AND active=1 AND COALESCE(archived,0)=0 AND stock-reserved<=0 ORDER BY name LIMIT 6').all(shop.id);
+      const recent = orders.slice(0, 8).map((so) => {
         const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(so.order_id);
         const customer = db.prepare('SELECT name FROM nb_users WHERE id=?').get(order.customer_id);
-        return { code: so.code, parentCode: order.code, customer: customer?.name, status: so.status, total: so.total_paise, fulfillment: so.fulfillment, createdAt: so.created_at };
+        const itemCount = db.prepare('SELECT COALESCE(SUM(qty),0) AS n FROM nb_order_items WHERE seller_order_id=?').get(so.id);
+        return { code: so.code, parentCode: order.code, customer: customer?.name, status: so.status, statusLabel: STATUS_LABELS[so.status] || so.status, total: so.total_paise, fulfillment: so.fulfillment, paymentMethod: order.payment_method, itemCount: Number(itemCount?.n || 0), createdAt: so.created_at };
       });
+      const unread = db.prepare('SELECT COUNT(*) AS n FROM nb_notifications WHERE user_id=? AND is_read=0').get(s.user_id);
+      const codes = sellerCodes(shop, s.user_id);
       send(res, 200, {
-        shop: { id: shop.id, name: shop.name, emoji: shop.emoji, slug: shop.slug, isOpen: Boolean(shop.is_open), opensAt: shop.opens_at, closesAt: shop.closes_at, verified: Boolean(shop.verified), rating: shop.rating },
-        counts, revenue, orders: orders.length, lowStock: lowStock.map((p) => ({ id: p.id, name: p.name, stock: p.stock, lowAt: p.low_stock, emoji: p.emoji })),
+        shop: { id: shop.id, name: shop.name, emoji: shop.emoji, slug: shop.slug, isOpen: Boolean(shop.is_open), opensAt: shop.opens_at, closesAt: shop.closes_at, verified: Boolean(shop.verified), rating: shop.rating, sellerId: codes.sellerId, shopId: codes.shopId, locality: shop.locality },
+        counts, revenue, grossSales, refunds: Number(refunds?.n || 0), netSales: Math.max(0, grossSales - Number(refunds?.n || 0)),
+        orders: orders.length,
+        products: { total: Number(productStats?.total || 0), inStock: Number(productStats?.inStock || 0), lowStock: Number(productStats?.lowStock || 0), outStock: Number(productStats?.outStock || 0) },
+        lowStock: lowStock.map((p) => ({ id: p.id, name: p.name, stock: Math.max(0, p.stock - p.reserved), lowAt: p.low_stock, emoji: p.emoji })),
+        outStock: outStock.map((p) => ({ id: p.id, name: p.name, stock: 0, emoji: p.emoji })),
+        unread: Number(unread?.n || 0),
         recent,
         runnerOffers: db.prepare(`SELECT a.*, so.code, u.name FROM nb_delivery_assignments a
           JOIN nb_seller_orders so ON so.id=a.seller_order_id JOIN nb_users u ON u.id=a.runner_id
@@ -2243,15 +2522,21 @@ async function handle(req, res) {
       if (filter !== 'all') {
         const sets = {
           new: ['placed'], active: ['accepted', 'preparing', 'ready', 'runner_requested', 'runner_assigned', 'picked_up', 'out_for_delivery'],
-          completed: ['delivered', 'completed'], cancelled: ['cancelled', 'rejected']
+          completed: ['delivered', 'completed'], cancelled: ['cancelled', 'rejected'],
+          handed_over: ['picked_up', 'out_for_delivery']
         };
-        orders = orders.filter((o) => (sets[filter] || []).includes(o.status));
+        // Grouped buckets above; any single lifecycle status also filters directly.
+        const wanted = sets[filter] || (/^[a-z_]+$/.test(filter) ? [filter] : []);
+        orders = orders.filter((o) => wanted.includes(o.status));
       }
       const payloadOrders = orders.map((so) => {
         const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(so.order_id);
         const customer = db.prepare('SELECT name,phone FROM nb_users WHERE id=?').get(order.customer_id);
         const items = db.prepare('SELECT * FROM nb_order_items WHERE seller_order_id=?').all(so.id);
         const address = JSON.parse(order.address_json);
+        const pack = packingSummary(so);
+        const assignment = db.prepare('SELECT * FROM nb_delivery_assignments WHERE seller_order_id=? ORDER BY created_at DESC LIMIT 1').get(so.id);
+        const runnerRow = so.runner_id ? db.prepare('SELECT u.name, u.phone, r.vehicle, r.rating FROM nb_users u LEFT JOIN nb_runners r ON r.user_id=u.id WHERE u.id=?').get(so.runner_id) : null;
         return {
           id: so.id, code: so.code, parentCode: order.code, status: so.status, statusLabel: STATUS_LABELS[so.status] || so.status,
           fulfillment: so.fulfillment, total: so.total_paise, subtotal: so.subtotal_paise, discount: so.discount_paise,
@@ -2259,11 +2544,18 @@ async function handle(req, res) {
           readyAt: so.ready_at, deliveredAt: so.delivered_at, paymentMethod: order.payment_method, paymentStatus: order.payment_status,
           customer: { name: customer?.name || 'Customer', phone: customer?.phone || null, maskedPhone: maskedPhone(customer?.phone) },
           address: so.fulfillment === 'delivery' ? address : null,
-          items: items.map((i) => ({ name: i.name, qty: i.qty, price: i.price_paise, emoji: i.emoji, unit: i.unit })),
+          items: items.map((i) => ({ id: i.id, productId: i.product_id, name: i.name, qty: i.qty, price: i.price_paise, emoji: i.emoji, unit: i.unit, packedQty: i.packed_qty || 0, missingQty: i.missing_qty || 0, packedStatus: i.packed_status || 'pending' })),
           itemCount: items.reduce((t, i) => t + i.qty, 0),
+          packing: { ordered: pack.ordered, packed: pack.packed, missing: pack.missing, complete: pack.complete, partial: Boolean(so.partial_fulfillment), partialNote: so.partial_note || null },
+          fulfillmentDetail: {
+            weightGrams: so.weight_grams, packages: so.packages_count || 1, requestedTiming: so.requested_timing,
+            runnerCharges: so.runner_charges_paise, deliveryStaffId: so.delivery_staff_id, deliveryStaffName: so.delivery_staff_name,
+            handoverConfirmedAt: so.handover_confirmed_at, handoverConfirmedBy: so.handover_confirmed_by,
+            assignment: assignment ? { id: assignment.id, status: assignment.status, payout: assignment.payout_paise, distanceKm: assignment.distance_km, expiresAt: assignment.expires_at, runnerId: assignment.runner_id } : null
+          },
           handoverPin: ['ready', 'runner_requested', 'runner_assigned'].includes(so.status) ? deriveCode('handover', so.id, 4) : null,
           pickupCodeHint: so.fulfillment === 'pickup' ? 'Ask the customer for their 6-digit collection code.' : null,
-          runner: so.runner_id ? db.prepare('SELECT name,phone FROM nb_users WHERE id=?').get(so.runner_id) : null,
+          runner: runnerRow ? { name: runnerRow.name, phone: runnerRow.phone, vehicle: runnerRow.vehicle, rating: runnerRow.rating } : null,
           receiptUrl: `/api/partner/seller/receipt/${so.code}`
         };
       });
@@ -2284,8 +2576,10 @@ async function handle(req, res) {
         if (action === 'accept') {
           if (so.status !== 'placed') fail(409, 'This order is no longer waiting for acceptance.');
           for (const item of db.prepare('SELECT * FROM nb_order_items WHERE seller_order_id=?').all(so.id)) {
+            const product = db.prepare('SELECT * FROM nb_products WHERE id=?').get(item.product_id);
             const upd = db.prepare('UPDATE nb_products SET stock=stock-?,reserved=MAX(0,reserved-?) WHERE id=? AND stock>=?').run(item.qty, item.qty, item.product_id, item.qty);
             if (Number(upd.changes) !== 1) fail(409, `Stock for ${item.name} changed. Reject the order or ask support to adjust it.`);
+            if (product) recordInventory(shop, { ...product, stock: product.stock - item.qty }, 'order_accept', product.stock, product.stock - item.qty, -item.qty, `Order ${so.code} accepted`, s);
           }
           db.prepare('UPDATE nb_seller_orders SET status=?,accepted_at=?,updated_at=? WHERE id=?').run('accepted', now(), now(), so.id);
           addEvent(so.order_id, so.id, 'accepted', 'Seller accepted', `${shop.name} accepted your order.`, 'seller');
@@ -2306,12 +2600,25 @@ async function handle(req, res) {
         } else if (action === 'prepare') {
           if (so.status !== 'accepted') fail(409, 'Accept the order before marking it as preparing.');
           db.prepare('UPDATE nb_seller_orders SET status=?,updated_at=? WHERE id=?').run('preparing', now(), so.id);
+          ensurePackingRows(so);
           addEvent(so.order_id, so.id, 'preparing', 'Preparing order', `${shop.name} started packing your items.`, 'seller');
           notify(order.customer_id, 'Your order is being prepared', `${so.code}: ${shop.name} started packing. Online cancellation is no longer available; use support if something is wrong.`, 'order', `#/orders/${order.code}`);
           message = 'Order moved to preparing.';
         } else if (action === 'ready') {
           if (so.status !== 'preparing') fail(409, 'Mark the order as preparing first.');
-          db.prepare('UPDATE nb_seller_orders SET status=?,ready_at=?,updated_at=? WHERE id=?').run('ready', now(), now(), so.id);
+          const summary = packingSummary(so);
+          const packingDetail = { packing: { ordered: summary.ordered, packed: summary.packed, missing: summary.missing } };
+          if (!summary.complete) {
+            fail(409, `Packing is incomplete (${summary.packed}/${summary.ordered} packed). Mark every item packed, or report what is missing, before marking ready.`, packingDetail);
+          }
+          // Every unit is accounted for — but a shortfall still needs the customer told why.
+          const shortfall = summary.rows.filter((r) => Number(r.packed_qty || 0) < Number(r.ordered_qty || 0));
+          if (shortfall.length) {
+            if (!so.partial_fulfillment) fail(409, 'Some items are short. Declare partial fulfilment so the customer knows this order is not complete.', packingDetail);
+            if (!String(so.partial_note || '').trim()) fail(409, 'Add a partial-fulfilment note so the customer knows what is short and why.', packingDetail);
+          }
+          db.prepare('UPDATE nb_seller_orders SET status=?,ready_at=?,packing_complete=?,partial_fulfillment=?,updated_at=? WHERE id=?')
+            .run('ready', now(), shortfall.length ? 0 : 1, shortfall.length ? 1 : 0, now(), so.id);
           addEvent(so.order_id, so.id, 'ready', so.fulfillment === 'pickup' ? 'Ready for pickup' : 'Ready for dispatch', so.fulfillment === 'pickup' ? 'Show your collection code at the counter.' : 'Choose delivery by your own rider or request a NearBuy runner.', 'seller');
           notify(order.customer_id, so.fulfillment === 'pickup' ? 'Ready for pickup' : 'Your order is packed', so.fulfillment === 'pickup' ? `${so.code} is ready at ${shop.name}. Your collection code is on the order page.` : `${so.code} is packed and waiting for dispatch.`, 'order', `#/orders/${order.code}`);
           message = 'Order marked ready.';
@@ -2341,16 +2648,39 @@ async function handle(req, res) {
               Math.round(runner.distance * 100) / 100, now(), new Date(Date.now() + offerSeconds * 1000).toISOString());
             notify(runner.user_id, 'New delivery offer', `${so.code} · ${shop.name} · ₹${Math.round(payout / 100)} payout. Open the delivery console to accept.`, 'runner', '#/delivery');
           }
-          db.prepare('UPDATE nb_seller_orders SET status=?,updated_at=? WHERE id=?').run('runner_requested', now(), so.id);
+          const weightGrams = payload.weightGrams != null ? clampInt(payload.weightGrams, 0, 500000) : (so.weight_grams || null);
+          const packagesCount = payload.packages != null ? clampInt(payload.packages, 1, 20) : (so.packages_count || 1);
+          const timing = payload.timing != null ? String(payload.timing).slice(0, 120) : (so.requested_timing || null);
+          const estCharge = eligible.length ? Math.max(3500, Math.min(15000, 3000 + Math.round((eligible[0].distance || 0) * 900))) : null;
+          db.prepare('UPDATE nb_seller_orders SET status=?,weight_grams=?,packages_count=?,requested_timing=?,runner_charges_paise=?,updated_at=? WHERE id=?')
+            .run('runner_requested', weightGrams, packagesCount, timing, estCharge, now(), so.id);
           addEvent(so.order_id, so.id, 'runner_requested', 'Finding a delivery partner', `${eligible.length} nearby runner(s) offered this delivery.`, 'seller');
           notify(order.customer_id, 'Finding a delivery partner', `${so.code}: ${shop.name} has requested a NearBuy runner.`, 'order', `#/orders/${order.code}`);
           message = `Runner request sent to ${Math.min(3, eligible.length)} nearby partner(s). Offers expire in ${Math.round(offerSeconds / 60)} minute(s).`;
         } else if (action === 'self_deliver') {
           if (so.status !== 'ready' || so.fulfillment !== 'delivery') fail(409, 'Only a ready delivery order can be dispatched.');
-          db.prepare('UPDATE nb_seller_orders SET status=?,updated_at=? WHERE id=?').run('out_for_delivery', now(), so.id);
-          addEvent(so.order_id, so.id, 'out_for_delivery', 'Out for delivery', `${shop.name} is delivering this order with its own rider.`, 'seller');
+          const staffId = payload.staffId ? String(payload.staffId) : null;
+          let staffName = payload.staffName ? String(payload.staffName).slice(0, 80) : null;
+          if (staffId) {
+            const staff = db.prepare('SELECT u.name FROM nb_shop_staff st JOIN nb_users u ON u.id=st.user_id WHERE st.id=? AND st.shop_id=? AND st.status=\'active\'').get(staffId, shop.id);
+            if (!staff) fail(400, 'Choose an active delivery staff member from your shop.');
+            staffName = staff.name;
+          }
+          db.prepare('UPDATE nb_seller_orders SET status=?,delivery_staff_id=?,delivery_staff_name=?,updated_at=? WHERE id=?').run('out_for_delivery', staffId, staffName, now(), so.id);
+          addEvent(so.order_id, so.id, 'out_for_delivery', 'Out for delivery', `${shop.name} is delivering this order with its own rider${staffName ? ` (${staffName})` : ''}.`, 'seller');
           notify(order.customer_id, 'Out for delivery', `${so.code} left ${shop.name} with the shop’s own rider. Share your delivery OTP only after you receive the items.`, 'order', `#/orders/${order.code}`);
           message = 'Order dispatched with your own rider. Ask the customer for their delivery OTP on arrival.';
+        } else if (action === 'confirm_handover') {
+          if (!['runner_assigned', 'ready'].includes(so.status)) fail(409, 'Handover can only be confirmed once a runner is assigned or the order is ready.');
+          db.prepare('UPDATE nb_seller_orders SET handover_confirmed_at=?,handover_confirmed_by=?,updated_at=? WHERE id=?').run(now(), s.name, now(), so.id);
+          addEvent(so.order_id, so.id, 'handover_confirmed', 'Package handed over', `${s.name} confirmed the package handover at ${shop.name}.`, 'seller');
+          message = 'Package handover confirmed. The runner still needs your handover PIN at pickup.';
+        } else if (action === 'cancel_runner') {
+          if (so.status !== 'runner_requested') fail(409, 'Only an unaccepted runner request can be cancelled.');
+          db.prepare("UPDATE nb_delivery_assignments SET status='expired' WHERE seller_order_id=? AND status='offered'").run(so.id);
+          db.prepare('UPDATE nb_seller_orders SET status=?,updated_at=? WHERE id=?').run('ready', now(), so.id);
+          addEvent(so.order_id, so.id, 'runner_cancelled', 'Runner request cancelled', 'The seller cancelled the runner request and kept the order ready for dispatch.', 'seller');
+          message = 'Runner request cancelled. The order is ready for self-delivery or a new runner request.';
         } else if (action === 'deliver') {
           if (so.fulfillment !== 'delivery') fail(409, 'Use complete_pickup for a store pickup order.');
           if (so.status !== 'out_for_delivery') fail(409, 'The order must be out for delivery before handover.');
@@ -2398,12 +2728,30 @@ async function handle(req, res) {
     if (base === '/api/partner' && route === '/seller/products' && method === 'GET') {
       const s = requirePartner(['seller']);
       const shop = sellerShopContext(s);
-      const products = db.prepare('SELECT * FROM nb_products WHERE shop_id=? ORDER BY category_slug, name').all(shop.id).map((p) => ({
-        id: p.id, name: p.name, brand: p.brand, category: p.category_slug, emoji: p.emoji, price: p.price_paise,
-        mrp: p.mrp_paise, stock: p.stock, reserved: p.reserved, available: Math.max(0, p.stock - p.reserved),
-        lowAt: p.low_stock, active: Boolean(p.active), unit: p.unit, rating: p.rating, reviewCount: p.review_count
+      let prodSql = 'SELECT * FROM nb_products WHERE shop_id=?';
+      const args = [shop.id];
+      const qTerm = String(q.get('q') || '').trim();
+      if (qTerm) {
+        prodSql += ' AND (name LIKE ? OR COALESCE(sku,"") LIKE ? OR COALESCE(barcode,"") LIKE ? OR COALESCE(brand,"") LIKE ?)';
+        const like = `%${qTerm}%`;
+        args.push(like, like, like, like);
+      }
+      const barcode = String(q.get('barcode') || '').trim();
+      if (barcode) { prodSql += ' AND barcode=?'; args.push(barcode); }
+      prodSql += ' ORDER BY category_slug, name LIMIT 500';
+      const products = db.prepare(prodSql).all(...args).map((p) => ({
+        id: p.id, name: p.name, brand: p.brand, category: p.category_slug, subcategory: p.subcategory || null,
+        emoji: p.emoji, price: p.price_paise, mrp: p.mrp_paise, stock: p.stock, reserved: p.reserved,
+        available: Math.max(0, p.stock - p.reserved), lowAt: p.low_stock, maxStock: p.max_stock,
+        active: Boolean(p.active), archived: Boolean(p.archived), unit: p.unit, packSize: p.pack_size,
+        variant: p.variant, parentProductId: p.parent_product_id, sku: p.sku, barcode: p.barcode,
+        weightGrams: p.weight_grams, dimensions: p.dimensions, taxRate: p.tax_rate,
+        returnDays: p.return_days, rating: p.rating, reviewCount: p.review_count,
+        imageUrl: p.image_url, description: p.description,
+        images: db.prepare('SELECT url FROM nb_product_images WHERE product_id=? ORDER BY sort').all(p.id).map((r) => r.url)
       }));
-      send(res, 200, { products, shop: { name: shop.name, emoji: shop.emoji } });
+      const categories = db.prepare('SELECT slug, name FROM nb_categories WHERE active=1 ORDER BY sort, name').all();
+      send(res, 200, { products, categories, shop: { name: shop.name, emoji: shop.emoji } });
       return true;
     }
 
@@ -2417,10 +2765,55 @@ async function handle(req, res) {
       if (payload.price !== undefined && (!Number.isFinite(nextPrice) || nextPrice < 100 || nextPrice > 1000000)) fail(400, 'Price must be between ₹1 and ₹10,000.');
       if (nextPrice > (payload.mrp !== undefined ? Math.round(Number(payload.mrp)) : product.mrp_paise || Infinity)) fail(400, 'Selling price cannot be above MRP.');
       const active = payload.active !== undefined ? (payload.active ? 1 : 0) : product.active;
-      db.prepare('UPDATE nb_products SET stock=?,price_paise=?,mrp_paise=?,active=? WHERE id=? AND shop_id=?')
-        .run(nextStock, nextPrice, payload.mrp !== undefined ? Math.round(Number(payload.mrp)) : product.mrp_paise, active, product.id, shop.id);
+      const archived = payload.archived !== undefined ? (payload.archived ? 1 : 0) : (product.archived || 0);
+      const lowStock = payload.lowStock !== undefined ? clampInt(payload.lowStock, 0, 100000) : product.low_stock;
+      const maxStock = payload.maxStock !== undefined ? clampInt(payload.maxStock, 0, 1000000) : (product.max_stock || null);
+      const sku = payload.sku !== undefined ? String(payload.sku).trim().slice(0, 60) || null : product.sku;
+      const barcode = payload.barcode !== undefined ? String(payload.barcode).trim().slice(0, 60) || null : product.barcode;
+      if (barcode && db.prepare('SELECT id FROM nb_products WHERE shop_id=? AND barcode=? AND id<>?').get(shop.id, barcode, product.id)) fail(409, 'Another product in your shop already uses this barcode.');
+      if (sku && db.prepare('SELECT id FROM nb_products WHERE shop_id=? AND sku=? AND id<>?').get(shop.id, sku, product.id)) fail(409, 'Another product in your shop already uses this SKU.');
+      requireSellerPerm(s, shop, 'manage_products', 'Editing products');
+      transaction(() => {
+        db.prepare('UPDATE nb_products SET stock=?,price_paise=?,mrp_paise=?,active=?,archived=?,low_stock=?,max_stock=?,sku=?,barcode=? WHERE id=? AND shop_id=?')
+          .run(nextStock, nextPrice, payload.mrp !== undefined ? Math.round(Number(payload.mrp)) : product.mrp_paise, active, archived, lowStock, maxStock, sku, barcode, product.id, shop.id);
+        if (nextStock !== product.stock) recordInventory(shop, { ...product, stock: nextStock }, 'adjust', product.stock, nextStock, nextStock - product.stock, payload.reason || 'Catalogue stock update', s);
+      });
       audit('seller', s.user_id, 'product_updated', 'product', product.id, `${product.name}: stock ${product.stock}→${nextStock}, price ${product.price_paise}→${nextPrice}, active ${active}`);
       send(res, 200, { message: 'Catalogue updated. The customer storefront reads this immediately.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/products\/[a-zA-Z0-9_-]+$/) && method === 'DELETE') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_products', 'Archiving products');
+      const product = db.prepare('SELECT * FROM nb_products WHERE id=? AND shop_id=?').get(route.split('/')[3], shop.id);
+      if (!product) fail(404, 'Product not found in your catalogue');
+      db.prepare('UPDATE nb_products SET archived=1,active=0 WHERE id=? AND shop_id=?').run(product.id, shop.id);
+      audit('seller', s.user_id, 'product_archived', 'product', product.id, product.name);
+      send(res, 200, { message: `${product.name} archived. Historical orders are preserved.` });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/products\/[a-zA-Z0-9_-]+\/duplicate$/) && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_products', 'Duplicating products');
+      const product = db.prepare('SELECT * FROM nb_products WHERE id=? AND shop_id=?').get(route.split('/')[3], shop.id);
+      if (!product) fail(404, 'Product not found in your catalogue');
+      const copySuffix = randomBytes(3).toString('hex');
+      const id = `${shop.slug}-${NB_SLUG(product.name).slice(0, 28)}-copy-${copySuffix}`;
+      const compareKeyBase = `${product.compare_key || NB_SLUG(product.name)}-${copySuffix}`;
+      insertRow('nb_products',
+        ['id', 'shop_id', 'category_slug', 'compare_key', 'name', 'brand', 'variant', 'description', 'highlights', 'specs', 'unit', 'pack_size', 'emoji', 'image_url',
+          'price_paise', 'mrp_paise', 'tax_rate', 'stock', 'reserved', 'low_stock', 'return_days', 'rating', 'review_count', 'active', 'is_demo', 'created_at',
+          'sku', 'barcode', 'parent_product_id', 'subcategory', 'weight_grams', 'dimensions', 'max_stock'],
+        [id, shop.id, product.category_slug, `${compareKeyBase}-copy`, `${product.name} (copy)`, product.brand, product.variant,
+          product.description, product.highlights, product.specs, product.unit, product.pack_size, product.emoji, product.image_url,
+          product.price_paise, product.mrp_paise, product.tax_rate, product.stock, 0, product.low_stock, product.return_days, 0, 0, 0, 0, now(),
+          product.sku ? `${product.sku}-COPY` : null, null, product.parent_product_id, product.subcategory, product.weight_grams, product.dimensions, product.max_stock]);
+      audit('seller', s.user_id, 'product_duplicated', 'product', id, product.name);
+      send(res, 201, { message: 'Product duplicated as a draft. Edit its SKU and barcode before publishing.', productId: id });
       return true;
     }
 
@@ -2430,6 +2823,11 @@ async function handle(req, res) {
       const so = sellerOrderOwned(decodeURIComponent(route.split('/')[3]), shop);
       const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(so.order_id);
       const customer = db.prepare('SELECT * FROM nb_users WHERE id=?').get(order.customer_id);
+      const existingReceipt = db.prepare('SELECT * FROM nb_order_receipts WHERE seller_order_id=?').get(so.id);
+      if (!existingReceipt) {
+        db.prepare('INSERT INTO nb_order_receipts(id,seller_order_id,order_id,shop_id,receipt_number,doc_type,issued_at) VALUES(?,?,?,?,?,?,?)')
+          .run(uid(), so.id, order.id, shop.id, `RCP-${so.code}`, 'order_receipt', now());
+      }
       sendHtml(res, 200, receiptHtml(order, so, shop, customer, 'seller'));
       return true;
     }
@@ -2935,6 +3333,7 @@ async function handle(req, res) {
     if (base === '/api/partner' && route === '/seller/products' && method === 'POST') {
       const s = requirePartner(['seller']);
       const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_products', 'Adding products');
       const name = String(payload.name || '').trim();
       if (!str(name, 2, 120)) fail(400, 'Give the product a name of 2–120 characters.');
       const categorySlug = String(payload.category || shop.category_slug);
@@ -2944,25 +3343,1191 @@ async function handle(req, res) {
       if (!Number.isFinite(price) || price < 100 || price > 1000000) fail(400, 'Price must be between ₹1 and ₹10,000.');
       if (!Number.isFinite(mrp) || mrp < price) fail(400, 'MRP cannot be lower than the selling price.');
       const stock = clampInt(payload.stock, 0, 100000);
+      const sku = payload.sku ? String(payload.sku).trim().slice(0, 60) : null;
+      const barcode = payload.barcode ? String(payload.barcode).trim().slice(0, 60) : null;
+      if (sku && db.prepare('SELECT id FROM nb_products WHERE shop_id=? AND sku=?').get(shop.id, sku)) fail(409, 'Another product in your shop already uses this SKU.');
+      if (barcode && db.prepare('SELECT id FROM nb_products WHERE shop_id=? AND barcode=?').get(shop.id, barcode)) fail(409, 'Another product in your shop already uses this barcode.');
+      const parentId = payload.parentProductId ? String(payload.parentProductId) : null;
+      if (parentId && !db.prepare('SELECT id FROM nb_products WHERE id=? AND shop_id=?').get(parentId, shop.id)) fail(400, 'Parent product not found in your shop.');
       const compareKey = payload.compareKey ? String(payload.compareKey).trim().slice(0, 60)
         : `${NB_SLUG(name)}-${String(payload.unit || '1 pc').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
       const id = `${shop.slug}-${NB_SLUG(name).slice(0, 32)}-${randomBytes(3).toString('hex')}`;
-      db.prepare(`INSERT INTO nb_products(id,shop_id,category_slug,compare_key,name,brand,variant,description,highlights,specs,unit,pack_size,emoji,image_url,
-        price_paise,mrp_paise,tax_rate,stock,reserved,low_stock,return_days,rating,review_count,active,is_demo,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,0,0,1,0,?)`).run(
-        id, shop.id, categorySlug, compareKey, name, String(payload.brand || '').trim() || null,
-        String(payload.variant || '').trim() || null, String(payload.description || '').slice(0, 2000) || null,
-        '[]', '[]', String(payload.unit || '1 pc').slice(0, 40), String(payload.packSize || '').slice(0, 40) || null,
-        String(payload.emoji || '🛍️').slice(0, 8), String(payload.imageUrl || '').slice(0, 300) || null,
-        price, mrp, Math.min(28, Math.max(0, Number(payload.taxRate) || 0)), stock, clampInt(payload.lowStock ?? 5, 0, 1000),
-        clampInt(payload.returnDays ?? 0, 0, 30), now()
-      );
+      const active = payload.active === false ? 0 : 1;
+      insertRow('nb_products',
+        ['id', 'shop_id', 'category_slug', 'compare_key', 'name', 'brand', 'variant', 'description', 'highlights', 'specs', 'unit', 'pack_size', 'emoji', 'image_url',
+          'price_paise', 'mrp_paise', 'tax_rate', 'stock', 'reserved', 'low_stock', 'return_days', 'rating', 'review_count', 'active', 'is_demo', 'created_at',
+          'sku', 'barcode', 'parent_product_id', 'subcategory', 'weight_grams', 'dimensions', 'max_stock'],
+        [id, shop.id, categorySlug, compareKey, name, String(payload.brand || '').trim() || null,
+          String(payload.variant || '').trim() || null, String(payload.description || '').slice(0, 2000) || null,
+          '[]', '[]', String(payload.unit || '1 pc').slice(0, 40), String(payload.packSize || '').slice(0, 40) || null,
+          String(payload.emoji || '🛍️').slice(0, 8), String(payload.imageUrl || '').slice(0, 300) || null,
+          price, mrp, Math.min(28, Math.max(0, Number(payload.taxRate) || 0)), stock, 0, clampInt(payload.lowStock ?? 5, 0, 100000),
+          clampInt(payload.returnDays ?? 0, 0, 30), 0, 0, active, 0, now(), sku, barcode, parentId,
+          String(payload.subcategory || '').trim().slice(0, 80) || null,
+          payload.weightGrams != null ? clampInt(payload.weightGrams, 0, 500000) : null,
+          String(payload.dimensions || '').trim().slice(0, 80) || null,
+          payload.maxStock != null ? clampInt(payload.maxStock, 0, 1000000) : null]);
+      const images = Array.isArray(payload.images) ? payload.images.filter((u) => typeof u === 'string' && u.startsWith('/')).slice(0, 8) : [];
+      images.forEach((url, i) => db.prepare('INSERT INTO nb_product_images(product_id,url,sort) VALUES(?,?,?)').run(id, url.slice(0, 300), i));
+      if (stock > 0) recordInventory(shop, { id, stock, reserved: 0, low_stock: clampInt(payload.lowStock ?? 5, 0, 100000), name }, 'opening', 0, stock, stock, 'Opening stock', s);
       audit('seller', s.user_id, 'product_created', 'product', id, `${name} · ${price}`);
-      send(res, 201, { message: `${name} is live in your catalogue.`, productId: id });
+      send(res, 201, { message: active ? `${name} is live in your catalogue.` : `${name} saved as a draft.`, productId: id, product: { id, name, price, mrp, stock, active: Boolean(active), sku, barcode } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/products/bulk' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_products', 'Bulk product import');
+      const rows = Array.isArray(payload.rows) ? payload.rows.slice(0, 200) : [];
+      if (!rows.length) fail(400, 'Send at least one product row.');
+      const created = [];
+      const errors = [];
+      transaction(() => {
+        rows.forEach((row, idx) => {
+          const line = idx + 2;
+          const name = String(row.name || '').trim();
+          const price = Math.round(Number(row.price));
+          const stock = clampInt(row.stock ?? 0, 0, 100000);
+          if (!str(name, 2, 120)) { errors.push({ line, message: 'Name must be 2–120 characters.' }); return; }
+          const categorySlug = String(row.category || shop.category_slug);
+          if (!db.prepare('SELECT 1 FROM nb_categories WHERE slug=?').get(categorySlug)) { errors.push({ line, message: `Unknown category ${categorySlug}.` }); return; }
+          if (!Number.isFinite(price) || price < 100) { errors.push({ line, message: 'Price must be at least ₹1.' }); return; }
+          const sku = row.sku ? String(row.sku).trim().slice(0, 60) : null;
+          const barcode = row.barcode ? String(row.barcode).trim().slice(0, 60) : null;
+          if (sku && db.prepare('SELECT id FROM nb_products WHERE shop_id=? AND sku=?').get(shop.id, sku)) { errors.push({ line, message: `SKU ${sku} already exists.` }); return; }
+          if (barcode && db.prepare('SELECT id FROM nb_products WHERE shop_id=? AND barcode=?').get(shop.id, barcode)) { errors.push({ line, message: `Barcode ${barcode} already exists.` }); return; }
+          const id = `${shop.slug}-${NB_SLUG(name).slice(0, 28)}-${randomBytes(3).toString('hex')}`;
+          const compareKey = `${NB_SLUG(name)}-${String(row.unit || '1 pc').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+          insertRow('nb_products',
+            ['id', 'shop_id', 'category_slug', 'compare_key', 'name', 'brand', 'unit', 'emoji', 'price_paise', 'mrp_paise', 'tax_rate', 'stock', 'reserved',
+              'low_stock', 'return_days', 'rating', 'review_count', 'active', 'is_demo', 'created_at', 'sku', 'barcode'],
+            [id, shop.id, categorySlug, compareKey, name, String(row.brand || '').trim() || null,
+              String(row.unit || '1 pc').slice(0, 40), String(row.emoji || '🛍️').slice(0, 8),
+              price, Math.max(price, Math.round(Number(row.mrp) || price)), 0, stock, 0,
+              clampInt(row.lowStock ?? 5, 0, 100000), 0, 0, 0, 1, 0, now(), sku, barcode]);
+          if (stock > 0) recordInventory(shop, { id, stock, reserved: 0, low_stock: clampInt(row.lowStock ?? 5, 0, 100000), name }, 'opening', 0, stock, stock, 'Bulk import opening stock', s);
+          created.push(id);
+        });
+      });
+      audit('seller', s.user_id, 'products_bulk_import', 'product', null, `${created.length} created, ${errors.length} errors`);
+      send(res, 201, { message: `Imported ${created.length} product(s). ${errors.length ? `${errors.length} row(s) need attention.` : ''}`, created: created.length, errors });
       return true;
     }
 
     /* ================================================================== */
+    /* ================================================================== */
+    /* Seller Hub — extended business modules (same DB, shop-scoped)       */
+    /* ================================================================== */
+
+    function csvCell(v) {
+      const s = String(v == null ? '' : v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    }
+    function sendCsv(res, filename, rows) {
+      const body = rows.map((r) => r.map(csvCell).join(',')).join('\n');
+      res.writeHead(200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Cache-Control': 'no-store'
+      });
+      res.end(body);
+    }
+    function shopHoursPayload(shop) {
+      const rows = db.prepare('SELECT * FROM nb_shop_hours WHERE shop_id=? ORDER BY day_of_week, holiday_date').all(shop.id);
+      const days = [0, 1, 2, 3, 4, 5, 6].map((d) => {
+        const r = rows.find((x) => x.day_of_week === d && !x.holiday_date);
+        return {
+          day: d, open: r?.open_time || shop.opens_at || '09:00', close: r?.close_time || shop.closes_at || '21:00',
+          breakStart: r?.break_start || '', breakEnd: r?.break_end || '',
+          shifts: (() => { try { return JSON.parse(r?.shifts_json || '[]'); } catch { return []; } })(),
+          closed: Boolean(r?.closed)
+        };
+      });
+      const holidays = rows.filter((r) => r.holiday_date).map((r) => ({ day: r.day_of_week, date: r.holiday_date, label: r.holiday_label || 'Holiday' }));
+      return { days, holidays, isOpen: Boolean(shop.is_open), temporaryClosureUntil: shop.temporary_closure_until || null, holidayDate: shop.holiday_date || null, holidayLabel: shop.holiday_label || null };
+    }
+    function nextOpening(shop) {
+      const hours = shopHoursPayload(shop);
+      const nowDate = new Date();
+      for (let add = 0; add < 8; add++) {
+        const d = new Date(nowDate.getTime() + add * 864e5);
+        const dow = d.getDay();
+        const day = hours.days.find((x) => x.day === dow);
+        const isHoliday = hours.holidays.some((h) => h.date === d.toISOString().slice(0, 10));
+        if (!day || day.closed || isHoliday) continue;
+        const [hh, mm] = String(day.open).split(':').map(Number);
+        const openAt = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hh || 9, mm || 0);
+        if (openAt > nowDate) return openAt.toISOString();
+      }
+      return null;
+    }
+
+    if (base === '/api/partner' && route === '/seller/verification' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      const verification = db.prepare('SELECT * FROM nb_seller_verifications WHERE user_id=? ORDER BY created_at DESC LIMIT 1').get(s.user_id);
+      const docs = verification ? db.prepare('SELECT * FROM nb_seller_documents WHERE verification_id=? ORDER BY created_at').all(verification.id) : [];
+      const codes = sellerCodes(shop, s.user_id);
+      send(res, 200, {
+        shop: { id: shop.id, name: shop.name, verified: Boolean(shop.verified), sellerId: codes.sellerId, shopId: codes.shopId },
+        verification: verification ? {
+          status: verification.status, legalName: verification.legal_name, businessCategory: verification.business_category,
+          shopType: verification.shop_type, description: verification.description, address: verification.address,
+          pincode: verification.pincode, city: verification.city, state: verification.state, country: verification.country,
+          lat: verification.lat, lng: verification.lng, contactNumber: verification.contact_number,
+          businessEmail: verification.business_email, ownershipType: verification.ownership_type,
+          pan: verification.pan_number, gst: verification.gst_number, reason: verification.reason,
+          submittedAt: verification.submitted_at, reviewedAt: verification.reviewed_at
+        } : null,
+        documents: docs.map((d) => ({ id: d.id, type: d.doc_type, fileName: d.file_name, fileType: d.file_type, fileSize: d.file_size, at: d.created_at }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/verification/submit' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      const verification = db.prepare('SELECT * FROM nb_seller_verifications WHERE user_id=? ORDER BY created_at DESC LIMIT 1').get(s.user_id);
+      if (!verification) fail(404, 'Verification record not found. Complete registration first.');
+      if (verification.status === 'approved') fail(409, 'This shop is already approved.');
+      const docs = Array.isArray(payload.documents) ? payload.documents.filter((d) => d && d.fileName).slice(0, 10) : [];
+      if (!docs.length) fail(400, 'Upload at least one KYC document.');
+      transaction(() => {
+        db.prepare(`UPDATE nb_seller_verifications SET status='submitted',legal_name=?,business_category=?,shop_type=?,description=?,address=?,pincode=?,city=?,state=?,country=?,lat=?,lng=?,contact_number=?,business_email=?,ownership_type=?,pan_number=?,gst_number=?,submitted_at=?,updated_at=? WHERE id=?`)
+          .run(String(payload.legalName || shop.name).trim().slice(0, 120), String(payload.businessCategory || shop.category_slug),
+            String(payload.shopType || 'retail').slice(0, 40), String(payload.description || '').slice(0, 2000) || null,
+            String(payload.address || shop.address).slice(0, 300), String(payload.pincode || shop.pincode).slice(0, 10),
+            String(payload.city || shop.city).slice(0, 60), String(payload.state || 'Delhi').slice(0, 60), String(payload.country || 'India').slice(0, 60),
+            Number.isFinite(Number(payload.lat)) ? Number(payload.lat) : shop.lat, Number.isFinite(Number(payload.lng)) ? Number(payload.lng) : shop.lng,
+            normalPhone(payload.contactNumber || s.phone) || s.phone, String(payload.businessEmail || s.email).trim().toLowerCase(),
+            String(payload.ownershipType || 'sole_proprietorship').slice(0, 60),
+            String(payload.pan || '').trim().toUpperCase().slice(0, 20) || null, String(payload.gst || '').trim().toUpperCase().slice(0, 20) || null,
+            now(), now(), verification.id);
+        for (const d of docs) {
+          db.prepare('INSERT INTO nb_seller_documents(id,verification_id,user_id,shop_id,doc_type,file_name,file_type,file_size,storage_ref,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+            .run(uid(), verification.id, s.user_id, shop.id, String(d.type || 'other').slice(0, 40), String(d.fileName).slice(0, 200), String(d.fileType || '').slice(0, 80) || null, clampInt(d.fileSize || 0, 0, 10000000), 'metadata-only', now());
+        }
+      });
+      audit('seller', s.user_id, 'kyc_resubmitted', 'verification', verification.id, `${docs.length} document(s)`);
+      send(res, 201, { message: 'KYC submitted for review. Selling activates after admin approval.', status: 'submitted' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/profile' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      const codes = sellerCodes(shop, s.user_id);
+      const verification = db.prepare('SELECT * FROM nb_seller_verifications WHERE user_id=? ORDER BY created_at DESC LIMIT 1').get(s.user_id);
+      send(res, 200, {
+        shop: {
+          ...shopRow(shop), sellerId: codes.sellerId, shopId: codes.shopId,
+          verificationStatus: verification?.status || (shop.verified ? 'approved' : 'documents_pending'),
+          verificationReason: verification?.reason || null
+        }
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/profile' && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      requireSellerPerm(s, shop, 'manage_settings', 'Editing the shop profile');
+      const name = payload.name !== undefined ? String(payload.name).trim() : shop.name;
+      if (!str(name, 2, 120)) fail(400, 'Shop name must be 2–120 characters.');
+      const categorySlug = payload.category !== undefined ? String(payload.category) : shop.category_slug;
+      if (!db.prepare('SELECT 1 FROM nb_categories WHERE slug=?').get(categorySlug)) fail(400, 'Choose a valid category.');
+      const pincode = payload.pincode !== undefined ? String(payload.pincode).trim() : shop.pincode;
+      if (!pincodeOk(pincode)) fail(400, 'Enter a valid 6-digit PIN code.');
+      const lat = payload.lat !== undefined ? Number(payload.lat) : shop.lat;
+      const lng = payload.lng !== undefined ? Number(payload.lng) : shop.lng;
+      if (!Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lng) || Math.abs(lng) > 180) fail(400, 'Enter valid latitude and longitude.');
+      const legalChanged = payload.legalName !== undefined && String(payload.legalName).trim() !== (shop.legal_name || shop.name);
+      transaction(() => {
+        db.prepare(`UPDATE nb_shops SET name=?,category_slug=?,tagline=?,description=?,about_text=?,address=?,locality=?,city=?,pincode=?,lat=?,lng=?,phone=?,business_email=?,support_contact=?,logo_url=?,cover_url=?,return_policy=?,pickup_instructions=?,delivery_info=?,legal_name=?,ownership_type=? WHERE id=?`)
+          .run(name, categorySlug, payload.tagline !== undefined ? String(payload.tagline).slice(0, 160) : shop.tagline,
+            payload.description !== undefined ? String(payload.description).slice(0, 2000) : shop.description,
+            payload.about !== undefined ? String(payload.about).slice(0, 2000) : shop.about_text,
+            payload.address !== undefined ? String(payload.address).slice(0, 300) : shop.address,
+            payload.locality !== undefined ? String(payload.locality).slice(0, 80) : shop.locality,
+            payload.city !== undefined ? String(payload.city).slice(0, 60) : shop.city,
+            pincode, lat, lng,
+            payload.phone !== undefined ? normalPhone(payload.phone) : shop.phone,
+            payload.businessEmail !== undefined ? String(payload.businessEmail).trim().toLowerCase() : shop.business_email,
+            payload.supportContact !== undefined ? String(payload.supportContact).slice(0, 120) : shop.support_contact,
+            payload.logoUrl !== undefined ? String(payload.logoUrl).slice(0, 300) : shop.logo_url,
+            payload.coverUrl !== undefined ? String(payload.coverUrl).slice(0, 300) : shop.cover_url,
+            payload.returnPolicy !== undefined ? String(payload.returnPolicy).slice(0, 1000) : shop.return_policy,
+            payload.pickupInstructions !== undefined ? String(payload.pickupInstructions).slice(0, 1000) : shop.pickup_instructions,
+            payload.deliveryInfo !== undefined ? String(payload.deliveryInfo).slice(0, 1000) : shop.delivery_info,
+            payload.legalName !== undefined ? String(payload.legalName).trim().slice(0, 120) : shop.legal_name,
+            payload.ownershipType !== undefined ? String(payload.ownershipType).slice(0, 60) : shop.ownership_type,
+            shop.id);
+        if (legalChanged) {
+          db.prepare("UPDATE nb_seller_verifications SET status='additional_info_required',reason=?,updated_at=? WHERE user_id=? AND status='approved'")
+            .run('Legal identity changed — please re-submit KYC for review.', now(), s.user_id);
+          db.prepare('UPDATE nb_shops SET verified=0 WHERE id=?').run(shop.id);
+        }
+      });
+      audit('seller', s.user_id, 'profile_updated', 'shop', shop.id, name);
+      const updated = db.prepare('SELECT * FROM nb_shops WHERE id=?').get(shop.id);
+      send(res, 200, { message: legalChanged ? 'Profile saved. Legal identity changes need re-verification before selling resumes.' : 'Shop profile saved. Public details sync to the Customer Portal.', shop: shopRow(updated) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/hours' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      send(res, 200, { hours: shopHoursPayload(shop), nextOpening: nextOpening(shop) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/hours' && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      requireSellerPerm(s, shop, 'manage_settings', 'Editing business hours');
+      const days = Array.isArray(payload.days) ? payload.days : [];
+      transaction(() => {
+        for (const d of days) {
+          const day = clampInt(d.day, 0, 6);
+          const open = String(d.open || '09:00').slice(0, 5);
+          const close = String(d.close || '21:00').slice(0, 5);
+          if (!/^\d{1,2}:\d{2}$/.test(open) || !/^\d{1,2}:\d{2}$/.test(close)) fail(400, 'Opening and closing times must look like 09:00.');
+          db.prepare(`INSERT INTO nb_shop_hours(shop_id,day_of_week,open_time,close_time,break_start,break_end,shifts_json,closed,holiday_date,holiday_label)
+            VALUES(?,?,?,?,?,?,?,?,NULL,NULL)
+            ON CONFLICT(shop_id,day_of_week,holiday_date) DO UPDATE SET open_time=excluded.open_time,close_time=excluded.close_time,break_start=excluded.break_start,break_end=excluded.break_end,shifts_json=excluded.shifts_json,closed=excluded.closed`)
+            .run(shop.id, day, open, close, d.breakStart ? String(d.breakStart).slice(0, 5) : null, d.breakEnd ? String(d.breakEnd).slice(0, 5) : null, JSON.stringify(Array.isArray(d.shifts) ? d.shifts.slice(0, 4) : []), d.closed ? 1 : 0);
+        }
+        if (Array.isArray(payload.holidays)) {
+          for (const h of payload.holidays) {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(String(h.date || ''))) fail(400, 'Holiday dates must be YYYY-MM-DD.');
+            const dow = new Date(`${h.date}T00:00:00`).getDay();
+            db.prepare(`INSERT INTO nb_shop_hours(shop_id,day_of_week,open_time,close_time,closed,holiday_date,holiday_label)
+              VALUES(?,?,?,?,1,?,?)
+              ON CONFLICT(shop_id,day_of_week,holiday_date) DO UPDATE SET holiday_label=excluded.holiday_label`)
+              .run(shop.id, dow, '09:00', '21:00', String(h.date), String(h.label || 'Holiday').slice(0, 80));
+          }
+        }
+        const isOpen = payload.isOpen !== undefined ? (payload.isOpen ? 1 : 0) : shop.is_open;
+        const tempUntil = payload.temporaryClosureUntil !== undefined ? (payload.temporaryClosureUntil || null) : shop.temporary_closure_until;
+        const holDate = payload.holidayDate !== undefined ? (payload.holidayDate || null) : shop.holiday_date;
+        const holLabel = payload.holidayLabel !== undefined ? (payload.holidayLabel || null) : shop.holiday_label;
+        const firstDay = days.find((d) => !d.closed) || days[0];
+        db.prepare('UPDATE nb_shops SET is_open=?,temporary_closure_until=?,holiday_date=?,holiday_label=?,opens_at=?,closes_at=? WHERE id=?')
+          .run(isOpen, tempUntil, holDate, holLabel, firstDay ? String(firstDay.open).slice(0, 5) : shop.opens_at, firstDay ? String(firstDay.close).slice(0, 5) : shop.closes_at, shop.id);
+      });
+      audit('seller', s.user_id, 'hours_updated', 'shop', shop.id, `open=${payload.isOpen}`);
+      const updated = db.prepare('SELECT * FROM nb_shops WHERE id=?').get(shop.id);
+      send(res, 200, { message: 'Business hours saved. Existing accepted orders are preserved.', hours: shopHoursPayload(updated), nextOpening: nextOpening(updated) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/service-areas' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      const areas = db.prepare('SELECT * FROM nb_shop_service_areas WHERE shop_id=? ORDER BY pincode').all(shop.id);
+      send(res, 200, {
+        shop: { radiusKm: shop.radius_km, deliveryFee: shop.delivery_fee_paise, freeDeliveryOver: shop.free_delivery_over_paise, minOrder: shop.min_order_paise, prepMinutes: shop.prep_minutes, deliveryEnabled: Boolean(shop.delivery_enabled), pickupEnabled: Boolean(shop.pickup_enabled), selfDeliveryEnabled: shop.self_delivery_enabled !== 0, runnerEnabled: shop.runner_enabled !== 0, lat: shop.lat, lng: shop.lng, locality: shop.locality, pincode: shop.pincode },
+        areas: areas.length ? areas.map((a) => ({ pincode: a.pincode, locality: a.locality, city: a.city, lat: a.lat, lng: a.lng, radiusKm: a.radius_km, active: Boolean(a.active) })) : String(shop.service_pincodes || '').split(',').map((p) => p.trim()).filter(Boolean).map((pincode) => ({ pincode, locality: null, city: null, lat: null, lng: null, radiusKm: shop.radius_km, active: true }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/service-areas' && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      requireSellerPerm(s, shop, 'manage_settings', 'Editing delivery areas');
+      const pincodes = Array.isArray(payload.pincodes) ? payload.pincodes.map((p) => String(p).trim()).filter((p) => pincodeOk(p)) : String(payload.pincodes || '').split(',').map((p) => p.trim()).filter((p) => pincodeOk(p));
+      if (!pincodes.length) fail(400, 'Add at least one valid 6-digit service PIN code.');
+      const radius = payload.radiusKm !== undefined ? round2(Math.min(50, Math.max(0.5, Number(payload.radiusKm) || shop.radius_km))) : shop.radius_km;
+      transaction(() => {
+        db.prepare(`UPDATE nb_shops SET radius_km=?,service_pincodes=?,delivery_fee_paise=?,free_delivery_over_paise=?,min_order_paise=?,prep_minutes=?,delivery_enabled=?,pickup_enabled=?,self_delivery_enabled=?,runner_enabled=? WHERE id=?`)
+          .run(radius, pincodes.join(','), payload.deliveryFee !== undefined ? clampInt(payload.deliveryFee, 0, 200000) : shop.delivery_fee_paise,
+            payload.freeDeliveryOver !== undefined ? (payload.freeDeliveryOver == null ? null : clampInt(payload.freeDeliveryOver, 0, 1000000)) : shop.free_delivery_over_paise,
+            payload.minOrder !== undefined ? clampInt(payload.minOrder, 0, 1000000) : shop.min_order_paise,
+            payload.prepMinutes !== undefined ? clampInt(payload.prepMinutes, 1, 240) : shop.prep_minutes,
+            payload.deliveryEnabled !== undefined ? (payload.deliveryEnabled ? 1 : 0) : shop.delivery_enabled,
+            payload.pickupEnabled !== undefined ? (payload.pickupEnabled ? 1 : 0) : shop.pickup_enabled,
+            payload.selfDeliveryEnabled !== undefined ? (payload.selfDeliveryEnabled ? 1 : 0) : (shop.self_delivery_enabled ?? 1),
+            payload.runnerEnabled !== undefined ? (payload.runnerEnabled ? 1 : 0) : (shop.runner_enabled ?? 1),
+            shop.id);
+        db.prepare('DELETE FROM nb_shop_service_areas WHERE shop_id=?').run(shop.id);
+        for (const pin of pincodes) {
+          const area = pincodeArea(pin);
+          db.prepare('INSERT INTO nb_shop_service_areas(shop_id,pincode,locality,city,lat,lng,radius_km,active) VALUES(?,?,?,?,?,?,?,1)')
+            .run(shop.id, pin, area?.locality || null, area?.city || null, area?.lat ?? null, area?.lng ?? null, radius);
+        }
+      });
+      audit('seller', s.user_id, 'service_areas_updated', 'shop', shop.id, `${pincodes.join(',')} · ${radius}km`);
+      send(res, 200, { message: 'Delivery area saved. Checkout now only promises delivery inside this area.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/inventory' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const products = db.prepare('SELECT * FROM nb_products WHERE shop_id=? AND COALESCE(archived,0)=0 ORDER BY name').all(shop.id);
+      const movements = db.prepare('SELECT * FROM nb_inventory_transactions WHERE shop_id=? ORDER BY created_at DESC LIMIT 100').all(shop.id);
+      const totalUnits = products.reduce((t, p) => t + Math.max(0, p.stock - p.reserved), 0);
+      send(res, 200, {
+        summary: {
+          totalProducts: products.length,
+          totalUnits,
+          lowStock: products.filter((p) => p.stock - p.reserved > 0 && p.stock - p.reserved <= p.low_stock).length,
+          outStock: products.filter((p) => p.stock - p.reserved <= 0).length
+        },
+        products: products.map((p) => ({ id: p.id, name: p.name, sku: p.sku, barcode: p.barcode, stock: p.stock, reserved: p.reserved, available: Math.max(0, p.stock - p.reserved), lowAt: p.low_stock, maxStock: p.max_stock, active: Boolean(p.active), unit: p.unit })),
+        movements: movements.map((m) => ({ id: m.id, productId: m.product_id, type: m.type, previousQty: m.previous_qty, newQty: m.new_qty, delta: m.delta, reason: m.reason, actor: m.actor_name, at: m.created_at }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/inventory/adjust' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_inventory', 'Adjusting inventory');
+      const product = db.prepare('SELECT * FROM nb_products WHERE id=? AND shop_id=?').get(String(payload.productId || ''), shop.id);
+      if (!product) fail(404, 'Product not found in your catalogue');
+      const action = normaliseInventoryAction(payload.action || 'add');
+      const quantity = action === 'set' || action === 'opening' ? clampInt(payload.quantity ?? payload.stock, 0, 1000000) : clampInt(payload.quantity, 1, 1000000);
+      if (payload.quantity === undefined && payload.stock === undefined) fail(400, 'Send a quantity.');
+      const reason = String(payload.reason || '').trim().slice(0, 300);
+      if (!reason) fail(400, 'Give a reason for this stock change — it is written to the audit log.');
+      let result;
+      transaction(() => { result = applyInventoryChange(shop, product, action, quantity, reason, s); });
+      audit('seller', s.user_id, 'inventory_adjusted', 'product', product.id, `${product.name}: ${action} ${quantity} (${reason})`);
+      send(res, 200, { message: `Stock updated: ${result.previousQty} → ${result.newQty}.`, ...result });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/scanner/devices' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const devices = db.prepare('SELECT * FROM nb_scanner_devices WHERE shop_id=? ORDER BY created_at DESC').all(shop.id);
+      send(res, 200, { devices: devices.map((d) => ({ id: d.id, deviceId: d.device_serial || d.id, name: d.name, type: d.device_type, status: d.status, shopId: shop.id, lastActiveAt: d.last_active_at, createdAt: d.created_at })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/scanner/devices' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_scanner', 'Registering scanners');
+      const name = String(payload.name || '').trim();
+      if (!str(name, 2, 80)) fail(400, 'Give the scanner a name.');
+      const type = ['usb_keyboard', 'camera_qr', 'qr_camera', 'handheld_api', 'web_api'].includes(payload.type) ? payload.type : 'usb_keyboard';
+      const deviceId = String(payload.deviceId || '').trim().slice(0, 80) || null;
+      const id = `NB-SCAN-${randomBytes(3).toString('hex').toUpperCase()}`;
+      db.prepare('INSERT INTO nb_scanner_devices(id,shop_id,name,device_type,device_serial,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)')
+        .run(id, shop.id, name, type, deviceId, 'registered', now(), now());
+      audit('seller', s.user_id, 'scanner_registered', 'scanner', id, `${name} · ${type}`);
+      send(res, 201, { message: `Scanner ${name} registered to your shop. Connect it and scan a barcode to identify a product.`, device: { id, name, type, status: 'registered' } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/scanner/scan' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_scanner', 'Using the scanner');
+      const code = String(payload.code || '').trim();
+      if (!code) fail(400, 'Scan a barcode or QR code first.');
+      const eventId = String(payload.eventId || payload.event_id || '').trim() || `EVT-${randomBytes(6).toString('hex')}`;
+      const existing = db.prepare('SELECT * FROM nb_scanner_events WHERE event_id=?').get(eventId);
+      if (existing) {
+        const product = existing.product_id ? db.prepare('SELECT * FROM nb_products WHERE id=?').get(existing.product_id) : null;
+        send(res, 200, { duplicate: true, event: { id: existing.id, eventId: existing.event_id, status: existing.status, action: existing.action }, product: product ? { id: product.id, name: product.name, sku: product.sku, barcode: product.barcode, stock: product.stock, available: Math.max(0, product.stock - product.reserved), unit: product.unit } : null, message: 'This scan was already recorded. No duplicate stock change was made.' });
+        return true;
+      }
+      const product = db.prepare('SELECT * FROM nb_products WHERE shop_id=? AND (barcode=? OR sku=? OR id=? OR compare_key=?) LIMIT 1').get(shop.id, code, code, code, code);
+      if (!product) fail(404, 'No product in your shop matches this code. Check the barcode or add the product first.');
+      const deviceId = payload.deviceId ? String(payload.deviceId) : null;
+      if (deviceId) {
+        const device = db.prepare('SELECT * FROM nb_scanner_devices WHERE id=? AND shop_id=?').get(deviceId, shop.id);
+        if (!device) fail(400, 'Scanner device is not registered to your shop.');
+        db.prepare('UPDATE nb_scanner_devices SET last_active_at=?,updated_at=? WHERE id=?').run(now(), now(), deviceId);
+      }
+      const orderCode = payload.orderCode ? String(payload.orderCode) : null;
+      if (orderCode) {
+        const so = db.prepare('SELECT * FROM nb_seller_orders WHERE code=? AND shop_id=?').get(orderCode, shop.id);
+        if (!so) fail(404, 'Order not found for your shop.');
+        const inOrder = db.prepare('SELECT * FROM nb_order_items WHERE seller_order_id=? AND product_id=?').get(so.id, product.id);
+        if (!inOrder) fail(400, 'This product is not part of that order.');
+      }
+      const id = uid();
+      db.prepare('INSERT INTO nb_scanner_events(id,event_id,shop_id,device_id,code,product_id,order_code,action,status,actor_user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+        .run(id, eventId, shop.id, deviceId, code, product.id, orderCode, String(payload.action || 'add').slice(0, 20), 'pending', s.user_id, now());
+      send(res, 201, {
+        event: { id, eventId, status: 'pending', action: payload.action || 'add' },
+        product: { id: product.id, name: product.name, sku: product.sku, barcode: product.barcode, stock: product.stock, reserved: product.reserved, available: Math.max(0, product.stock - product.reserved), unit: product.unit, price: product.price_paise },
+        message: 'Product identified. Confirm the stock action to commit it — scanning alone never changes stock.'
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/scanner\/events\/[A-Za-z0-9-]+\/(confirm|reject)$/) && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_scanner', 'Confirming scans');
+      const parts = route.split('/');
+      const eventId = decodeURIComponent(parts[4]);
+      const verb = parts[5];
+      const event = db.prepare('SELECT * FROM nb_scanner_events WHERE event_id=? AND shop_id=?').get(eventId, shop.id);
+      if (!event) fail(404, 'Scan event not found.');
+      if (event.status === 'confirmed') { send(res, 200, { message: 'This scan was already confirmed. No duplicate change was made.', status: 'confirmed' }); return true; }
+      if (verb === 'reject') {
+        db.prepare("UPDATE nb_scanner_events SET status='rejected' WHERE id=?").run(event.id);
+        send(res, 200, { message: 'Scan discarded. Stock was not changed.', status: 'rejected' });
+        return true;
+      }
+      const product = db.prepare('SELECT * FROM nb_products WHERE id=? AND shop_id=?').get(event.product_id, shop.id);
+      if (!product) fail(404, 'Product no longer exists.');
+      const action = normaliseInventoryAction(payload.action || event.action || 'add');
+      const quantity = clampInt(payload.quantity ?? 1, 1, 100000);
+      const orderCode = String(payload.orderCode || event.order_code || '').trim();
+      if (action === 'pack' && !orderCode) fail(400, 'Enter the order code this scan should pack for.');
+      const reason = String(payload.reason || `Scanner ${action.replace(/_/g, ' ')}`).slice(0, 300);
+      transaction(() => {
+        if (action === 'pack') {
+          const so = db.prepare('SELECT * FROM nb_seller_orders WHERE code=? AND shop_id=?').get(orderCode, shop.id);
+          if (!so) fail(404, 'Order not found for your shop.');
+          const item = db.prepare('SELECT * FROM nb_order_items WHERE seller_order_id=? AND product_id=?').get(so.id, product.id);
+          if (!item) fail(400, 'This product is not part of that order.');
+          const packed = Math.min(item.qty, (item.packed_qty || 0) + quantity);
+          db.prepare('UPDATE nb_order_items SET packed_qty=?,packed_status=? WHERE id=?').run(packed, packed >= item.qty ? 'packed' : 'packing', item.id);
+          db.prepare('UPDATE nb_packing_items SET packed_qty=?,status=?,updated_at=? WHERE seller_order_id=? AND order_item_id=?').run(packed, packed >= item.qty ? 'packed' : 'packing', now(), so.id, item.id);
+        } else if (action === 'price_check' || action === 'price') {
+          // A price check looks the product up and must never move stock.
+        } else {
+          applyInventoryChange(shop, product, action, quantity, reason, s);
+        }
+        db.prepare("UPDATE nb_scanner_events SET status='confirmed',action=?,quantity=?,reason=?,order_code=?,confirmed_at=? WHERE id=?").run(action, quantity, reason, orderCode || event.order_code || null, now(), event.id);
+      });
+      audit('seller', s.user_id, 'scanner_confirmed', 'scanner_event', event.id, `${product.name}: ${action} ${quantity}`);
+      const message = action === 'pack' ? `Item marked packed for order ${orderCode}.`
+          : action === 'price_check' || action === 'price' ? `${product.name} is ₹${(Number(product.price_paise) / 100).toFixed(2)}${product.stock != null ? ` · ${product.stock} on the shelf` : ''}. No stock change was made.`
+          : `Stock updated for ${product.name}.`;
+      send(res, 200, { message, status: 'confirmed' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/scanner/events' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const rows = db.prepare('SELECT e.*, p.name AS product_name FROM nb_scanner_events e LEFT JOIN nb_products p ON p.id=e.product_id WHERE e.shop_id=? ORDER BY e.created_at DESC LIMIT 50').all(shop.id);
+      send(res, 200, { events: rows.map((e) => ({ id: e.id, eventId: e.event_id, code: e.code, product: e.product_name, orderCode: e.order_code, action: e.action, status: e.status, quantity: e.quantity, at: e.created_at })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/orders\/[A-Za-z0-9-]+\/packing$/) && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const so = sellerOrderOwned(decodeURIComponent(route.split('/')[3]), shop);
+      const summary = packingSummary(so);
+      send(res, 200, {
+        order: { code: so.code, status: so.status, fulfillment: so.fulfillment, partial: Boolean(so.partial_fulfillment), partialNote: so.partial_note || null },
+        summary: { ordered: summary.ordered, packed: summary.packed, missing: summary.missing, complete: summary.complete },
+        items: summary.rows.map((r) => ({ id: r.id, orderItemId: r.order_item_id, productId: r.product_id, name: r.name, unit: r.unit, emoji: r.emoji, orderedQty: r.ordered_qty, packedQty: r.packed_qty, missingQty: r.missing_qty, status: r.status, note: r.note }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/orders\/[A-Za-z0-9-]+\/packing$/) && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'prepare_orders', 'Packing orders');
+      const so = sellerOrderOwned(decodeURIComponent(route.split('/')[3]), shop);
+      if (!['accepted', 'preparing', 'ready'].includes(so.status)) fail(409, 'Packing is available once the order is accepted.');
+      const itemId = String(payload.itemId || payload.orderItemId || '');
+      const row = db.prepare('SELECT * FROM nb_packing_items WHERE seller_order_id=? AND order_item_id=?').get(so.id, itemId);
+      if (!row) fail(404, 'Packing item not found. Open the packing checklist first.');
+      const packedQty = clampInt(payload.packedQty ?? row.packed_qty, 0, row.ordered_qty);
+      // Missing units must be reported explicitly — silent short-packs must never auto-resolve an order.
+      const missingQty = payload.missingQty !== undefined ? clampInt(payload.missingQty, 0, row.ordered_qty) : Number(row.missing_qty || 0);
+      if (packedQty + missingQty > row.ordered_qty) fail(400, 'Packed plus missing cannot exceed the ordered quantity.');
+      const status = payload.status ? String(payload.status).slice(0, 20) : (missingQty > 0 ? 'missing' : packedQty >= row.ordered_qty ? 'packed' : 'packing');
+      const note = payload.note !== undefined ? String(payload.note).slice(0, 300) : row.note;
+      transaction(() => {
+        db.prepare('UPDATE nb_packing_items SET packed_qty=?,missing_qty=?,status=?,note=?,updated_at=? WHERE id=?').run(packedQty, missingQty, status, note, now(), row.id);
+        db.prepare('UPDATE nb_order_items SET packed_qty=?,missing_qty=?,packed_status=? WHERE id=?').run(packedQty, missingQty, status, row.order_item_id);
+        if (payload.partial !== undefined || payload.partialNote !== undefined) {
+          db.prepare('UPDATE nb_seller_orders SET partial_fulfillment=?,partial_note=?,updated_at=? WHERE id=?').run(payload.partial ? 1 : 0, payload.partialNote ? String(payload.partialNote).slice(0, 500) : so.partial_note, now(), so.id);
+        }
+      });
+      audit('seller', s.user_id, 'packing_updated', 'seller_order', so.id, `${so.code}: packed ${packedQty}/${row.ordered_qty}`);
+      const summary = packingSummary(so);
+      send(res, 200, { message: 'Packing updated.', summary: { ordered: summary.ordered, packed: summary.packed, missing: summary.missing, complete: summary.complete } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/delivery' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const orders = db.prepare('SELECT * FROM nb_seller_orders WHERE shop_id=? ORDER BY created_at DESC LIMIT 100').all(shop.id);
+      const by = (statuses) => orders.filter((o) => statuses.includes(o.status));
+      const staff = db.prepare(`SELECT st.id, st.role, u.name, u.phone FROM nb_shop_staff st JOIN nb_users u ON u.id=st.user_id WHERE st.shop_id=? AND st.status='active' AND st.role='delivery_staff' ORDER BY u.name`).all(shop.id);
+      send(res, 200, {
+        summary: {
+          pendingDispatch: by(['ready']).length,
+          runnerRequested: by(['runner_requested']).length,
+          runnerAssigned: by(['runner_assigned']).length,
+          readyForPickup: orders.filter((o) => o.status === 'ready' && o.fulfillment === 'pickup').length,
+          selfDelivery: by(['out_for_delivery']).filter((o) => !o.runner_id).length,
+          delivered: by(['delivered', 'completed']).length,
+          failed: by(['cancelled', 'rejected']).length,
+          deliveryCharges: orders.reduce((t, o) => t + o.delivery_fee_paise, 0)
+        },
+        staff: staff.map((x) => ({ id: x.id, name: x.name, phone: x.phone })),
+        orders: orders.map((so) => {
+          const assignment = db.prepare('SELECT * FROM nb_delivery_assignments WHERE seller_order_id=? ORDER BY created_at DESC LIMIT 1').get(so.id);
+          const runner = so.runner_id ? db.prepare('SELECT name FROM nb_users WHERE id=?').get(so.runner_id) : null;
+          return { code: so.code, parentCode: db.prepare('SELECT code FROM nb_orders WHERE id=?').get(so.order_id)?.code, status: so.status, fulfillment: so.fulfillment, total: so.total_paise, createdAt: so.created_at, runner: runner?.name || null, assignmentStatus: assignment?.status || null, deliveryStaff: so.delivery_staff_name || null, weightGrams: so.weight_grams, packages: so.packages_count || 1, runnerCharges: so.runner_charges_paise, handoverConfirmedAt: so.handover_confirmed_at };
+        })
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/analytics' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'view_analytics', 'Viewing analytics');
+      const range = String(q.get('range') || '30d');
+      const nowDate = new Date();
+      const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      const endOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+      let from = new Date(nowDate.getTime() - 29 * 864e5);
+      let to = nowDate;
+      if (range === 'today') { from = startOfDay(nowDate); to = endOfDay(nowDate); }
+      else if (range === 'yesterday') { const y = new Date(nowDate.getTime() - 864e5); from = startOfDay(y); to = endOfDay(y); }
+      else if (range === '7d') { from = startOfDay(new Date(nowDate.getTime() - 6 * 864e5)); to = endOfDay(nowDate); }
+      else if (range === '30d') { from = startOfDay(new Date(nowDate.getTime() - 29 * 864e5)); to = endOfDay(nowDate); }
+      else if (range === '90d') { from = startOfDay(new Date(nowDate.getTime() - 89 * 864e5)); to = endOfDay(nowDate); }
+      else if (range === 'month') { from = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1); to = endOfDay(nowDate); }
+      else if (range === 'last_month') { from = new Date(nowDate.getFullYear(), nowDate.getMonth() - 1, 1); to = endOfDay(new Date(nowDate.getFullYear(), nowDate.getMonth(), 0)); }
+      else if (range === 'year') { from = startOfDay(new Date(nowDate.getTime() - 364 * 864e5)); to = endOfDay(nowDate); }
+      else if (range === 'this_year') { from = new Date(nowDate.getFullYear(), 0, 1); to = endOfDay(nowDate); }
+      else if (range === 'last_year') { from = new Date(nowDate.getFullYear() - 1, 0, 1); to = endOfDay(new Date(nowDate.getFullYear() - 1, 11, 31)); }
+      else if (range === 'custom' && q.get('from') && q.get('to')) {
+        const cf = new Date(q.get('from')); const ct = new Date(q.get('to'));
+        if (Number.isNaN(cf.getTime()) || Number.isNaN(ct.getTime())) fail(400, 'Send a valid custom from/to date pair.');
+        from = startOfDay(cf); to = endOfDay(ct.getTime() < cf.getTime() ? cf : ct);
+      }
+      if (to.getTime() - from.getTime() > 731 * 864e5) fail(400, 'Analytics ranges are capped at two years.');
+      const fromIso = from.toISOString();
+      const toIso = to.toISOString();
+      const rows = db.prepare('SELECT so.*, o.customer_id, o.is_demo FROM nb_seller_orders so JOIN nb_orders o ON o.id=so.order_id WHERE so.shop_id=? AND so.created_at>=? AND so.created_at<=? ORDER BY so.created_at').all(shop.id, fromIso, toIso);
+      const valid = rows.filter((o) => !['cancelled', 'rejected'].includes(o.status));
+      const completed = rows.filter((o) => ['delivered', 'completed'].includes(o.status));
+      const gross = valid.reduce((t, o) => t + o.total_paise, 0);
+      const refunds = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n FROM nb_refunds r JOIN nb_seller_orders so ON so.order_id=r.order_id WHERE so.shop_id=? AND r.status='completed' AND r.created_at>=? AND r.created_at<=?`).get(shop.id, fromIso, toIso);
+      const refundTotal = Number(refunds?.n || 0);
+      const discounts = valid.reduce((t, o) => t + o.discount_paise, 0);
+      const deliveryCharges = valid.reduce((t, o) => t + o.delivery_fee_paise, 0);
+      const tax = valid.reduce((t, o) => t + o.tax_paise, 0);
+      const seriesMap = new Map();
+      for (const o of valid) {
+        const day = o.created_at.slice(0, 10);
+        const cur = seriesMap.get(day) || { date: day, sales: 0, orders: 0 };
+        cur.sales += o.total_paise; cur.orders += 1;
+        seriesMap.set(day, cur);
+      }
+      // Every calendar day in the range is represented; a zero day is real data, not an invention.
+      const series = [];
+      for (let d = startOfDay(from); d.getTime() <= to.getTime() && series.length < 731; d = new Date(d.getTime() + 864e5)) {
+        const key = d.toISOString().slice(0, 10);
+        const cur = seriesMap.get(key);
+        series.push(cur ? { date: key, sales: cur.sales, orders: cur.orders } : { date: key, sales: 0, orders: 0 });
+      }
+      const productRows = db.prepare(`SELECT oi.product_id, oi.name, SUM(oi.qty) AS qty, SUM(oi.line_total_paise) AS revenue FROM nb_order_items oi JOIN nb_seller_orders so ON so.id=oi.seller_order_id WHERE so.shop_id=? AND so.created_at>=? AND so.created_at<=? AND so.status NOT IN ('cancelled','rejected') GROUP BY oi.product_id, oi.name ORDER BY revenue DESC`).all(shop.id, fromIso, toIso);
+      const categoryRows = db.prepare(`SELECT p.category_slug, SUM(oi.line_total_paise) AS revenue, SUM(oi.qty) AS qty FROM nb_order_items oi JOIN nb_seller_orders so ON so.id=oi.seller_order_id JOIN nb_products p ON p.id=oi.product_id WHERE so.shop_id=? AND so.created_at>=? AND so.created_at<=? AND so.status NOT IN ('cancelled','rejected') GROUP BY p.category_slug ORDER BY revenue DESC`).all(shop.id, fromIso, toIso);
+      const customers = new Map();
+      for (const o of valid) {
+        const c = customers.get(o.customer_id) || { id: o.customer_id, orders: 0, spent: 0 };
+        c.orders += 1; c.spent += o.total_paise;
+        customers.set(o.customer_id, c);
+      }
+      const repeat = [...customers.values()].filter((c) => c.orders > 1).length;
+      const isDemo = rows.some((o) => o.is_demo);
+      const couponOrders = valid.filter((o) => Number(o.discount_paise || 0) > 0).length;
+      const unitsSold = productRows.reduce((n, r) => n + Number(r.qty || 0), 0);
+      send(res, 200, {
+        range, from: fromIso, to: toIso, isDemo,
+        metrics: {
+          grossSales: gross, netSales: Math.max(0, gross - refundTotal), orderCount: valid.length,
+          completedOrders: completed.length, cancelledOrders: rows.filter((o) => o.status === 'cancelled').length,
+          rejectedOrders: rows.filter((o) => o.status === 'rejected').length, refunds: refundTotal,
+          discounts, couponOrders, deliveryCharges, tax, unitsSold,
+          averageOrderValue: valid.length ? Math.round(gross / valid.length) : 0
+        },
+        series,
+        products: productRows.map((p) => ({ id: p.product_id, name: p.name, qty: Number(p.qty), revenue: Number(p.revenue) })),
+        bestSellers: productRows.slice(0, 5).map((p) => ({ name: p.name, qty: Number(p.qty), revenue: Number(p.revenue) })),
+        leastSellers: [...productRows].sort((a, b) => a.revenue - b.revenue).slice(0, 5).map((p) => ({ name: p.name, qty: Number(p.qty), revenue: Number(p.revenue) })),
+        categories: categoryRows.map((c) => ({ slug: c.category_slug, revenue: Number(c.revenue), qty: Number(c.qty) })),
+        customers: { total: customers.size, repeat, repeatRate: customers.size ? Math.round((repeat / customers.size) * 100) : 0 }
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/revenue' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'view_revenue', 'Viewing revenue');
+      const commissionRate = Number(shop.commission_rate || 0);
+      const payments = db.prepare(`SELECT pr.*, so.code AS seller_code, so.shop_id, o.code AS order_code, o.payment_method, o.total_paise AS order_total FROM nb_payment_records pr JOIN nb_orders o ON o.id=pr.order_id LEFT JOIN nb_seller_orders so ON so.order_id=o.id AND so.shop_id=? WHERE so.id IS NOT NULL ORDER BY pr.created_at DESC LIMIT 200`).all(shop.id);
+      const byStatus = (st) => payments.filter((p) => p.status === st).reduce((t, p) => t + p.amount_paise, 0);
+      const cod = payments.filter((p) => p.method === 'cod').reduce((t, p) => t + p.amount_paise, 0);
+      const payAtStore = payments.filter((p) => p.method === 'pay_at_store').reduce((t, p) => t + p.amount_paise, 0);
+      const refunds = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n FROM nb_refunds r JOIN nb_seller_orders so ON so.order_id=r.order_id WHERE so.shop_id=? AND r.status='completed'`).get(shop.id);
+      const grossCollected = byStatus('paid');
+      const commission = Math.round(grossCollected * commissionRate / 100);
+      send(res, 200, {
+        dashboard: {
+          successful: byStatus('paid'), pending: byStatus('pending'), failed: byStatus('failed'),
+          cod, payAtStore, refunds: Number(refunds?.n || 0), commission, commissionRate,
+          payableBalance: Math.max(0, grossCollected - commission - Number(refunds?.n || 0))
+        },
+        transactions: payments.map((p) => {
+          const so = p.seller_code ? db.prepare('SELECT * FROM nb_seller_orders WHERE code=?').get(p.seller_code) : null;
+          const refund = so ? db.prepare(`SELECT COALESCE(SUM(amount_paise),0) AS n FROM nb_refunds WHERE order_id=? AND status='completed'`).get(so.order_id) : { n: 0 };
+          const gross = so ? so.total_paise : p.amount_paise;
+          const comm = Math.round(gross * commissionRate / 100);
+          const settlement = so ? db.prepare('SELECT st.status FROM nb_settlement_items si JOIN nb_settlements st ON st.id=si.settlement_id WHERE si.seller_order_id=? LIMIT 1').get(so.id) : null;
+          return { id: p.id, orderCode: p.order_code, sellerOrderCode: p.seller_code, method: p.method, provider: p.provider, gross, discount: so?.discount_paise || 0, refund: Number(refund?.n || 0), commission: comm, netPayable: Math.max(0, gross - comm - Number(refund?.n || 0)), paymentStatus: p.status, settlementStatus: settlement?.status || 'not_settled', reference: p.reference, at: p.created_at };
+        })
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/settlements' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'view_revenue', 'Viewing settlements');
+      const rows = db.prepare('SELECT * FROM nb_settlements WHERE shop_id=? ORDER BY created_at DESC').all(shop.id);
+      const sum = (st) => rows.filter((r) => r.status === st).reduce((t, r) => t + r.net_paise, 0);
+      send(res, 200, {
+        summary: { totalEarnings: rows.reduce((t, r) => t + r.net_paise, 0), pending: sum('pending'), processing: sum('processing'), settled: sum('completed'), failed: sum('failed'), onHold: sum('on_hold'), refundDeductions: rows.reduce((t, r) => t + r.refunds_paise, 0) },
+        settlements: rows.map((r) => ({ id: r.id, code: r.code, periodStart: r.period_start, periodEnd: r.period_end, gross: r.gross_paise, refunds: r.refunds_paise, commission: r.commission_paise, adjustments: r.adjustments_paise, net: r.net_paise, status: r.status, bankReference: r.bank_reference, payoutDate: r.payout_date, createdAt: r.created_at }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/settlements/generate' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_settlements', 'Generating settlements');
+      const periodStart = String(payload.periodStart || '').slice(0, 10);
+      const periodEnd = String(payload.periodEnd || '').slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(periodStart) || !/^\d{4}-\d{2}-\d{2}$/.test(periodEnd) || periodStart > periodEnd) fail(400, 'Choose a valid settlement period.');
+      const orders = db.prepare(`SELECT so.* FROM nb_seller_orders so WHERE so.shop_id=? AND so.status IN ('delivered','completed') AND date(so.created_at)>=? AND date(so.created_at)<=?
+        AND so.id NOT IN (SELECT seller_order_id FROM nb_settlement_items) ORDER BY so.created_at`).all(shop.id, periodStart, periodEnd);
+      if (!orders.length) fail(409, 'No unsettled completed orders in this period.');
+      const commissionRate = Number(shop.commission_rate || 0);
+      let gross = 0, refunds = 0, commission = 0;
+      const id = uid();
+      const code = `STL-${String(Math.floor(100000 + Math.random() * 900000))}`;
+      const lines = [];
+      transaction(() => {
+        for (const so of orders) {
+          const refund = db.prepare(`SELECT COALESCE(SUM(amount_paise),0) AS n FROM nb_refunds WHERE order_id=? AND status='completed'`).get(so.order_id);
+          const r = Number(refund?.n || 0);
+          const c = Math.round(so.total_paise * commissionRate / 100);
+          gross += so.total_paise; refunds += r; commission += c;
+          lines.push([uid(), id, so.id, so.total_paise, r, c, Math.max(0, so.total_paise - r - c)]);
+        }
+        // Parent settlement first — settlement items carry a foreign key to it.
+        db.prepare('INSERT INTO nb_settlements(id,code,shop_id,period_start,period_end,gross_paise,refunds_paise,commission_paise,adjustments_paise,net_paise,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(id, code, shop.id, periodStart, periodEnd, gross, refunds, commission, 0, Math.max(0, gross - refunds - commission), 'pending', now(), now());
+        for (const line of lines) {
+          db.prepare('INSERT INTO nb_settlement_items(id,settlement_id,seller_order_id,gross_paise,refund_paise,commission_paise,net_paise) VALUES(?,?,?,?,?,?,?)').run(...line);
+        }
+      });
+      audit('seller', s.user_id, 'settlement_generated', 'settlement', id, `${code} · ${orders.length} order(s)`);
+      send(res, 201, { message: `Settlement ${code} created as pending. It becomes settled only after the payout is confirmed.`, code, status: 'pending' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/settlements\/[A-Za-z0-9-]+$/) && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const row = db.prepare('SELECT * FROM nb_settlements WHERE code=? AND shop_id=?').get(decodeURIComponent(route.split('/')[3]), shop.id);
+      if (!row) fail(404, 'Settlement not found.');
+      const items = db.prepare('SELECT si.*, so.code AS order_code FROM nb_settlement_items si JOIN nb_seller_orders so ON so.id=si.seller_order_id WHERE si.settlement_id=? ORDER BY so.created_at').all(row.id);
+      send(res, 200, { settlement: { id: row.id, code: row.code, periodStart: row.period_start, periodEnd: row.period_end, gross: row.gross_paise, refunds: row.refunds_paise, commission: row.commission_paise, adjustments: row.adjustments_paise, net: row.net_paise, status: row.status, bankReference: row.bank_reference, payoutDate: row.payout_date }, items: items.map((i) => ({ orderCode: i.order_code, gross: i.gross_paise, refund: i.refund_paise, commission: i.commission_paise, net: i.net_paise })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/settlements\/[A-Za-z0-9-]+\/statement\.csv$/) && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const row = db.prepare('SELECT * FROM nb_settlements WHERE code=? AND shop_id=?').get(decodeURIComponent(route.split('/')[3]), shop.id);
+      if (!row) fail(404, 'Settlement not found.');
+      const items = db.prepare('SELECT si.*, so.code AS order_code FROM nb_settlement_items si JOIN nb_seller_orders so ON so.id=si.seller_order_id WHERE si.settlement_id=? ORDER BY so.created_at').all(row.id);
+      sendCsv(res, `settlement-${row.code}.csv`, [
+        ['NearBuy Seller Settlement Statement', row.code, shop.name, `Period ${row.period_start} to ${row.period_end}`, `Status ${row.status}`],
+        ['Order', 'Gross (₹)', 'Refund (₹)', 'Commission (₹)', 'Net (₹)'],
+        ...items.map((i) => [i.order_code, (i.gross_paise / 100).toFixed(2), (i.refund_paise / 100).toFixed(2), (i.commission_paise / 100).toFixed(2), (i.net_paise / 100).toFixed(2)]),
+        ['Total', (row.gross_paise / 100).toFixed(2), (row.refunds_paise / 100).toFixed(2), (row.commission_paise / 100).toFixed(2), (row.net_paise / 100).toFixed(2)]
+      ]);
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/promotions' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const rows = db.prepare('SELECT * FROM nb_coupons WHERE shop_id=? ORDER BY ends_at DESC').all(shop.id);
+      send(res, 200, { promotions: rows.map((c) => ({ code: c.code, title: c.title, description: c.description, type: c.type, promoType: c.promo_type || c.type, value: c.value, minOrder: c.min_order_paise, maxDiscount: c.max_discount_paise, productIds: parseJsonArray(c.product_ids), categorySlugs: parseJsonArray(c.category_slugs), buyQty: c.buy_qty, getQty: c.get_qty, eligibility: c.eligibility, startsAt: c.starts_at, endsAt: c.ends_at, usageLimit: c.usage_limit, usedCount: c.used_count, perCustomerLimit: c.per_customer_limit, active: Boolean(c.active) })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/promotions' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_promotions', 'Creating promotions');
+      const code = String(payload.code || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 20);
+      if (!/^[A-Z0-9-]{3,20}$/.test(code)) fail(400, 'Coupon code must be 3–20 letters, numbers or dashes.');
+      if (db.prepare('SELECT code FROM nb_coupons WHERE code=?').get(code)) fail(409, 'That coupon code already exists.');
+      const promoType = ['percentage', 'fixed', 'product', 'category', 'bogo', 'bulk', 'seasonal', 'limited_time', 'min_order'].includes(payload.promoType) ? payload.promoType : 'percentage';
+      // nb_coupons.type is constrained to percent/fixed/free_delivery; a BOGO deal is carried by promo_type + buy_qty/get_qty.
+      const isBogo = promoType === 'bogo';
+      const type = isBogo ? 'percent' : (payload.type === 'fixed' || promoType === 'fixed' ? 'fixed' : payload.type === 'free_delivery' ? 'free_delivery' : 'percent');
+      const value = isBogo ? 0 : clampInt(payload.value, 0, 1000000);
+      if (!isBogo && type === 'percent' && (value < 1 || value > 90)) fail(400, 'Percentage discount must be 1–90.');
+      if (!isBogo && type === 'fixed' && value < 100) fail(400, 'Fixed discount must be at least ₹1.');
+      if (isBogo && (clampInt(payload.buyQty ?? 1, 1, 100) < 1 || clampInt(payload.getQty ?? 1, 1, 100) < 1)) fail(400, 'Buy One Get One needs buy and get quantities of at least 1.');
+      const startsAt = payload.startsAt ? new Date(payload.startsAt).toISOString() : now();
+      const endsAt = payload.endsAt ? new Date(payload.endsAt).toISOString() : new Date(Date.now() + 30 * 864e5).toISOString();
+      if (Number.isNaN(new Date(startsAt).getTime()) || Number.isNaN(new Date(endsAt).getTime()) || endsAt <= startsAt) fail(400, 'Choose a valid start and end date.');
+      const productIds = Array.isArray(payload.productIds) ? payload.productIds.filter((id) => db.prepare('SELECT id FROM nb_products WHERE id=? AND shop_id=?').get(String(id), shop.id)).map(String) : [];
+      const categorySlugs = Array.isArray(payload.categorySlugs) ? payload.categorySlugs.filter((slug) => db.prepare('SELECT slug FROM nb_categories WHERE slug=?').get(String(slug))).map(String) : [];
+      if ((promoType === 'product' || promoType === 'bogo') && !productIds.length && !categorySlugs.length) fail(400, 'Select eligible products or categories for this offer.');
+      db.prepare(`INSERT INTO nb_coupons(code,title,description,type,value,min_order_paise,max_discount_paise,shop_id,starts_at,ends_at,usage_limit,used_count,per_customer_limit,active,promo_type,product_ids,category_slugs,buy_qty,get_qty,eligibility)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)`).run(
+        code, String(payload.title || code).trim().slice(0, 120), String(payload.description || '').slice(0, 500) || null, type, value,
+        clampInt(payload.minOrder ?? 0, 0, 1000000), payload.maxDiscount != null ? clampInt(payload.maxDiscount, 0, 1000000) : null,
+        shop.id, startsAt, endsAt, payload.usageLimit != null ? clampInt(payload.usageLimit, 1, 1000000) : null,
+        clampInt(payload.perCustomerLimit ?? 1, 1, 100), payload.active === false ? 0 : 1, promoType,
+        productIds.length ? JSON.stringify(productIds) : null, categorySlugs.length ? JSON.stringify(categorySlugs) : null,
+        payload.buyQty != null ? clampInt(payload.buyQty, 1, 100) : null, payload.getQty != null ? clampInt(payload.getQty, 1, 100) : null,
+        String(payload.eligibility || 'all_customers').slice(0, 40)
+      );
+      audit('seller', s.user_id, 'promotion_created', 'coupon', code, `${promoType} · ${value}`);
+      send(res, 201, { message: `Offer ${code} created for your shop only. It is validated at checkout.`, code });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/promotions\/[A-Za-z0-9-]+$/) && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_promotions', 'Editing promotions');
+      const code = decodeURIComponent(route.split('/')[3]).toUpperCase();
+      const coupon = db.prepare('SELECT * FROM nb_coupons WHERE code=? AND shop_id=?').get(code, shop.id);
+      if (!coupon) fail(404, 'Promotion not found for your shop.');
+      db.prepare('UPDATE nb_coupons SET active=?,ends_at=?,usage_limit=? WHERE code=?').run(
+        payload.active !== undefined ? (payload.active ? 1 : 0) : coupon.active,
+        payload.endsAt ? new Date(payload.endsAt).toISOString() : coupon.ends_at,
+        payload.usageLimit !== undefined ? (payload.usageLimit == null ? null : clampInt(payload.usageLimit, 1, 1000000)) : coupon.usage_limit,
+        code
+      );
+      audit('seller', s.user_id, 'promotion_updated', 'coupon', code, `active=${payload.active}`);
+      send(res, 200, { message: `Offer ${code} updated.` });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/promotions\/[A-Za-z0-9-]+$/) && method === 'DELETE') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_promotions', 'Deleting promotions');
+      const code = decodeURIComponent(route.split('/')[3]).toUpperCase();
+      const coupon = db.prepare('SELECT * FROM nb_coupons WHERE code=? AND shop_id=?').get(code, shop.id);
+      if (!coupon) fail(404, 'Promotion not found for your shop.');
+      // Redeemed offers stay in the ledger so past orders keep explaining their discount.
+      if (Number(coupon.used_count || 0) > 0) {
+        db.prepare('UPDATE nb_coupons SET active=0,ends_at=? WHERE code=?').run(coupon.ends_at || now(), code);
+        audit('seller', s.user_id, 'promotion_retired', 'coupon', code, `${coupon.used_count} redemption(s) kept on record`);
+        send(res, 200, { message: `Offer ${code} was used ${coupon.used_count} time(s), so it has been retired instead of deleted. Past orders keep their discount record.` });
+        return true;
+      }
+      db.prepare('DELETE FROM nb_coupons WHERE code=? AND shop_id=?').run(code, shop.id);
+      audit('seller', s.user_id, 'promotion_deleted', 'coupon', code, coupon.title || code);
+      send(res, 200, { message: `Offer ${code} deleted.` });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/staff' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_staff', 'Viewing staff');
+      const rows = db.prepare(`SELECT st.*, u.name, u.email, u.phone, u.status AS user_status FROM nb_shop_staff st JOIN nb_users u ON u.id=st.user_id WHERE st.shop_id=? ORDER BY u.name`).all(shop.id);
+      send(res, 200, {
+        roles: Object.keys(STAFF_ROLE_PERMS).filter((r) => r !== 'owner').map((r) => ({ id: r, label: r.replace(/_/g, ' '), permissions: STAFF_ROLE_PERMS[r] })),
+        allPermissions: [...new Set(Object.values(STAFF_ROLE_PERMS).flat())],
+        staff: rows.map((r) => { let perms = null; try { perms = JSON.parse(r.permissions_json ?? 'null'); } catch { perms = null; } return { id: r.id, userId: r.user_id, name: r.name, email: r.email, phone: r.phone, role: r.role, permissions: Array.isArray(perms) ? perms : (STAFF_ROLE_PERMS[r.role] || []), status: r.status, userStatus: r.user_status, createdAt: r.created_at }; })
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/staff' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_staff', 'Adding staff');
+      const name = String(payload.name || '').trim();
+      const email = String(payload.email || '').trim().toLowerCase();
+      const phone = normalPhone(payload.phone);
+      const role = String(payload.role || 'sales_staff');
+      if (!str(name, 2, 80)) fail(400, 'Enter the staff member’s name.');
+      if (!emailOk(email)) fail(400, 'Enter a valid email address.');
+      if (!phoneOk(phone)) fail(400, 'Enter a valid 10-digit mobile number.');
+      if (typeof payload.password !== 'string' || payload.password.length < 8) fail(400, 'Staff password must be at least 8 characters.');
+      if (!STAFF_ROLE_PERMS[role] || role === 'owner') fail(400, 'Choose a staff role. Owner rights cannot be granted here.');
+      if (db.prepare('SELECT id FROM nb_users WHERE email=?').get(email)) fail(409, 'An account with this email already exists.');
+      const perms = Array.isArray(payload.permissions) ? payload.permissions.filter((p) => STAFF_ROLE_PERMS.owner.includes(p)) : STAFF_ROLE_PERMS[role];
+      const userId = uid();
+      transaction(() => {
+        db.prepare(`INSERT INTO nb_users(id,role,name,email,phone,password_hash,email_verified,phone_verified,avatar,status,is_demo,created_at) VALUES(?,?,?,?,?,?,1,1,'🧑‍💼','active',0,?)`)
+          .run(userId, 'seller', name, email, phone, makePassword(payload.password), now());
+        db.prepare('INSERT INTO nb_shop_staff(id,shop_id,user_id,role,permissions_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)')
+          .run(uid(), shop.id, userId, role, JSON.stringify(perms), 'active', now(), now());
+      });
+      audit('seller', s.user_id, 'staff_created', 'staff', userId, `${name} · ${role}`);
+      send(res, 201, { message: `${name} added as ${role.replace(/_/g, ' ')}. They never receive owner admin rights automatically.` });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/staff\/[A-Za-z0-9-]+$/) && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_staff', 'Editing staff');
+      const row = db.prepare('SELECT * FROM nb_shop_staff WHERE id=? AND shop_id=?').get(decodeURIComponent(route.split('/')[3]), shop.id);
+      if (!row) fail(404, 'Staff member not found.');
+      const role = payload.role !== undefined ? String(payload.role) : row.role;
+      if (!STAFF_ROLE_PERMS[role] || role === 'owner') fail(400, 'Choose a staff role.');
+      if (payload.permissions !== undefined && !Array.isArray(payload.permissions)) fail(400, 'Permissions must be a list.');
+      const perms = Array.isArray(payload.permissions) ? payload.permissions.filter((p) => STAFF_ROLE_PERMS.owner.includes(p)) : null;
+      const status = payload.status !== undefined ? (payload.status === 'suspended' ? 'suspended' : 'active') : row.status;
+      transaction(() => {
+        db.prepare('UPDATE nb_shop_staff SET role=?,permissions_json=?,status=?,updated_at=? WHERE id=?').run(role, perms ? JSON.stringify(perms) : row.permissions_json, status, now(), row.id);
+        db.prepare('UPDATE nb_users SET status=? WHERE id=?').run(status === 'suspended' ? 'suspended' : 'active', row.user_id);
+        if (status === 'suspended') db.prepare('DELETE FROM nb_sessions WHERE user_id=?').run(row.user_id);
+      });
+      audit('seller', s.user_id, 'staff_updated', 'staff', row.id, `${role} · ${status}`);
+      send(res, 200, { message: 'Staff updated.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/staff\/[A-Za-z0-9-]+$/) && method === 'DELETE') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_staff', 'Removing staff');
+      const row = db.prepare('SELECT st.*, u.name, u.email FROM nb_shop_staff st JOIN nb_users u ON u.id=st.user_id WHERE st.id=? AND st.shop_id=?').get(decodeURIComponent(route.split('/')[3]), shop.id);
+      if (!row) fail(404, 'Staff member not found.');
+      if (row.user_id === s.user_id) fail(400, 'You cannot remove your own owner account here.');
+      transaction(() => {
+        // The user row stays so past orders, stock movements and audit entries keep their name.
+        db.prepare('DELETE FROM nb_shop_staff WHERE id=?').run(row.id);
+        db.prepare('DELETE FROM nb_sessions WHERE user_id=?').run(row.user_id);
+        db.prepare("UPDATE nb_users SET status='inactive' WHERE id=?").run(row.user_id);
+      });
+      audit('seller', s.user_id, 'staff_removed', 'staff', row.user_id, `${row.name} · ${row.email}`);
+      send(res, 200, { message: `${row.name} no longer has access to your Seller Hub. Their history on past orders is preserved.` });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/staff/activity' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_staff', 'Viewing staff activity');
+      const ids = [shop.owner_user_id, ...db.prepare('SELECT user_id FROM nb_shop_staff WHERE shop_id=?').all(shop.id).map((r) => r.user_id)].filter(Boolean);
+      const rows = ids.length ? db.prepare(`SELECT * FROM nb_audit_logs WHERE actor_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at DESC LIMIT 100`).all(...ids) : [];
+      send(res, 200, { activity: rows.map((r) => ({ action: r.action, entity: r.entity, detail: r.detail, at: r.created_at })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/notifications' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      sellerShopContext(s, { allowPending: true });
+      const rows = db.prepare('SELECT * FROM nb_notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100').all(s.user_id);
+      send(res, 200, { unread: rows.filter((r) => !r.is_read).length, notifications: rows.map((r) => ({ id: r.id, title: r.title, body: r.body, type: r.type, link: r.link, read: Boolean(r.is_read), at: r.created_at })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/notifications/read' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      if (payload.all === true) db.prepare('UPDATE nb_notifications SET is_read=1 WHERE user_id=?').run(s.user_id);
+      else if (payload.id) db.prepare('UPDATE nb_notifications SET is_read=1 WHERE id=? AND user_id=?').run(payload.id, s.user_id);
+      else fail(400, 'Send a notification id or all: true.');
+      send(res, 200, { message: 'Marked as read.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/notifications/preferences' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      let prefs = db.prepare('SELECT * FROM nb_seller_notification_prefs WHERE user_id=?').get(s.user_id);
+      if (!prefs) { db.prepare('INSERT INTO nb_seller_notification_prefs(user_id,updated_at) VALUES(?,?)').run(s.user_id, now()); prefs = db.prepare('SELECT * FROM nb_seller_notification_prefs WHERE user_id=?').get(s.user_id); }
+      send(res, 200, { preferences: { inApp: Boolean(prefs.in_app), email: Boolean(prefs.email), sms: Boolean(prefs.sms), whatsapp: Boolean(prefs.whatsapp), orderAlerts: Boolean(prefs.order_alerts), stockAlerts: Boolean(prefs.stock_alerts), paymentAlerts: Boolean(prefs.payment_alerts), runnerAlerts: Boolean(prefs.runner_alerts), marketing: Boolean(prefs.marketing) }, providers: { email: false, sms: false, whatsapp: false, note: 'In-app notifications are live database records. Email, SMS and WhatsApp providers are not configured on this deployment, so those channels are stored as preferences only.' } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/notifications/preferences' && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const b = (v, d) => v === undefined ? d : (v ? 1 : 0);
+      const cur = db.prepare('SELECT * FROM nb_seller_notification_prefs WHERE user_id=?').get(s.user_id);
+      if (!cur) db.prepare('INSERT INTO nb_seller_notification_prefs(user_id,updated_at) VALUES(?,?)').run(s.user_id, now());
+      db.prepare('UPDATE nb_seller_notification_prefs SET in_app=?,email=?,sms=?,whatsapp=?,order_alerts=?,stock_alerts=?,payment_alerts=?,runner_alerts=?,marketing=?,updated_at=? WHERE user_id=?')
+        .run(b(payload.inApp, 1), b(payload.email, 0), b(payload.sms, 0), b(payload.whatsapp, 0), b(payload.orderAlerts, 1), b(payload.stockAlerts, 1), b(payload.paymentAlerts, 1), b(payload.runnerAlerts, 1), b(payload.marketing, 0), now(), s.user_id);
+      send(res, 200, { message: 'Notification preferences saved.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/customers' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'view_customers', 'Viewing customers');
+      const rows = db.prepare(`SELECT u.id, u.name, u.phone, COUNT(DISTINCT so.id) AS orders, COALESCE(SUM(so.total_paise),0) AS spent, MAX(so.created_at) AS last_order
+        FROM nb_seller_orders so JOIN nb_orders o ON o.id=so.order_id JOIN nb_users u ON u.id=o.customer_id
+        WHERE so.shop_id=? GROUP BY u.id ORDER BY spent DESC LIMIT 100`).all(shop.id);
+      send(res, 200, { customers: rows.map((r) => ({ id: r.id, name: r.name, phoneMasked: maskedPhone(r.phone), orders: Number(r.orders), spent: Number(r.spent), lastOrder: r.last_order })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/reviews' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const rows = db.prepare(`SELECT r.*, u.name AS customer_name, p.name AS product_name FROM nb_reviews r JOIN nb_users u ON u.id=r.customer_id LEFT JOIN nb_products p ON p.id=r.product_id WHERE r.shop_id=? ORDER BY r.created_at DESC LIMIT 100`).all(shop.id);
+      send(res, 200, { reviews: rows.map((r) => ({ id: r.id, customer: r.customer_name, product: r.product_name, shopRating: r.shop_rating, productRating: r.product_rating, title: r.title, body: r.body, verified: Boolean(r.verified_purchase), status: r.status, sellerReply: r.seller_reply, sellerReplyAt: r.seller_reply_at, reported: Boolean(r.reported_at), at: r.created_at })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/reviews\/[A-Za-z0-9-]+\/(reply|report)$/) && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const parts = route.split('/');
+      const review = db.prepare('SELECT * FROM nb_reviews WHERE id=? AND shop_id=?').get(decodeURIComponent(parts[3]), shop.id);
+      if (!review) fail(404, 'Review not found for your shop.');
+      if (parts[4] === 'reply') {
+        if (!str(payload.reply, 2, 1000)) fail(400, 'Write a reply of at least 2 characters.');
+        db.prepare('UPDATE nb_reviews SET seller_reply=?,seller_reply_at=? WHERE id=?').run(payload.reply.trim(), now(), review.id);
+        audit('seller', s.user_id, 'review_replied', 'review', review.id, payload.reply.trim().slice(0, 200));
+        send(res, 200, { message: 'Reply published on the review.' });
+      } else {
+        const reason = String(payload.reason || '').trim().slice(0, 300);
+        db.prepare('UPDATE nb_reviews SET reported_at=?,reported_reason=? WHERE id=?').run(now(), reason || null, review.id);
+        audit('seller', s.user_id, 'review_reported', 'review', review.id, reason);
+        send(res, 200, { message: 'Review sent to moderation. It stays visible until a moderator decides.' });
+      }
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/reports' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      sellerShopContext(s);
+      send(res, 200, { reports: [
+        { id: 'sales', label: 'Daily / monthly sales', file: 'sales.csv' },
+        { id: 'orders', label: 'Order report', file: 'orders.csv' },
+        { id: 'products', label: 'Product performance', file: 'products.csv' },
+        { id: 'stock', label: 'Stock report', file: 'stock.csv' },
+        { id: 'low_stock', label: 'Low-stock report', file: 'low-stock.csv' },
+        { id: 'movements', label: 'Inventory movement report', file: 'movements.csv' },
+        { id: 'payments', label: 'Payment report', file: 'payments.csv' },
+        { id: 'refunds', label: 'Refund report', file: 'refunds.csv' },
+        { id: 'settlements', label: 'Settlement statement', file: 'settlements.csv' },
+        { id: 'promotions', label: 'Promotion performance', file: 'promotions.csv' }
+      ] });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/reports\/[a-z_]+\.csv$/) && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const type = route.split('/')[3].replace('.csv', '');
+      if (type === 'sales') {
+        const rows = db.prepare(`SELECT date(created_at) AS day, COUNT(*) AS orders, COALESCE(SUM(total_paise),0) AS gross FROM nb_seller_orders WHERE shop_id=? AND status NOT IN ('cancelled','rejected') GROUP BY day ORDER BY day`).all(shop.id);
+        sendCsv(res, 'sales.csv', [['Date', 'Orders', 'Gross (₹)'], ...rows.map((r) => [r.day, r.orders, (r.gross / 100).toFixed(2)])]);
+      } else if (type === 'orders') {
+        const rows = db.prepare('SELECT so.code, o.code AS parent, so.status, so.fulfillment, so.total_paise, so.created_at FROM nb_seller_orders so JOIN nb_orders o ON o.id=so.order_id WHERE so.shop_id=? ORDER BY so.created_at DESC LIMIT 500').all(shop.id);
+        sendCsv(res, 'orders.csv', [['Seller order', 'Parent order', 'Status', 'Fulfilment', 'Total (₹)', 'Created'], ...rows.map((r) => [r.code, r.parent, r.status, r.fulfillment, (r.total_paise / 100).toFixed(2), r.created_at])]);
+      } else if (type === 'products') {
+        const rows = db.prepare(`SELECT oi.name, SUM(oi.qty) AS qty, SUM(oi.line_total_paise) AS revenue FROM nb_order_items oi JOIN nb_seller_orders so ON so.id=oi.seller_order_id WHERE so.shop_id=? AND so.status NOT IN ('cancelled','rejected') GROUP BY oi.name ORDER BY revenue DESC`).all(shop.id);
+        sendCsv(res, 'products.csv', [['Product', 'Qty sold', 'Revenue (₹)'], ...rows.map((r) => [r.name, r.qty, (r.revenue / 100).toFixed(2)])]);
+      } else if (type === 'stock') {
+        const rows = db.prepare('SELECT name, sku, barcode, stock, reserved, low_stock FROM nb_products WHERE shop_id=? ORDER BY name').all(shop.id);
+        sendCsv(res, 'stock.csv', [['Product', 'SKU', 'Barcode', 'Stock', 'Reserved', 'Available', 'Low at'], ...rows.map((r) => [r.name, r.sku || '', r.barcode || '', r.stock, r.reserved, Math.max(0, r.stock - r.reserved), r.low_stock])]);
+      } else if (type === 'low_stock') {
+        const rows = db.prepare('SELECT name, sku, stock, reserved, low_stock FROM nb_products WHERE shop_id=? AND stock-reserved<=low_stock ORDER BY name').all(shop.id);
+        sendCsv(res, 'low-stock.csv', [['Product', 'SKU', 'Available', 'Low at'], ...rows.map((r) => [r.name, r.sku || '', Math.max(0, r.stock - r.reserved), r.low_stock])]);
+      } else if (type === 'movements') {
+        const rows = db.prepare('SELECT product_id, type, previous_qty, new_qty, delta, reason, actor_name, created_at FROM nb_inventory_transactions WHERE shop_id=? ORDER BY created_at DESC LIMIT 500').all(shop.id);
+        sendCsv(res, 'movements.csv', [['Product', 'Type', 'Previous', 'New', 'Delta', 'Reason', 'By', 'At'], ...rows.map((r) => [r.product_id, r.type, r.previous_qty, r.new_qty, r.delta, r.reason || '', r.actor_name || '', r.created_at])]);
+      } else if (type === 'payments') {
+        const rows = db.prepare(`SELECT pr.id, o.code, pr.method, pr.amount_paise, pr.status, pr.created_at FROM nb_payment_records pr JOIN nb_orders o ON o.id=pr.order_id JOIN nb_seller_orders so ON so.order_id=o.id AND so.shop_id=? ORDER BY pr.created_at DESC LIMIT 500`).all(shop.id);
+        sendCsv(res, 'payments.csv', [['Transaction', 'Order', 'Method', 'Amount (₹)', 'Status', 'At'], ...rows.map((r) => [r.id, r.code, r.method, (r.amount_paise / 100).toFixed(2), r.status, r.created_at])]);
+      } else if (type === 'refunds') {
+        const rows = db.prepare(`SELECT r.id, o.code, r.amount_paise, r.status, r.created_at FROM nb_refunds r JOIN nb_orders o ON o.id=r.order_id JOIN nb_seller_orders so ON so.order_id=o.id AND so.shop_id=? ORDER BY r.created_at DESC LIMIT 500`).all(shop.id);
+        sendCsv(res, 'refunds.csv', [['Refund', 'Order', 'Amount (₹)', 'Status', 'At'], ...rows.map((r) => [r.id, r.code, (r.amount_paise / 100).toFixed(2), r.status, r.created_at])]);
+      } else if (type === 'settlements') {
+        const rows = db.prepare('SELECT code, period_start, period_end, gross_paise, refunds_paise, commission_paise, net_paise, status FROM nb_settlements WHERE shop_id=? ORDER BY created_at DESC').all(shop.id);
+        sendCsv(res, 'settlements.csv', [['Settlement', 'Period', 'Gross (₹)', 'Refunds (₹)', 'Commission (₹)', 'Net (₹)', 'Status'], ...rows.map((r) => [r.code, `${r.period_start} to ${r.period_end}`, (r.gross_paise / 100).toFixed(2), (r.refunds_paise / 100).toFixed(2), (r.commission_paise / 100).toFixed(2), (r.net_paise / 100).toFixed(2), r.status])]);
+      } else if (type === 'promotions') {
+        const rows = db.prepare('SELECT code, title, used_count, usage_limit, active FROM nb_coupons WHERE shop_id=? ORDER BY code').all(shop.id);
+        sendCsv(res, 'promotions.csv', [['Code', 'Title', 'Used', 'Limit', 'Active'], ...rows.map((r) => [r.code, r.title, r.used_count, r.usage_limit || '', r.active ? 'yes' : 'no'])]);
+      } else fail(404, 'Unknown report.');
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/support/faqs' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      sellerShopContext(s, { allowPending: true });
+      const rows = db.prepare('SELECT * FROM nb_faqs ORDER BY category, sort').all();
+      send(res, 200, { faqs: rows.map((f) => ({ category: f.category, question: f.question, answer: f.answer })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/support/tickets' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      const rows = db.prepare('SELECT * FROM nb_seller_tickets WHERE user_id=? ORDER BY created_at DESC').all(s.user_id);
+      send(res, 200, { tickets: rows.map((t) => ({ code: t.code, category: t.category, subject: t.subject, status: t.status, orderCode: t.order_code, assignedAgent: t.assigned_agent, createdAt: t.created_at, updatedAt: t.updated_at })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/support/tickets' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      const category = String(payload.category || 'general').slice(0, 60);
+      const subject = String(payload.subject || '').trim();
+      const description = String(payload.description || '').trim();
+      if (!str(subject, 3, 120)) fail(400, 'Give the ticket a short subject.');
+      if (!str(description, 10, 2000)) fail(400, 'Describe the issue in at least 10 characters.');
+      const orderCode = payload.orderCode ? String(payload.orderCode).slice(0, 20) : null;
+      if (orderCode && !db.prepare('SELECT id FROM nb_seller_orders WHERE code=? AND shop_id=?').get(orderCode, shop.id)) fail(400, 'That order does not belong to your shop.');
+      const id = uid();
+      const code = `SUP-${String(Math.floor(100000 + Math.random() * 900000))}`;
+      transaction(() => {
+        db.prepare('INSERT INTO nb_seller_tickets(id,code,user_id,shop_id,order_code,category,subject,description,attachment,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(id, code, s.user_id, shop.id, orderCode, category, subject, description, payload.attachment ? String(payload.attachment).slice(0, 300) : null, 'open', now(), now());
+        db.prepare('INSERT INTO nb_seller_ticket_messages(id,ticket_id,author_role,author_name,body,created_at) VALUES(?,?,?,?,?,?)')
+          .run(uid(), id, 'seller', s.name, description, now());
+      });
+      audit('seller', s.user_id, 'support_ticket_created', 'ticket', id, `${code} · ${category}`);
+      send(res, 201, { ticket: { code, status: 'open' }, message: `Ticket ${code} created. Support will reply in this thread.` });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/support\/tickets\/[A-Za-z0-9-]+$/) && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const ticket = db.prepare('SELECT * FROM nb_seller_tickets WHERE code=? AND user_id=?').get(decodeURIComponent(route.split('/')[4]), s.user_id);
+      if (!ticket) fail(404, 'Ticket not found.');
+      const messages = db.prepare('SELECT * FROM nb_seller_ticket_messages WHERE ticket_id=? ORDER BY created_at').all(ticket.id);
+      send(res, 200, { ticket: { code: ticket.code, category: ticket.category, subject: ticket.subject, description: ticket.description, status: ticket.status, orderCode: ticket.order_code, assignedAgent: ticket.assigned_agent, attachment: ticket.attachment, createdAt: ticket.created_at, updatedAt: ticket.updated_at, messages: messages.map((m) => ({ authorRole: m.author_role, authorName: m.author_name, body: m.body, at: m.created_at })) } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/support\/tickets\/[A-Za-z0-9-]+\/(reply|close)$/) && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const parts = route.split('/');
+      const ticket = db.prepare('SELECT * FROM nb_seller_tickets WHERE code=? AND user_id=?').get(decodeURIComponent(parts[4]), s.user_id);
+      if (!ticket) fail(404, 'Ticket not found.');
+      if (parts[5] === 'close') {
+        db.prepare("UPDATE nb_seller_tickets SET status='closed',updated_at=? WHERE id=?").run(now(), ticket.id);
+        send(res, 200, { message: 'Ticket closed.' });
+        return true;
+      }
+      if (ticket.status === 'closed') fail(409, 'This ticket is closed. Create a new ticket if you still need help.');
+      if (!str(payload.body, 2, 2000)) fail(400, 'Write a message of at least 2 characters.');
+      transaction(() => {
+        db.prepare('INSERT INTO nb_seller_ticket_messages(id,ticket_id,author_role,author_name,body,created_at) VALUES(?,?,?,?,?,?)').run(uid(), ticket.id, 'seller', s.name, payload.body.trim(), now());
+        db.prepare("UPDATE nb_seller_tickets SET status=?,updated_at=? WHERE id=?").run(ticket.status === 'awaiting_seller' ? 'in_progress' : ticket.status, now(), ticket.id);
+      });
+      send(res, 200, { message: 'Reply added.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/settings' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s, { allowPending: true });
+      const user = db.prepare('SELECT * FROM nb_users WHERE id=?').get(s.user_id);
+      const sessions = db.prepare('SELECT token_hash, created_at, expires_at, user_agent, ip FROM nb_sessions WHERE user_id=? ORDER BY created_at DESC LIMIT 10').all(s.user_id);
+      const logins = db.prepare("SELECT * FROM nb_audit_logs WHERE actor_id=? AND action='partner_login' ORDER BY created_at DESC LIMIT 10").all(s.user_id);
+      const financial = db.prepare('SELECT * FROM nb_shop_financial_settings WHERE shop_id=?').get(shop.id);
+      send(res, 200, {
+        account: { name: user.name, email: user.email, phone: user.phone, twoFactor: Boolean(user.two_factor_enabled), status: user.status },
+        business: { name: shop.name, category: shop.category_slug, address: shop.address, city: shop.city, pincode: shop.pincode, phone: shop.phone, businessEmail: shop.business_email },
+        financial: financial ? { commissionRate: financial.commission_rate, bankName: financial.bank_name, bankLast4: financial.bank_account_last4, bankIfsc: financial.bank_ifsc, bankStatus: financial.bank_status, settlementPreference: financial.settlement_preference } : { commissionRate: Number(shop.commission_rate || 0), bankName: shop.bank_name, bankLast4: shop.bank_account_last4, bankIfsc: shop.bank_ifsc, bankStatus: shop.bank_status || 'not_submitted', settlementPreference: 'weekly' },
+        sessions: sessions.map((x) => ({ tokenHash: x.token_hash.slice(0, 12) + '…', createdAt: x.created_at, expiresAt: x.expires_at, userAgent: x.user_agent, ip: x.ip })),
+        loginHistory: logins.map((l) => ({ at: l.created_at, detail: l.detail }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/settings/account' && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const user = db.prepare('SELECT * FROM nb_users WHERE id=?').get(s.user_id);
+      if (payload.password) {
+        if (!checkPassword(payload.currentPassword || '', user.password_hash)) fail(401, 'Current password is incorrect.');
+        if (String(payload.password).length < 8) fail(400, 'New password must be at least 8 characters.');
+        db.prepare('UPDATE nb_users SET password_hash=? WHERE id=?').run(makePassword(payload.password), s.user_id);
+        db.prepare('DELETE FROM nb_sessions WHERE user_id=? AND token_hash<>?').run(s.user_id, sha(s.token));
+      }
+      const name = payload.name !== undefined ? String(payload.name).trim() : user.name;
+      if (!str(name, 2, 80)) fail(400, 'Name must be 2–80 characters.');
+      const email = payload.email !== undefined ? String(payload.email).trim().toLowerCase() : user.email;
+      if (!emailOk(email)) fail(400, 'Enter a valid email address.');
+      if (email !== user.email && db.prepare('SELECT id FROM nb_users WHERE email=?').get(email)) fail(409, 'Another account already uses this email.');
+      const phone = payload.phone !== undefined ? normalPhone(payload.phone) : user.phone;
+      if (!phoneOk(phone)) fail(400, 'Enter a valid 10-digit mobile number.');
+      db.prepare('UPDATE nb_users SET name=?,email=?,phone=? WHERE id=?').run(name, email, phone, s.user_id);
+      audit('seller', s.user_id, 'account_updated', 'user', s.user_id, name);
+      send(res, 200, { message: payload.password ? 'Password changed. Other sessions were signed out.' : 'Account saved.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/settings/2fa' && method === 'POST') {
+      const s = requirePartner(['seller']);
+      const enabled = payload.enabled ? 1 : 0;
+      db.prepare('UPDATE nb_users SET two_factor_enabled=? WHERE id=?').run(enabled, s.user_id);
+      send(res, 200, { message: enabled ? 'Two-factor authentication enabled. A verification code will be required at sign-in once an OTP provider is configured.' : 'Two-factor authentication disabled.', enabled: Boolean(enabled) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/seller\/settings\/sessions\/[A-Za-z0-9]+$/) && method === 'DELETE') {
+      const s = requirePartner(['seller']);
+      const prefix = decodeURIComponent(route.split('/')[4]);
+      const rows = db.prepare('SELECT token_hash FROM nb_sessions WHERE user_id=?').all(s.user_id);
+      const match = rows.find((r) => r.token_hash.startsWith(prefix.replace('…', '')));
+      if (!match) fail(404, 'Session not found.');
+      db.prepare('DELETE FROM nb_sessions WHERE token_hash=?').run(match.token_hash);
+      send(res, 200, { message: 'Session revoked.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/settings/financial' && method === 'PATCH') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      requireSellerPerm(s, shop, 'manage_settlements', 'Editing financial settings');
+      const bankName = payload.bankName !== undefined ? String(payload.bankName).slice(0, 80) : shop.bank_name;
+      const bankLast4 = payload.bankAccount !== undefined ? String(payload.bankAccount).replace(/\D/g, '').slice(-4) : shop.bank_account_last4;
+      const bankIfsc = payload.bankIfsc !== undefined ? String(payload.bankIfsc).trim().toUpperCase().slice(0, 20) : shop.bank_ifsc;
+      const bankChanged = bankName !== shop.bank_name || bankLast4 !== shop.bank_account_last4 || bankIfsc !== shop.bank_ifsc;
+      const status = bankChanged ? 'verification_pending' : (shop.bank_status || 'not_submitted');
+      transaction(() => {
+        db.prepare('UPDATE nb_shops SET bank_name=?,bank_account_last4=?,bank_ifsc=?,bank_status=? WHERE id=?').run(bankName, bankLast4, bankIfsc, status, shop.id);
+        db.prepare(`INSERT INTO nb_shop_financial_settings(shop_id,commission_rate,bank_name,bank_account_last4,bank_ifsc,bank_status,settlement_preference,updated_at)
+          VALUES(?,?,?,?,?,?,?,?)
+          ON CONFLICT(shop_id) DO UPDATE SET bank_name=excluded.bank_name,bank_account_last4=excluded.bank_account_last4,bank_ifsc=excluded.bank_ifsc,bank_status=excluded.bank_status,settlement_preference=excluded.settlement_preference,updated_at=excluded.updated_at`)
+          .run(shop.id, Number(shop.commission_rate || 0), bankName, bankLast4, bankIfsc, status, String(payload.settlementPreference || 'weekly').slice(0, 20), now());
+      });
+      audit('seller', s.user_id, 'bank_updated', 'shop', shop.id, bankChanged ? 'Bank change submitted for verification' : 'Financial settings saved');
+      send(res, 200, { message: bankChanged ? 'Bank details submitted. Payouts stay on hold until admin verifies the change.' : 'Financial settings saved.', bankStatus: status });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/seller/categories' && method === 'GET') {
+      const s = requirePartner(['seller']);
+      const shop = sellerShopContext(s);
+      const rows = db.prepare(`SELECT c.*, (SELECT COUNT(*) FROM nb_products p WHERE p.category_slug=c.slug AND p.shop_id=? AND COALESCE(p.archived,0)=0) AS products FROM nb_categories c WHERE c.active=1 ORDER BY c.sort, c.name`).all(shop.id);
+      send(res, 200, { categories: rows.map((c) => ({ slug: c.slug, name: c.name, icon: c.icon, parentSlug: c.parent_slug, products: Number(c.products || 0) })) });
+      return true;
+    }
+
+
     /* Admin: catalogue, service areas, shops, deliveries, broadcast        */
     /* ================================================================== */
 
@@ -3141,6 +4706,143 @@ async function handle(req, res) {
       });
       return true;
     }
+
+    /* ================================================================== */
+    /* Admin: seller applications, settlements, seller tickets, bank        */
+    /* ================================================================== */
+
+    if (base === '/api/admin' && route === '/seller-applications' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT v.*, u.name AS owner_name, u.email AS owner_email, u.phone AS owner_phone, u.status AS user_status, s.name AS shop_name, s.slug AS shop_slug
+        FROM nb_seller_verifications v JOIN nb_users u ON u.id=v.user_id LEFT JOIN nb_shops s ON s.id=v.shop_id
+        ORDER BY v.created_at DESC LIMIT 100`).all();
+      send(res, 200, { applications: rows.map((v) => {
+        const docs = db.prepare('SELECT * FROM nb_seller_documents WHERE verification_id=? ORDER BY created_at').all(v.id);
+        return { id: v.id, userId: v.user_id, shopId: v.shop_id, status: v.status, legalName: v.legal_name, businessCategory: v.business_category, shopType: v.shop_type, address: v.address, pincode: v.pincode, city: v.city, state: v.state, country: v.country, contactNumber: v.contact_number, businessEmail: v.business_email, ownershipType: v.ownership_type, pan: v.pan_number, gst: v.gst_number, reason: v.reason, submittedAt: v.submitted_at, reviewedAt: v.reviewed_at, owner: { name: v.owner_name, email: v.owner_email, phone: v.owner_phone, status: v.user_status }, shop: v.shop_name ? { name: v.shop_name, slug: v.shop_slug } : null, documents: docs.map((d) => ({ type: d.doc_type, fileName: d.file_name, fileType: d.file_type, fileSize: d.file_size })) };
+      }) });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/seller-applications\/[A-Za-z0-9-]+$/) && method === 'PATCH') {
+      const admin = requireAdmin();
+      const id = decodeURIComponent(route.split('/')[2]);
+      const verification = db.prepare('SELECT * FROM nb_seller_verifications WHERE id=?').get(id);
+      if (!verification) fail(404, 'Application not found.');
+      const status = String(payload.status || '');
+      if (!['under_review', 'approved', 'rejected', 'additional_info_required', 'suspended'].includes(status)) fail(400, 'Choose under_review, approved, rejected, additional_info_required or suspended.');
+      const reason = String(payload.reason || '').trim().slice(0, 500);
+      if ((status === 'rejected' || status === 'additional_info_required') && !reason) fail(400, 'Give the seller a reason for this decision.');
+      transaction(() => {
+        db.prepare('UPDATE nb_seller_verifications SET status=?,reason=?,reviewed_at=?,reviewer_id=?,updated_at=? WHERE id=?').run(status, reason || null, now(), admin.user_id, now(), id);
+        if (status === 'approved') {
+          db.prepare('UPDATE nb_users SET status=\'active\' WHERE id=?').run(verification.user_id);
+          if (verification.shop_id) {
+            const shop = db.prepare('SELECT * FROM nb_shops WHERE id=?').get(verification.shop_id);
+            const slugPart = String(shop.slug || 'shop').toUpperCase().replace(/[^A-Z0-9]+/g, '-').slice(0, 12);
+            db.prepare('UPDATE nb_shops SET verified=1,is_open=1,seller_code=?,shop_code=? WHERE id=?').run(`NB-SELLER-${slugPart}`, `NB-SHOP-${slugPart}`, shop.id);
+            // Seed the storefront profile + serviceability from the verified application so customers can order immediately.
+            const hasPins = String(shop.service_pincodes || '').split(',').some((p) => /^\d{6}$/.test(p.trim()));
+            const updates = [];
+            const args = [];
+            if (verification.address && !String(shop.address || '').trim()) { updates.push('address=?'); args.push(verification.address); }
+            if (verification.city && !String(shop.city || '').trim()) { updates.push('city=?'); args.push(verification.city); }
+            if (verification.pincode && !pincodeOk(String(shop.pincode || ''))) { updates.push('pincode=?'); args.push(verification.pincode); }
+            if (Number.isFinite(Number(verification.lat)) && Number(verification.lat) !== 0) { updates.push('lat=?'); args.push(Number(verification.lat)); }
+            if (Number.isFinite(Number(verification.lng)) && Number(verification.lng) !== 0) { updates.push('lng=?'); args.push(Number(verification.lng)); }
+            if (!hasPins && pincodeOk(String(verification.pincode || ''))) { updates.push('service_pincodes=?'); args.push(String(verification.pincode)); }
+            if (updates.length) { args.push(shop.id); db.prepare(`UPDATE nb_shops SET ${updates.join(',')} WHERE id=?`).run(...args); }
+          }
+        } else if (status === 'suspended') {
+          db.prepare('UPDATE nb_users SET status=\'suspended\' WHERE id=?').run(verification.user_id);
+          db.prepare('DELETE FROM nb_sessions WHERE user_id=?').run(verification.user_id);
+          if (verification.shop_id) db.prepare('UPDATE nb_shops SET verified=0,is_open=0 WHERE id=?').run(verification.shop_id);
+        } else if (status === 'rejected') {
+          db.prepare('UPDATE nb_users SET status=\'pending_verification\' WHERE id=?').run(verification.user_id);
+        }
+        notify(verification.user_id, 'Seller verification update', `Your NearBuy seller application is now ${status.replace(/_/g, ' ')}.${reason ? ` ${reason}` : ''}`, 'seller', '#/verification');
+      });
+      audit('admin', admin.user_id, 'seller_application_reviewed', 'verification', id, `${status}${reason ? ' · ' + reason : ''}`);
+      send(res, 200, { message: `Application ${status.replace(/_/g, ' ')}. The seller sees this decision in the Seller Hub.` });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/settlements' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare('SELECT st.*, s.name AS shop_name FROM nb_settlements st JOIN nb_shops s ON s.id=st.shop_id ORDER BY st.created_at DESC LIMIT 100').all();
+      send(res, 200, { settlements: rows.map((r) => ({ id: r.id, code: r.code, shop: r.shop_name, periodStart: r.period_start, periodEnd: r.period_end, gross: r.gross_paise, refunds: r.refunds_paise, commission: r.commission_paise, net: r.net_paise, status: r.status, bankReference: r.bank_reference, payoutDate: r.payout_date })) });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/settlements\/[A-Za-z0-9-]+\/status$/) && method === 'POST') {
+      const admin = requireAdmin();
+      const code = decodeURIComponent(route.split('/')[2]);
+      const row = db.prepare('SELECT * FROM nb_settlements WHERE code=?').get(code);
+      if (!row) fail(404, 'Settlement not found.');
+      const status = String(payload.status || '');
+      if (!['pending', 'processing', 'completed', 'failed', 'on_hold', 'reconciliation_required'].includes(status)) fail(400, 'Choose a valid settlement status.');
+      const bankReference = payload.bankReference !== undefined ? String(payload.bankReference).slice(0, 120) : row.bank_reference;
+      if (status === 'completed' && !bankReference) fail(400, 'A confirmed payout needs a bank reference.');
+      db.prepare('UPDATE nb_settlements SET status=?,bank_reference=?,payout_date=?,updated_at=? WHERE id=?').run(status, bankReference, status === 'completed' ? now() : row.payout_date, now(), row.id);
+      const shop = db.prepare('SELECT owner_user_id, name FROM nb_shops WHERE id=?').get(row.shop_id);
+      if (shop?.owner_user_id) notify(shop.owner_user_id, 'Settlement update', `${row.code} is now ${status.replace(/_/g, ' ')}.${bankReference ? ` Reference ${bankReference}.` : ''}`, 'settlement', '#/settlements');
+      audit('admin', admin.user_id, 'settlement_status', 'settlement', row.id, `${row.code} → ${status}`);
+      send(res, 200, { message: `Settlement ${row.code} is now ${status.replace(/_/g, ' ')}.` });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/seller-tickets' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT t.*, s.name AS shop_name, u.name AS seller_name FROM nb_seller_tickets t JOIN nb_shops s ON s.id=t.shop_id JOIN nb_users u ON u.id=t.user_id ORDER BY t.created_at DESC LIMIT 100`).all();
+      send(res, 200, { tickets: rows.map((t) => ({ code: t.code, shop: t.shop_name, seller: t.seller_name, category: t.category, subject: t.subject, status: t.status, orderCode: t.order_code, assignedAgent: t.assigned_agent, createdAt: t.created_at, updatedAt: t.updated_at })) });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/seller-tickets\/[A-Za-z0-9-]+$/) && method === 'GET') {
+      requireAdmin();
+      const ticket = db.prepare('SELECT * FROM nb_seller_tickets WHERE code=?').get(decodeURIComponent(route.split('/')[2]));
+      if (!ticket) fail(404, 'Ticket not found.');
+      const messages = db.prepare('SELECT * FROM nb_seller_ticket_messages WHERE ticket_id=? ORDER BY created_at').all(ticket.id);
+      send(res, 200, { ticket: { code: ticket.code, category: ticket.category, subject: ticket.subject, description: ticket.description, status: ticket.status, orderCode: ticket.order_code, assignedAgent: ticket.assigned_agent, attachment: ticket.attachment, createdAt: ticket.created_at, messages: messages.map((m) => ({ authorRole: m.author_role, authorName: m.author_name, body: m.body, at: m.created_at })) } });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/seller-tickets\/[A-Za-z0-9-]+\/(reply|status)$/) && method === 'POST') {
+      const admin = requireAdmin();
+      const parts = route.split('/');
+      const ticket = db.prepare('SELECT * FROM nb_seller_tickets WHERE code=?').get(decodeURIComponent(parts[2]));
+      if (!ticket) fail(404, 'Ticket not found.');
+      if (parts[3] === 'reply') {
+        if (!str(payload.body, 2, 2000)) fail(400, 'Write a reply of at least 2 characters.');
+        transaction(() => {
+          db.prepare('INSERT INTO nb_seller_ticket_messages(id,ticket_id,author_role,author_name,body,created_at) VALUES(?,?,?,?,?,?)').run(uid(), ticket.id, 'support', admin.name, payload.body.trim(), now());
+          db.prepare("UPDATE nb_seller_tickets SET status='awaiting_seller',updated_at=? WHERE id=?").run(now(), ticket.id);
+        });
+        notify(ticket.user_id, 'Support replied', `${ticket.code}: ${payload.body.trim().slice(0, 120)}`, 'support', `#/support/tickets/${ticket.code}`);
+        send(res, 200, { message: 'Reply sent to the seller.' });
+        return true;
+      }
+      const status = String(payload.status || '');
+      if (!['open', 'assigned', 'in_progress', 'awaiting_seller', 'resolved', 'closed'].includes(status)) fail(400, 'Choose a valid ticket status.');
+      db.prepare('UPDATE nb_seller_tickets SET status=?,assigned_agent=?,updated_at=? WHERE id=?').run(status, payload.agent ? String(payload.agent).slice(0, 80) : ticket.assigned_agent, now(), ticket.id);
+      notify(ticket.user_id, 'Ticket update', `${ticket.code} is now ${status.replace(/_/g, ' ')}.`, 'support', `#/support/tickets/${ticket.code}`);
+      audit('admin', admin.user_id, 'seller_ticket_status', 'ticket', ticket.id, `${ticket.code} → ${status}`);
+      send(res, 200, { message: `Ticket ${status.replace(/_/g, ' ')}.` });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/shops\/[a-z0-9-]+\/bank$/) && method === 'POST') {
+      const admin = requireAdmin();
+      const shop = db.prepare('SELECT * FROM nb_shops WHERE slug=?').get(route.split('/')[2]);
+      if (!shop) fail(404, 'Shop not found.');
+      const verified = payload.verified ? 'verified' : 'rejected';
+      db.prepare('UPDATE nb_shops SET bank_status=? WHERE id=?').run(verified, shop.id);
+      db.prepare('UPDATE nb_shop_financial_settings SET bank_status=?,updated_at=? WHERE shop_id=?').run(verified, now(), shop.id);
+      if (shop.owner_user_id) notify(shop.owner_user_id, 'Bank details verified', `Your payout bank details for ${shop.name} were ${verified}.`, 'settlement', '#/settings');
+      audit('admin', admin.user_id, 'bank_verified', 'shop', shop.id, verified);
+      send(res, 200, { message: `Bank details ${verified} for ${shop.name}.` });
+      return true;
+    }
+
 
     fail(404, 'API endpoint not found');
     return true;

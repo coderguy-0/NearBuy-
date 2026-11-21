@@ -25,6 +25,7 @@
   };
   PA.date = (iso) => iso ? new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
   PA.dateTime = (iso) => iso ? new Date(iso).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : '—';
+  PA.dateOnly = (iso) => iso ? new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
   PA.clock = (iso) => iso ? new Date(iso).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' }) : '';
   PA.ago = (iso) => {
     const diff = Date.now() - new Date(iso).getTime();
@@ -64,7 +65,25 @@
     print: '<path d="M6 9V3h12v6"/><rect x="3" y="9" width="18" height="8" rx="2"/><path d="M7 17h10v4H7z"/>',
     rupee: '<path d="M7 4h10M7 9h10M16 4c0 5-4 5-9 5l9 11"/>',
     home: '<path d="m3 11 9-8 9 8"/><path d="M5 10v11h14V10"/>',
-    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    chart: '<path d="M4 20V10M10 20V4M16 20v-8M22 20H2"/>',
+    scan: '<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M7 12h10"/>',
+    wallet: '<path d="M3 7a2 2 0 0 1 2-2h13v2"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1H5a2 2 0 0 1-2-2Z"/><circle cx="16.5" cy="14.5" r="1"/>',
+    percent: '<path d="M19 5 5 19"/><circle cx="7.5" cy="7.5" r="2.5"/><circle cx="16.5" cy="16.5" r="2.5"/>',
+    file: '<path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4"/>',
+    help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.3a2.6 2.6 0 0 1 5 .9c0 1.7-2.5 2-2.5 3.6"/><circle cx="12" cy="17.2" r=".6"/>',
+    calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+    shield: '<path d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3Z"/><path d="m9 12 2 2 4-4"/>',
+    download: '<path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>',
+    eye: '<path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
+    edit: '<path d="M17 3a2.8 2.8 0 1 1 4 4L8 20l-5 1 1-5L17 3Z"/>',
+    trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/>',
+    copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    phone: '<path d="M5 4h4l2 5-2.5 1.5a12 12 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
+    lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+    refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
+    link: '<path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/>'
   };
   PA.icon = (name) => `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.grid}</svg>`;
 
@@ -187,7 +206,12 @@
     open: 'amber', assigned: 'blue', in_progress: 'blue', awaiting_customer: 'amber', resolved: 'green', closed: 'grey',
     requested: 'amber', under_review: 'amber', approved: 'blue', processing: 'blue', refunded: 'green',
     published: 'green', hidden: 'grey', reported: 'red', paid: 'green', pending: 'amber', failed: 'red',
-    active: 'green', suspended: 'red', online: 'green', offline: 'grey', delivered_ok: 'green'
+    active: 'green', suspended: 'red', online: 'green', offline: 'grey', delivered_ok: 'green',
+    packed: 'green', packing: 'blue', missing: 'amber', reported: 'amber', registered: 'blue',
+    confirmed: 'green', submitted: 'amber', documents_pending: 'amber',
+    additional_info_required: 'amber', info_required: 'amber', not_settled: 'grey',
+    reconciliation_required: 'amber', on_hold: 'amber', verification_pending: 'amber',
+    partial_fulfillment: 'amber', awaiting_seller: 'amber', in_stock: 'green', low_stock: 'amber', out_of_stock: 'red'
   };
   PA.tone = (status) => STATUS_TONE[String(status || '').toLowerCase()] || 'grey';
   PA.badge = (label, tone = 'grey') => `<span class="badge ${tone}">${PA.esc(label)}</span>`;
@@ -226,6 +250,14 @@
       await found.handler(path.match(found.pattern), { path, seq, isCurrent: () => seq === renderSeq });
     } catch (err) {
       if (seq !== renderSeq) return;
+      if (/verification is still pending/i.test(err.message || '')) {
+        PA.set(`<div class="card"><div class="empty"><div class="emoji">🪪</div><b>Verification in progress</b>
+          <span>Your KYC application is with the NearBuy admin team. Shop profile, business hours, service areas, notifications and support stay open meanwhile — orders, catalogue edits and payouts unlock once you are approved.</span>
+          <div class="row" style="margin-top:14px;justify-content:center">
+            <a class="btn btn-primary" href="#/profile">Track verification & KYC</a>
+            <a class="btn" href="#/support">Contact support</a></div></div></div>`);
+        return;
+      }
       PA.set(`<div class="card"><div class="form-error">${PA.esc(err.message)}</div>
         <div class="row" style="margin-top:12px"><button class="btn" onclick="location.reload()">Reload</button>
         <a class="btn" href="#/overview">Back to overview</a></div></div>`);
