@@ -15,6 +15,13 @@ npm test       # 33 tests: security, catalogue, journeys and the site itself
 Node 22.5 or newer. No npm dependencies, no build step. The server serves the static site and every API from one port
 (`HOST` / `PORT`, default `0.0.0.0:4173`).
 
+## Authentication repair and sandbox launcher
+
+Open **`/demo/`** for four one-click, server-authenticated demo accounts. See
+[IMPLEMENTATION-REPORT.md](IMPLEMENTATION-REPORT.md) for verified fixes, demo restrictions,
+seeding/repair commands, test results and Netlify backend configuration. Netlify static hosting
+alone cannot run the Node/SQLite API; the build requires `NEARBUY_API_ORIGIN`.
+
 ## Where things live
 
 | Surface | URL | Sign-in |

@@ -366,3 +366,38 @@ test('the removed classic storefront returns 404 instead of a stale page', async
     await res.body?.cancel();
   }
 });
+
+test('all HTML surfaces load the universal navy and orange brand theme', () => {
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+    if (['.git', 'node_modules', 'dist', 'data'].includes(entry.name)) return [];
+    const full = path.join(dir, entry.name);
+    return entry.isDirectory() ? walk(full) : entry.name.endsWith('.html') ? [full] : [];
+  });
+  for (const file of walk(ROOT)) {
+    assert.match(fs.readFileSync(file, 'utf8'), /href="\/public\/assets\/brand\.css"/, file);
+  }
+  const theme = fs.readFileSync(path.join(ROOT, 'public/assets/brand.css'), 'utf8');
+  assert.match(theme, /--brand-navy: #06245e/);
+  assert.match(theme, /--brand-orange: #ff7900/);
+});
+
+test('customer and partner portals do not advertise other role workspaces', () => {
+  for (const name of ['customer/core.js', 'customer/views-account.js', 'customer/views-home.js']) {
+    const source = fs.readFileSync(path.join(ROOT, name), 'utf8');
+    assert.doesNotMatch(source, /href="\/(seller|runner|demo)\//, name);
+  }
+  const partner = fs.readFileSync(path.join(ROOT, 'partner/core.js'), 'utf8');
+  assert.doesNotMatch(partner, /href="\/(customer|demo)\//);
+  assert.match(partner, /role: state.mode/);
+  assert.match(partner, /state.user.role !== state.mode/);
+});
+
+test('footers retain branding without navigation tab groups or portal shortcuts', () => {
+  for (const file of ['index.html', 'about/index.html', 'help/index.html', 'roadmap/index.html']) {
+    const html = fs.readFileSync(path.join(ROOT, file), 'utf8');
+    const footer = html.match(/<footer\b[\s\S]*?<\/footer>/)?.[0] || '';
+    assert.doesNotMatch(footer, /footer__cols|footer__admin|href="\/(customer|seller|runner|admin)\//, file);
+  }
+  const customer = fs.readFileSync(path.join(ROOT, 'customer/core.js'), 'utf8');
+  assert.doesNotMatch(customer, /class="footer-col"/);
+});

@@ -331,7 +331,7 @@
             <div>
               <div class="small muted strong" style="letter-spacing:.12em;text-transform:uppercase">NearBuy ${PA.esc(copy.eyebrow)}</div>
               <h1 style="margin-top:6px">Sign in</h1>
-              <p class="muted small">Use the account that belongs to your role. Customers sign in at <a href="/customer/">the storefront</a>.</p>
+              <p class="muted small">Sign in with your ${PA.esc(copy.eyebrow)} account. This workspace is only for your assigned role.</p>
             </div>
             ${message ? `<div class="form-error" role="alert">${PA.esc(message)}</div>` : ''}
             <div class="field">
@@ -347,8 +347,8 @@
               <div class="form-note"><b>Demo account</b> ${PA.esc(copy.demo.email)} · ${PA.esc(copy.demo.password)}${state.mode === 'admin' ? '' : ''}.
               Demo data is seeded only outside production.</div>` : ''}
             <div class="row small muted" style="justify-content:space-between">
-              <a href="/" style="color:var(--blue)">← NearBuy home</a>
-              <span>${state.mode === 'admin' ? 'Administrators only' : 'Sellers and delivery partners'}</span>
+              <a href="${state.mode === 'admin' ? '/admin/' : state.mode === 'runner' ? '/runner/' : '/seller/'}" style="color:var(--blue)">← Portal sign-in</a>
+              <span>${state.mode === 'admin' ? 'Administrators only' : copy.eyebrow + ' accounts only'}</span>
             </div>
           </form>
         </div>
@@ -371,7 +371,7 @@
       submit.disabled = true;
       submit.textContent = 'Signing in…';
       try {
-        const data = await PA.api('POST', '/login', { email, password });
+        const data = await PA.api('POST', '/login', { email, password, role: state.mode });
         state.user = data.user;
         state.csrf = data.user.csrf || '';
         state.shop = data.shop || null;
@@ -421,8 +421,7 @@
           </nav>
           <div class="foot">
             <button class="btn btn-sm" type="button" id="logout" style="background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.2);color:#fff">${PA.icon('logout')} Sign out</button>
-            <a href="/customer/">Customer storefront</a>
-            <a href="/">NearBuy home</a>
+
           </div>
         </aside>
         <div class="main">
@@ -472,6 +471,11 @@
       }
     }
     if (!state.user) { renderGate(); return; }
+    if (state.user.role !== state.mode) {
+      state.user = null; state.csrf = '';
+      renderGate('This account does not belong to this portal. Sign in with the correct account for this workspace.');
+      return;
+    }
     renderShell();
     if (!location.hash) location.hash = PA.home;
     render();
@@ -481,7 +485,7 @@
         state.user = me.user;
         state.shop = me.shop || null;
         state.runner = me.runner || null;
-        if (!state.user) { state.csrf = ''; renderGate('Your session ended. Sign in again.'); }
+        if (!state.user || state.user.role !== state.mode) { state.user = null; state.csrf = ''; renderGate('Your session ended or this account belongs to a different workspace. Sign in with this portal’s account.'); }
       } catch { /* transient */ }
     }, 60000);
   }

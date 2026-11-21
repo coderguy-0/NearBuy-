@@ -1183,7 +1183,7 @@
     ];
     PA.set(`
       ${pageHead('Delivery & Pickup', 'Control how each eligible order reaches the customer — self-delivery, NearBuy runners, or store pickup.',
-        `<a class="btn" href="#/runner">${PA.icon('bike')} Runner console</a>`)}
+        `<a class="btn" href="#/runner">${PA.icon('bike')} Runner delivery tracking</a>`)}
 
       <div class="kpi-grid">
         <div class="kpi amber"><span class="label">Pending dispatch</span><span class="value">${s.pendingDispatch ?? 0}</span><span class="hint">Packed and waiting</span></div>

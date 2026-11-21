@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#081428" />
+  <meta name="theme-color" content="#06245e" />
   <meta name="description" content="The 84-item NearBuy blueprint as five reviewable sections. Selections persist in this browser only." />
   <title>Feature checklist — NearBuy</title>
   <link rel="icon" href="/public/assets/nearbuy-logo.png" />
@@ -26,6 +26,7 @@
       }, 2500);
     })();
   </script>
+<link rel="stylesheet" href="/public/assets/brand.css" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -323,51 +324,19 @@
         </a>
         <p class="footer__tagline">Your neighbourhood.<br />Everything you need.</p>
         <p class="footer__meta">Hauz Khas · New Delhi<br />hello@nearbuy.in</p>
-        <div class="footer__social" role="group" aria-label="NearBuy channels">
-          <a href="/help/#support" aria-label="Support"><svg class="ic"><use href="#i-mail"/></svg></a>
-          <a href="/help/#support" aria-label="Call support"><svg class="ic"><use href="#i-phone"/></svg></a>
-          <a href="/about/#trust" aria-label="Trust and safety"><svg class="ic"><use href="#i-shield"/></svg></a>
-        </div>
+        
       </div>
-      <div class="footer__cols">
-        <div>
-          <h4>Explore</h4>
-          <a href="/">Home</a>
-          <a href="/portal.html#/shop/explore">Browse everything</a>
-          <a href="/portal.html#/shop/shops">Nearby shops</a>
-          <a href="/roadmap/">Feature checklist</a>
-        </div>
-        <div>
-          <h4>Portals</h4>
-          <a href="/customer/">Customer</a>
-          <a href="/seller/">Seller</a>
-          <a href="/runner/">Delivery partner</a>
-          <a href="/portal.html">NearBuy One</a>
-        </div>
-        <div>
-          <h4>Support</h4>
-          <a href="/help/">Help centre</a>
-          <a href="/portal.html#/shop/help">In-app help</a>
-          <a href="/help/#support">Send an enquiry</a>
-          <a href="/help/#faq">FAQs</a>
-        </div>
-        <div>
-          <h4>Legal</h4>
-          <a href="/about/#trust">Privacy policy</a>
-          <a href="/about/#trust">Terms &amp; conditions</a>
-          <a href="/about/#trust">Refund policy</a>
-          <button class="footer__motion" id="motionToggle" type="button" aria-pressed="false">
-            <span class="footer__motion-dot" aria-hidden="true"></span> <span id="motionLabel">Reduce motion</span>
-          </button>
-        </div>
-      </div>
+      
     </div>
     <div class="wrap footer__bottom">
       <span>© <span id="year">2026</span> NearBuy. All rights reserved.</span>
       <span class="footer__disclaimer">Prototype demo · sample data only · no real payments, dispatch or KYC.</span>
-      <a href="/control-tower/" class="footer__admin">Operations console ↗</a>
+      
     </div>
-  </footer>
+  <button class="footer__motion" id="motionToggle" type="button" aria-pressed="false">
+            <span class="footer__motion-dot" aria-hidden="true"></span> <span id="motionLabel">Reduce motion</span>
+          </button>
+</footer>
   <script src="/home.js"></script>
 </body>
 </html>

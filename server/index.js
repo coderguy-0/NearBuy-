@@ -91,6 +91,7 @@ const notFoundHtml = `<!doctype html>
   a.btn:hover { background: #d95f0a; }
   code { background: #f2ece1; border-radius: 6px; padding: 2px 6px; color: #0c1a33; font-size: 14px; }
 </style>
+<link rel="stylesheet" href="/public/assets/brand.css" />
 </head>
 <body>
 <main>
