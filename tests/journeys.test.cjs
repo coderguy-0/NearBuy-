@@ -804,9 +804,9 @@ test('journey 15 — every surface is responsive and reachable', () => {
   assert.match(core, /Search for shops, products, groceries, medicines, stationery and more\.\.\./, 'the header search placeholder is exact');
   assert.match(core, /Delivering to/, 'the location selector is visible in the header');
 
-  const views = ['views-home.js', 'views-shop.js', 'views-cart.js', 'views-orders.js', 'views-account.js']
+  const views = ['views-home.js', 'views-shop.js', 'views-search.js', 'views-cart.js', 'views-orders.js', 'views-account.js']
     .map((f) => fs.readFileSync(path.join(ROOT, 'customer', f), 'utf8')).join('\n');
-  for (const route of ['NB.view(/^\\/$/', 'NB.view(/^\\/categories', 'NB.view(/^\\/shops', 'NB.view(/^\\/offers', 'NB.view(/^\\/orders', 'NB.view(/^\\/wishlist', 'NB.view(/^\\/help', 'NB.view(/^\\/account', 'NB.view(/^\\/cart']) {
+  for (const route of ['NB.view(/^\\/$/', 'NB.view(/^\\/categories', 'NB.view(/^\\/search', 'NB.view(/^\\/shops', 'NB.view(/^\\/offers', 'NB.view(/^\\/orders', 'NB.view(/^\\/wishlist', 'NB.view(/^\\/help', 'NB.view(/^\\/account', 'NB.view(/^\\/cart']) {
     assert.ok(views.includes(route), `the storefront registers ${route}`);
   }
   assert.doesNotMatch(views + core, /href="#"(\s|>)/, 'no dead "#" links are generated');
