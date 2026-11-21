@@ -314,8 +314,8 @@
             : `<span class="promo-strip__item hide-sm">${NB.icon('truck')} Delivery or pickup — set by each shop</span>`}
           <nav class="promo-strip__links" aria-label="Secondary">
             <a href="#/help">Help &amp; Support</a>
-            <a href="/seller/" class="hide-sm">Sell on NearBuy</a>
-            <a href="/runner/" class="hide-sm">Become a partner</a>
+            
+            
           </nav>
         </div>
       </div>
@@ -378,21 +378,12 @@
               <a class="brand brand--light" href="#/">${LOGO}</a>
               <p>Shop Local. Live Better. NearBuy connects you with trusted neighbourhood shops — compare prices, order easily and track every delivery.</p>
               <div class="footer-tagline">Smart Shopping. Right Nearby.</div>
-              <div class="socials" aria-label="NearBuy on social media">
-                <a href="#/page/contact" aria-label="Instagram">${NB.icon('camera')}</a>
-                <a href="#/page/contact" aria-label="Facebook">${NB.icon('chat')}</a>
-                <a href="#/page/contact" aria-label="X">${NB.icon('spark')}</a>
-                <a href="#/page/contact" aria-label="YouTube">${NB.icon('eye')}</a>
-              </div>
+              
             </div>
-            <div class="footer-col"><h3>Shop</h3>
-              <a href="#/categories">All categories</a><a href="#/shops">Nearby shops</a><a href="#/offers">Today’s offers</a><a href="#/products?sort=discount">Best discounts</a><a href="#/wishlist">Wishlist</a><a href="#/cart">Shopping cart</a></div>
-            <div class="footer-col"><h3>My NearBuy</h3>
-              <a href="#/orders">Orders &amp; tracking</a><a href="#/account">My account</a><a href="#/account/addresses">Saved addresses</a><a href="#/account/returns">Returns &amp; refunds</a><a href="#/help/tickets">My support tickets</a><a href="#/notifications">Notifications</a></div>
-            <div class="footer-col"><h3>Help</h3>
-              <a href="#/help">Help &amp; support</a><a href="#/page/faq">FAQs</a><a href="#/page/returns">Return &amp; refund policy</a><a href="#/page/cancellation">Cancellation policy</a><a href="#/page/delivery">Delivery information</a><a href="#/page/contact">Contact us</a></div>
-            <div class="footer-col"><h3>NearBuy</h3>
-              <a href="#/page/about">About NearBuy</a><a href="#/page/privacy">Privacy policy</a><a href="#/page/terms">Terms &amp; conditions</a><a href="/seller/register/">Seller registration</a><a href="/runner/register/">Delivery partner registration</a><a href="/seller/">Seller Hub &amp; partner console</a></div>
+
+
+
+
           </div>
           <div class="footer-bottom">
             <span>© ${new Date().getFullYear()} NearBuy. A neighbourhood commerce prototype. <b>Demo data</b> is labelled throughout.</span>
@@ -417,7 +408,7 @@
           <nav class="mobile-links">
             <a href="#/">Home</a><a href="#/categories">All categories</a><a href="#/shops">Nearby shops</a><a href="#/offers">Offers</a>
             <a href="#/orders">Orders</a><a href="#/wishlist">Wishlist</a><a href="#/notifications">Notifications</a><a href="#/account">My account</a>
-            <a href="#/help">Help &amp; support</a><a href="/seller/">Seller Hub</a><a href="/runner/">Runner app</a>
+            <a href="#/help">Help &amp; support</a>
           </nav>
         </aside>
       </div>`;

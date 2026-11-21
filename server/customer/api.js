@@ -50,6 +50,15 @@ class HttpError extends Error {
 }
 const fail = (status, message, extra) => { throw new HttpError(status, message, extra); };
 
+// A demo administrator is only safe on a separate, sample-only database.
+function demoIsIsolated() {
+  return !db.prepare('SELECT 1 FROM nb_users WHERE is_demo=0 LIMIT 1').get()
+    && !db.prepare('SELECT 1 FROM nb_orders WHERE is_demo=0 LIMIT 1').get();
+}
+function assertDemoIsolation() {
+  if (!demoIsIsolated()) fail(403, 'Demo access requires a separate sample-only database. Real accounts or records were detected.');
+}
+
 function send(res, status, payload, headers = {}) {
   const body = JSON.stringify(payload === undefined ? null : payload);
   res.writeHead(status, {
@@ -140,6 +149,10 @@ const cookieAttrs = (req) => {
 };
 
 function startSession(req, user, cookieName = SESSION_COOKIE, hours = SESSION_HOURS) {
+  user = db.prepare('SELECT * FROM nb_users WHERE id=?').get(user.id);
+  if (!user || !['active', 'pending_verification'].includes(user.status)) fail(403, 'This account is not active. Contact support.');
+  if (user.is_demo && !DEMO) fail(403, 'Demo accounts are disabled on this deployment.');
+  if (user.is_demo && user.role === 'admin' && (process.env.NODE_ENV === 'production' || process.env.DEMO_SANDBOX === '1')) assertDemoIsolation();
   const token = randomBytes(32).toString('hex');
   const csrf = randomBytes(24).toString('hex');
   db.prepare('INSERT INTO nb_sessions(token_hash,user_id,role,csrf,created_at,expires_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)')
@@ -151,13 +164,14 @@ function startSession(req, user, cookieName = SESSION_COOKIE, hours = SESSION_HO
 function sessionFor(req, cookieName = SESSION_COOKIE) {
   const token = parseCookies(req)[cookieName];
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
-  const row = db.prepare(`SELECT s.user_id, s.role, s.csrf, s.expires_at, u.name, u.email, u.phone, u.avatar, u.status
+  const row = db.prepare(`SELECT s.user_id, u.role, s.csrf, s.expires_at, u.is_demo, u.name, u.email, u.phone, u.avatar, u.status
     FROM nb_sessions s JOIN nb_users u ON u.id=s.user_id WHERE s.token_hash=?`).get(sha(token));
   if (!row) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) {
     db.prepare('DELETE FROM nb_sessions WHERE token_hash=?').run(sha(token));
     return null;
   }
+  if (row.is_demo && !DEMO) return null;
   if (row.status !== 'active' && !(cookieName === PARTNER_COOKIE && row.status === 'pending_verification')) return null;
   return { ...row, token };
 }
@@ -165,7 +179,8 @@ function sessionFor(req, cookieName = SESSION_COOKIE) {
 function requireUser(req, roles, cookieName = SESSION_COOKIE) {
   const s = sessionFor(req, cookieName);
   if (!s) fail(401, 'Please sign in to continue');
-  if (roles && !roles.includes(s.role)) fail(403, 'You do not have access to this area');
+  if (roles && !roles.includes(s.role)) fail(403, 'You do not have access to this area. Return to your own dashboard.');
+  if (s.is_demo && s.role === 'admin' && (process.env.NODE_ENV === 'production' || process.env.DEMO_SANDBOX === '1')) assertDemoIsolation();
   return s;
 }
 
@@ -941,7 +956,8 @@ function receiptHtml(order, sellerOrder, shop, customer, audience = 'customer') 
   .actions button, .actions a { border: 0; border-radius: 10px; padding: 10px 18px; background: #0866d9; color: #fff; font: 600 13px system-ui; cursor: pointer; text-decoration: none; }
   .actions a { background: #e7f2ff; color: #063b78; }
   @media print { body { background: #fff; padding: 0; } .sheet { border: 0; box-shadow: none; border-radius: 0; } .actions { display: none; } }
-</style></head><body>
+</style><link rel="stylesheet" href="/public/assets/brand.css" />
+</head><body>
 <div class="actions"><a href="javascript:history.back()">Back</a><button onclick="window.print()">Print / save as PDF</button></div>
 <div class="sheet">
   <div class="top">
@@ -993,8 +1009,9 @@ async function handle(req, res) {
     const session = sessionFor(req);
     const partnerSession = sessionFor(req, PARTNER_COOKIE);
     const adminSession = sessionFor(req, ADMIN_COOKIE);
-    const authPath = /\/auth\/(login|register|forgot|reset)$/.test(path) || path === '/api/partner/login' || path === '/api/admin/login';
-    if (!['GET', 'HEAD'].includes(method)) checkMutation(req, authPath ? null : (session || partnerSession || adminSession));
+    const requestSession = path.startsWith('/api/admin/') ? adminSession : path.startsWith('/api/partner/') ? partnerSession : session;
+    const authPath = /\/auth\/(login|register|forgot|reset)$/.test(path) || path === '/api/partner/login' || path === '/api/admin/login' || path === '/api/customer/auth/demo';
+    if (!['GET', 'HEAD'].includes(method)) checkMutation(req, authPath ? null : requestSession);
     const base = path.startsWith('/api/customer') ? '/api/customer' : path.startsWith('/api/partner') ? '/api/partner' : '/api/admin';
     const route = path.slice(base.length) || '/';
     /* Customer routes only match /api/customer/*, so an admin or partner path with
@@ -1004,6 +1021,30 @@ async function handle(req, res) {
 
     const page = clampInt(q.get('page') || 1, 1, 1000);
     const limit = clampInt(q.get('limit') || 12, 1, 48);
+
+    if (method === 'GET' && custRoute === '/auth/demo') {
+      send(res, 200, { enabled: DEMO && demoIsIsolated() });
+      return true;
+    }
+    if (method === 'POST' && custRoute === '/auth/demo') {
+      if (!DEMO) fail(404, 'Demo access is disabled on this deployment.');
+      assertDemoIsolation();
+      rateLimit(`demo-login:${clientIp(req)}`, 40, 900e3);
+      const accounts = {
+        customer: ['customer@nearbuy.demo', SESSION_COOKIE, '/customer/'],
+        seller: ['owner@nearbuy.demo', PARTNER_COOKIE, '/seller/'],
+        runner: ['rohan@nearbuy.demo', PARTNER_COOKIE, '/runner/'],
+        admin: ['admin@nearbuy.demo', ADMIN_COOKIE, '/admin/']
+      };
+      const account = Object.hasOwn(accounts, payload.role) ? accounts[payload.role] : null;
+      if (!account) fail(400, 'Choose Customer, Seller, Runner or Admin.');
+      const user = db.prepare('SELECT * FROM nb_users WHERE email=? AND role=? AND is_demo=1').get(account[0], payload.role);
+      if (!user) fail(503, 'This demo account has not been seeded. Ask the operator to run npm run seed:demo on the sandbox database.');
+      const sess = startSession(req, user, account[1]);
+      audit(user.role, user.id, 'demo_login', 'user', user.id, 'Sandbox demo session started');
+      send(res, 200, { portal: account[2], role: user.role }, { 'Set-Cookie': sess.cookie });
+      return true;
+    }
 
     /* ---------------------------- auth ----------------------------- */
     if (method === 'POST' && custRoute === '/auth/register') {
@@ -2301,6 +2342,7 @@ async function handle(req, res) {
       const user = db.prepare("SELECT * FROM nb_users WHERE email=? AND role IN ('seller','runner')").get(email);
       const ok = user ? checkPassword(payload.password, user.password_hash) : checkPassword(payload.password, makePassword('invalid-password'));
       if (!user || !ok) fail(401, 'Those partner details do not match an account.');
+      if (payload.role !== undefined && (!['seller', 'runner'].includes(payload.role) || payload.role !== user.role)) fail(403, 'This account does not belong to this portal. Use the correct account for this workspace.');
       if (user.status === 'suspended') fail(403, 'This partner account is suspended. Contact NearBuy support.');
       if (!['active', 'pending_verification'].includes(user.status)) fail(403, 'This partner account is not active.');
       const sess = startSession(req, user, PARTNER_COOKIE);
@@ -3236,6 +3278,7 @@ async function handle(req, res) {
 
     if (method === 'POST' && custRoute === '/payments/intent') {
       const s = requireCustomer(req);
+      if (s.is_demo) fail(403, 'Demo orders cannot start real payments. Use cash on delivery or pay at pickup; no money is collected in this sandbox.');
       if (!GATEWAY.configured) fail(503, 'Online payment is not configured. This deployment has no Razorpay keys, so no payment can be started.');
       const order = orderByCode(String(payload.orderCode || ''), s.user_id);
       if (order.payment_status === 'paid') fail(409, 'There is nothing left to pay for this order.');

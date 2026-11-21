@@ -782,43 +782,6 @@ function shopCategoryStripHtml() {
 
 function shopFooterHtml() {
   return `<footer class="nb-footer">
-    <div class="nb-footer-inner">
-      <div>
-        <h4>About NearBuy</h4>
-        <a href="/about/">About NearBuy</a>
-        <a href="/">Public Homepage</a>
-        <a href="/roadmap/">Platform Roadmap</a>
-        <button type="button" data-act="nav" data-surface="shop" data-view="shops">Neighbourhood Shops</button>
-      </div>
-      <div>
-        <h4>Shop Categories</h4>
-        <button type="button" data-act="discover-deals">Deals of the Day</button>
-        <button type="button" data-act="category" data-cat="fresh">Fresh Produce</button>
-        <button type="button" data-act="category" data-cat="bakery">Bakery &amp; Dairy</button>
-        <button type="button" data-act="category" data-cat="stationery">Books &amp; Stationery</button>
-      </div>
-      <div>
-        <h4>Your Shopping</h4>
-        <button type="button" data-act="nav" data-surface="shop" data-view="account">Customer Account</button>
-        <button type="button" data-act="nav" data-surface="shop" data-view="orders">Orders &amp; Tracking</button>
-        <button type="button" data-act="nav" data-surface="shop" data-view="saved">Saved Items</button>
-        <button type="button" data-act="nav" data-surface="shop" data-view="cart">Shopping Cart</button>
-      </div>
-      <div>
-        <h4>Partner Locally</h4>
-        <button type="button" data-act="shop-seller-open">Sell on NearBuy</button>
-        <a href="/seller/register/">Register a Local Shop</a>
-        <a href="/runner/register/">Join as Delivery Partner</a>
-        <button type="button" data-act="reset">Reset Demo Data</button>
-      </div>
-      <div>
-        <h4>Help &amp; Support</h4>
-        <button type="button" data-act="nav" data-surface="shop" data-view="help">Portal Help Centre</button>
-        <a href="/help/">Public FAQ &amp; Support</a>
-        <a href="mailto:hello@nearbuy.in">hello@nearbuy.in</a>
-        <span class="nb-footer-meta">${esc(areaLabel())} · South Delhi (Demo)</span>
-      </div>
-    </div>
     <div class="nb-footer-bottom">
       <div class="nb-footer-brand">${LOGO}<span><b>Near<em>Buy</em></b> · Your neighbourhood, everything you need.</span></div>
       <p>© 2026 NearBuy Neighbourhood Marketplace · Interactive prototype demo. All products, shops, prices and orders are simulated locally in this browser.</p>

@@ -36,7 +36,7 @@
           <h2>Every order keeps a neighbourhood business going.</h2>
           <p>NearBuy gives local shopkeepers a digital shopfront, live inventory and delivery tools — without taking their identity away. When you buy nearby, more of every rupee stays on your street.</p>
           <div class="local-band__actions">
-            <a class="btn btn--light" href="/seller/register/">Register your shop ${NB.icon('arrowRight')}</a>
+            
             <a class="btn btn--outline-light" href="#/page/about">Why local matters</a>
           </div>
         </div>

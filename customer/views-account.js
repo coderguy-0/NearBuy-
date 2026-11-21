@@ -946,7 +946,7 @@
         ['Fulfilment choice', 'Every delivery order lets you deliver with your own rider or request a nearby NearBuy runner. Pickup orders are verified at the counter with the customer’s collection code.'],
         ['Start the application', 'Open Seller Registration. Demo review may be automatic outside production; production requires a staff review before going live.']
       ],
-      cta: { label: 'Open Seller Registration', href: '/seller/register/' }
+
     },
     'partner-registration': {
       eyebrow: 'Deliver with NearBuy', title: 'Earn on deliveries around your neighbourhood.',
@@ -957,7 +957,7 @@
         ['Earnings and safety', 'Each assignment records a payout. Payouts are records; money movement requires a configured payout provider. Share location only while on a job, and never ask a customer for their OTP in advance.'],
         ['Start the application', 'Open the Delivery Partner Registration journey. Do not upload real identity documents to this prototype.']
       ],
-      cta: { label: 'Open Delivery Partner Registration', href: '/runner/register/' }
+
     }
   };
 

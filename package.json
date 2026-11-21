@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server/index.js",
     "start:static": "python3 -m http.server 4173 --bind 0.0.0.0",
-    "test": "node --test tests/*.test.cjs"
+    "test": "node --test tests/*.test.cjs",
+    "seed:demo": "node tools/seed-demo.cjs",
+    "build:netlify": "node tools/build-netlify.cjs"
   },
   "engines": {
     "node": ">=22.5.0"
