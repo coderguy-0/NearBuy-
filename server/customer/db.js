@@ -741,6 +741,55 @@ CREATE TABLE IF NOT EXISTS nb_shop_financial_settings (
   tax_config_json TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT NOT NULL
 );
+
+/* Runner Portal extension tables (shared DB, runner scoped) */
+CREATE TABLE IF NOT EXISTS nb_runner_preferences (
+  user_id TEXT PRIMARY KEY REFERENCES nb_users(id) ON DELETE CASCADE,
+  areas TEXT NOT NULL DEFAULT '',
+  pincodes TEXT NOT NULL DEFAULT '',
+  hours TEXT NOT NULL DEFAULT '',
+  max_distance_km REAL NOT NULL DEFAULT 10,
+  categories TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nb_runner_payouts (
+  id TEXT PRIMARY KEY,
+  runner_id TEXT NOT NULL REFERENCES nb_users(id),
+  period_label TEXT NOT NULL,
+  gross_paise INTEGER NOT NULL DEFAULT 0,
+  adjustments_paise INTEGER NOT NULL DEFAULT 0,
+  net_paise INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  reference TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runner_payouts ON nb_runner_payouts(runner_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS nb_runner_tickets (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL REFERENCES nb_users(id),
+  category TEXT NOT NULL DEFAULT 'general',
+  subject TEXT NOT NULL,
+  description TEXT NOT NULL,
+  attachment TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  assigned_agent TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runner_tickets ON nb_runner_tickets(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS nb_runner_ticket_messages (
+  id TEXT PRIMARY KEY,
+  ticket_id TEXT NOT NULL REFERENCES nb_runner_tickets(id) ON DELETE CASCADE,
+  author_role TEXT NOT NULL,
+  author_name TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 `);
 
 /* Idempotent column migrations for existing databases. */

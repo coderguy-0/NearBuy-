@@ -2631,9 +2631,10 @@ async function handle(req, res) {
           const busy = new Set(db.prepare(`SELECT a.runner_id FROM nb_delivery_assignments a JOIN nb_seller_orders x ON x.id=a.seller_order_id
             WHERE a.status='accepted' AND x.status NOT IN ('delivered','completed','cancelled','rejected')`).all().map((r) => r.runner_id));
           const declined = new Set(db.prepare("SELECT runner_id FROM nb_delivery_assignments WHERE seller_order_id=? AND status='declined'").all(so.id).map((r) => r.runner_id));
+          const prefMax = new Map(db.prepare('SELECT user_id,max_distance_km FROM nb_runner_preferences').all().map((p) => [p.user_id, Number(p.max_distance_km) || 10]));
           const eligible = runnerRows.filter((r) => !busy.has(r.user_id) && !declined.has(r.user_id))
             .map((r) => ({ ...r, distance: haversineKm(shop.lat, shop.lng, r.lat, r.lng) || 0 }))
-            .filter((r) => r.distance <= 10)
+            .filter((r) => r.distance <= Math.min(10, prefMax.get(r.user_id) || 10))
             .sort((a, b) => a.distance - b.distance);
           if (!eligible.length) {
             fail(409, 'No NearBuy runner is free right now. You can deliver this order with your own rider, or try again in a few minutes.', {
@@ -3029,6 +3030,203 @@ async function handle(req, res) {
       db.prepare('INSERT INTO nb_delivery_tracking(seller_order_id,status,note,lat,lng,actor,created_at) VALUES(?,?,?,?,?,?,?)')
         .run(assignment.seller_order_id, 'location', 'Runner shared a location', lat, lng, 'runner', now());
       send(res, 200, { message: 'Location shared with the customer.' });
+      return true;
+    }
+
+    /* Runner: earnings, payouts, preferences, notifications, safety      */
+    /* Rate card (server-side, transparent): base ₹30 + ₹9 per km of the   */
+    /* runner-to-shop distance, clamped to ₹35–₹150. This matches the     */
+    /* payout stored on each assignment at offer time.                    */
+    const RUNNER_RATE_CARD = { basePaise: 3000, perKmPaise: 900, minPaise: 3500, maxPaise: 15000 };
+    function runnerEarningsBreakdown(assignment) {
+      const payout = Number(assignment.payout_paise || 0);
+      const base = Math.min(RUNNER_RATE_CARD.basePaise, payout);
+      const distanceComponent = Math.max(0, payout - base);
+      return { base, distanceComponent, total: payout, distanceKm: assignment.distance_km ?? null };
+    }
+    function runnerDelivered(userId) {
+      return db.prepare(`SELECT a.*, so.code AS order_code, s.name AS shop_name
+        FROM nb_delivery_assignments a JOIN nb_seller_orders so ON so.id=a.seller_order_id
+        JOIN nb_shops s ON s.id=a.shop_id
+        WHERE a.runner_id=? AND a.status='delivered' ORDER BY a.delivered_at DESC`).all(userId);
+    }
+
+    if (base === '/api/partner' && route === '/runner/earnings' && method === 'GET') {
+      const s = requirePartner(['runner']);
+      const rows = runnerDelivered(s.user_id);
+      const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+      const weekStart = new Date(dayStart.getTime() - 6 * 86400e3);
+      const monthStart = new Date(dayStart.getFullYear(), dayStart.getMonth(), 1);
+      const sumSince = (d) => rows.filter((r) => new Date(r.delivered_at).getTime() >= d.getTime()).reduce((t, r) => t + Number(r.payout_paise), 0);
+      const byDay = {};
+      for (const r of rows) {
+        const key = String(r.delivered_at).slice(0, 10);
+        byDay[key] = (byDay[key] || 0) + Number(r.payout_paise);
+      }
+      send(res, 200, {
+        rateCard: { basePaise: RUNNER_RATE_CARD.basePaise, perKmPaise: RUNNER_RATE_CARD.perKmPaise, minPaise: RUNNER_RATE_CARD.minPaise, maxPaise: RUNNER_RATE_CARD.maxPaise, note: 'Base ₹30 per delivery plus ₹9 per km of runner-to-shop distance, clamped between ₹35 and ₹150. The Admin Portal controls the live rate card.' },
+        totals: {
+          today: sumSince(dayStart), week: sumSince(weekStart), month: sumSince(monthStart),
+          allTime: rows.reduce((t, r) => t + Number(r.payout_paise), 0),
+          deliveries: rows.length,
+          avgPerDelivery: rows.length ? Math.round(rows.reduce((t, r) => t + Number(r.payout_paise), 0) / rows.length) : 0,
+          distanceKm: Math.round(rows.reduce((t, r) => t + Number(r.distance_km || 0), 0) * 100) / 100
+        },
+        byDay,
+        deliveries: rows.slice(0, 50).map((r) => ({
+          id: r.id, orderCode: r.order_code, shop: r.shop_name, deliveredAt: r.delivered_at,
+          breakdown: runnerEarningsBreakdown(r)
+        }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/payouts' && method === 'GET') {
+      const s = requirePartner(['runner']);
+      const rows = db.prepare('SELECT * FROM nb_runner_payouts WHERE runner_id=? ORDER BY created_at DESC').all(s.user_id);
+      const sum = (status) => rows.filter((r) => r.status === status).reduce((t, r) => t + Number(r.net_paise), 0);
+      send(res, 200, {
+        summary: { pending: sum('pending'), processing: sum('processing'), completed: sum('completed'), failed: sum('failed'), onHold: sum('on_hold') },
+        payouts: rows.map((r) => ({ id: r.id, period: r.period_label, gross: r.gross_paise, adjustments: r.adjustments_paise, net: r.net_paise, status: r.status, reference: r.reference, createdAt: r.created_at, updatedAt: r.updated_at }))
+      });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/payouts/request' && method === 'POST') {
+      const s = requirePartner(['runner']);
+      const delivered = runnerDelivered(s.user_id);
+      const covered = new Set(db.prepare("SELECT id FROM nb_runner_payouts WHERE runner_id=? AND status NOT IN ('failed')").all(s.user_id).map(() => null));
+      const existing = db.prepare("SELECT * FROM nb_runner_payouts WHERE runner_id=? AND status IN ('pending','processing')").all(s.user_id);
+      if (existing.length) fail(409, 'You already have a payout in progress. It will appear here when operations process it.');
+      const gross = delivered.reduce((t, r) => t + Number(r.payout_paise), 0);
+      const paidOut = db.prepare("SELECT COALESCE(SUM(net_paise),0) AS n FROM nb_runner_payouts WHERE runner_id=? AND status='completed'").get(s.user_id).n;
+      const net = gross - Number(paidOut);
+      if (net <= 0) fail(400, 'There is no unpaid delivery earning to request yet. Complete a delivery first.');
+      const id = uid();
+      const period = new Date().toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
+      db.prepare('INSERT INTO nb_runner_payouts(id,runner_id,period_label,gross_paise,adjustments_paise,net_paise,status,reference,created_at,updated_at) VALUES(?,?,?,?,?,?,?,NULL,?,?)')
+        .run(id, s.user_id, period, gross, 0, net, 'pending', now(), now());
+      audit('runner', s.user_id, 'payout_requested', 'payout', id, `₹${Math.round(net / 100)} · ${period}`);
+      send(res, 201, { message: 'Payout requested. Operations will process it and update the status here.', payout: { id, net, status: 'pending' } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/service-areas' && method === 'GET') {
+      requirePartner(['runner']);
+      const rows = db.prepare('SELECT * FROM nb_service_areas WHERE active=1 ORDER BY pincode').all();
+      send(res, 200, { areas: rows.map((a) => ({ pincode: a.pincode, locality: a.locality, city: a.city, active: Boolean(a.active) })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/preferences' && method === 'GET') {
+      const s = requirePartner(['runner']);
+      const row = db.prepare('SELECT * FROM nb_runner_preferences WHERE user_id=?').get(s.user_id);
+      send(res, 200, { preferences: row ? { areas: row.areas, pincodes: row.pincodes, hours: row.hours, maxDistanceKm: row.max_distance_km, categories: row.categories, updatedAt: row.updated_at } : { areas: '', pincodes: '', hours: '', maxDistanceKm: 10, categories: '', updatedAt: null } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/preferences' && method === 'PATCH') {
+      const s = requirePartner(['runner']);
+      const areas = String(payload.areas || '').trim().slice(0, 500);
+      const pincodes = String(payload.pincodes || '').trim().slice(0, 200);
+      const hours = String(payload.hours || '').trim().slice(0, 200);
+      const categories = String(payload.categories || '').trim().slice(0, 300);
+      const maxDistanceKm = Number(payload.maxDistanceKm);
+      if (!Number.isFinite(maxDistanceKm) || maxDistanceKm < 1 || maxDistanceKm > 25) fail(400, 'Maximum delivery distance must be between 1 and 25 km.');
+      if (pincodes && pincodes.split(',').some((p) => !/^\d{6}$/.test(p.trim()))) fail(400, 'PIN codes must be 6 digits, separated by commas.');
+      db.prepare(`INSERT INTO nb_runner_preferences(user_id,areas,pincodes,hours,max_distance_km,categories,updated_at) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET areas=excluded.areas,pincodes=excluded.pincodes,hours=excluded.hours,max_distance_km=excluded.max_distance_km,categories=excluded.categories,updated_at=excluded.updated_at`)
+        .run(s.user_id, areas, pincodes, hours, maxDistanceKm, categories, now());
+      audit('runner', s.user_id, 'preferences_updated', 'runner', s.user_id, `max ${maxDistanceKm}km · ${areas || 'all areas'}`);
+      send(res, 200, { message: 'Work preferences saved. New offers will respect your maximum distance.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/notifications' && method === 'GET') {
+      const s = requirePartner(['runner']);
+      const rows = db.prepare('SELECT * FROM nb_notifications WHERE user_id=? ORDER BY id DESC LIMIT 100').all(s.user_id);
+      send(res, 200, { notifications: rows.map((n) => ({ id: n.id, title: n.title, body: n.body, type: n.type, link: n.link, read: Boolean(n.is_read), at: n.created_at })), unread: rows.filter((n) => !n.is_read).length });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/notifications/read' && method === 'POST') {
+      const s = requirePartner(['runner']);
+      db.prepare('UPDATE nb_notifications SET is_read=1 WHERE user_id=?').run(s.user_id);
+      send(res, 200, { message: 'All notifications marked as read.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/profile' && method === 'PATCH') {
+      const s = requirePartner(['runner']);
+      const name = String(payload.name || '').trim();
+      const phone = String(payload.phone || '').trim();
+      const vehicle = String(payload.vehicle || '').trim().slice(0, 40);
+      if (name && name.length < 2) fail(400, 'Name must be at least 2 characters.');
+      if (phone && !/^\+?[\d\s-]{10,15}$/.test(phone)) fail(400, 'Enter a valid mobile number.');
+      if (vehicle && !['Scooter', 'Motorcycle', 'Bicycle', 'On foot', 'Car'].includes(vehicle)) fail(400, 'Choose a supported vehicle type.');
+      transaction(() => {
+        if (name) db.prepare('UPDATE nb_users SET name=? WHERE id=?').run(name, s.user_id);
+        if (phone) db.prepare('UPDATE nb_users SET phone=? WHERE id=?').run(phone, s.user_id);
+        if (vehicle) db.prepare('UPDATE nb_runners SET vehicle=? WHERE user_id=?').run(vehicle.toLowerCase(), s.user_id);
+      });
+      audit('runner', s.user_id, 'profile_updated', 'runner', s.user_id, [name ? 'name' : null, phone ? 'phone' : null, vehicle ? 'vehicle' : null].filter(Boolean).join(', '));
+      send(res, 200, { message: 'Profile updated.' });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/safety/tickets' && method === 'GET') {
+      const s = requirePartner(['runner']);
+      const rows = db.prepare('SELECT * FROM nb_runner_tickets WHERE user_id=? ORDER BY created_at DESC').all(s.user_id);
+      send(res, 200, { tickets: rows.map((t) => ({ code: t.code, category: t.category, subject: t.subject, status: t.status, assignedAgent: t.assigned_agent, createdAt: t.created_at, updatedAt: t.updated_at })) });
+      return true;
+    }
+
+    if (base === '/api/partner' && route === '/runner/safety/tickets' && method === 'POST') {
+      const s = requirePartner(['runner']);
+      const category = String(payload.category || 'general').slice(0, 60);
+      const subject = String(payload.subject || '').trim();
+      const description = String(payload.description || '').trim();
+      if (!str(subject, 3, 120)) fail(400, 'Give the report a short subject.');
+      if (!str(description, 10, 2000)) fail(400, 'Describe what happened in at least 10 characters.');
+      const id = uid();
+      const code = `SAFE-${String(Math.floor(100000 + Math.random() * 900000))}`;
+      transaction(() => {
+        db.prepare('INSERT INTO nb_runner_tickets(id,code,user_id,category,subject,description,attachment,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+          .run(id, code, s.user_id, category, subject, description, payload.attachment ? String(payload.attachment).slice(0, 300) : null, 'open', now(), now());
+        db.prepare('INSERT INTO nb_runner_ticket_messages(id,ticket_id,author_role,author_name,body,created_at) VALUES(?,?,?,?,?,?)')
+          .run(uid(), id, 'runner', s.name, description, now());
+      });
+      audit('runner', s.user_id, 'safety_report_created', 'ticket', id, `${code} · ${category}`);
+      send(res, 201, { ticket: { code, status: 'open' }, message: `Safety report ${code} created. Support will reply in this thread.` });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/runner\/safety\/tickets\/[A-Za-z0-9-]+$/) && method === 'GET') {
+      const s = requirePartner(['runner']);
+      const ticket = db.prepare('SELECT * FROM nb_runner_tickets WHERE code=? AND user_id=?').get(decodeURIComponent(route.split('/')[4]), s.user_id);
+      if (!ticket) fail(404, 'Ticket not found.');
+      const messages = db.prepare('SELECT * FROM nb_runner_ticket_messages WHERE ticket_id=? ORDER BY created_at').all(ticket.id);
+      send(res, 200, { ticket: { code: ticket.code, category: ticket.category, subject: ticket.subject, description: ticket.description, status: ticket.status, assignedAgent: ticket.assigned_agent, attachment: ticket.attachment, createdAt: ticket.created_at, updatedAt: ticket.updated_at, messages: messages.map((m) => ({ authorRole: m.author_role, authorName: m.author_name, body: m.body, at: m.created_at })) } });
+      return true;
+    }
+
+    if (base === '/api/partner' && route.match(/^\/runner\/safety\/tickets\/[A-Za-z0-9-]+\/(reply|close)$/) && method === 'POST') {
+      const s = requirePartner(['runner']);
+      const parts = route.split('/');
+      const ticket = db.prepare('SELECT * FROM nb_runner_tickets WHERE code=? AND user_id=?').get(decodeURIComponent(parts[4]), s.user_id);
+      if (!ticket) fail(404, 'Ticket not found.');
+      if (parts[5] === 'close') {
+        db.prepare("UPDATE nb_runner_tickets SET status='closed',updated_at=? WHERE id=?").run(now(), ticket.id);
+        send(res, 200, { message: 'Ticket closed.' });
+        return true;
+      }
+      if (ticket.status === 'closed') fail(409, 'This ticket is closed. Create a new report if you still need help.');
+      if (!str(payload.body, 2, 2000)) fail(400, 'Write a message of at least 2 characters.');
+      transaction(() => {
+        db.prepare('INSERT INTO nb_runner_ticket_messages(id,ticket_id,author_role,author_name,body,created_at) VALUES(?,?,?,?,?,?)').run(uid(), ticket.id, 'runner', s.name, payload.body.trim(), now());
+        db.prepare("UPDATE nb_runner_tickets SET status=?,updated_at=? WHERE id=?").run(ticket.status === 'awaiting_runner' ? 'in_progress' : ticket.status, now(), ticket.id);
+      });
+      send(res, 200, { message: 'Reply added.' });
       return true;
     }
 
@@ -4843,6 +5041,94 @@ async function handle(req, res) {
       return true;
     }
 
+
+    /* Admin: runner management, runner safety tickets, runner payouts    */
+    if (base === '/api/admin' && route === '/runners' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT r.*, u.name, u.email, u.phone, u.status AS account_status, u.created_at AS joined_at,
+        (SELECT COUNT(*) FROM nb_delivery_assignments a WHERE a.runner_id=r.user_id AND a.status='delivered') AS deliveries,
+        (SELECT COALESCE(SUM(payout_paise),0) FROM nb_delivery_assignments a WHERE a.runner_id=r.user_id AND a.status='delivered') AS earned
+        FROM nb_runners r JOIN nb_users u ON u.id=r.user_id ORDER BY u.created_at DESC LIMIT 200`).all();
+      send(res, 200, { runners: rows.map((r) => ({ userId: r.user_id, name: r.name, email: r.email, phone: r.phone, vehicle: r.vehicle, status: r.status, active: Boolean(r.active), accountStatus: r.account_status, rating: r.rating, completed: r.completed, deliveries: r.deliveries, earned: r.earned, joinedAt: r.joined_at })) });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/runners\/[a-zA-Z0-9-]+$/) && method === 'PATCH') {
+      const admin = requireAdmin();
+      const id = route.split('/')[2];
+      const runner = db.prepare('SELECT * FROM nb_runners WHERE user_id=?').get(id);
+      if (!runner) fail(404, 'Runner not found.');
+      const active = payload.active === false ? 0 : 1;
+      db.prepare('UPDATE nb_runners SET active=?,status=? WHERE user_id=?').run(active, active ? runner.status : 'offline', id);
+      db.prepare('UPDATE nb_users SET status=? WHERE id=?').run(active ? 'active' : 'suspended', id);
+      if (!active) db.prepare('DELETE FROM nb_sessions WHERE user_id=?').run(id);
+      audit('admin', admin.user_id, active ? 'runner_reactivated' : 'runner_suspended', 'runner', id, active ? 'reactivated' : 'suspended');
+      send(res, 200, { message: active ? 'Runner reactivated. They can go online again.' : 'Runner suspended. Live sessions were ended and no new offers will be sent.' });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/runner-tickets' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT t.*, u.name AS runner_name FROM nb_runner_tickets t JOIN nb_users u ON u.id=t.user_id ORDER BY t.created_at DESC LIMIT 200`).all();
+      send(res, 200, { tickets: rows.map((t) => ({ code: t.code, runner: t.runner_name, category: t.category, subject: t.subject, status: t.status, assignedAgent: t.assigned_agent, createdAt: t.created_at, updatedAt: t.updated_at })) });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/runner-tickets\/[A-Za-z0-9-]+$/) && method === 'GET') {
+      requireAdmin();
+      const ticket = db.prepare('SELECT * FROM nb_runner_tickets WHERE code=?').get(decodeURIComponent(route.split('/')[2]));
+      if (!ticket) fail(404, 'Ticket not found.');
+      const messages = db.prepare('SELECT * FROM nb_runner_ticket_messages WHERE ticket_id=? ORDER BY created_at').all(ticket.id);
+      send(res, 200, { ticket: { code: ticket.code, category: ticket.category, subject: ticket.subject, description: ticket.description, status: ticket.status, assignedAgent: ticket.assigned_agent, attachment: ticket.attachment, createdAt: ticket.created_at, updatedAt: ticket.updated_at, messages: messages.map((m) => ({ authorRole: m.author_role, authorName: m.author_name, body: m.body, at: m.created_at })) } });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/runner-tickets\/[A-Za-z0-9-]+\/(reply|status)$/) && method === 'POST') {
+      const admin = requireAdmin();
+      const parts = route.split('/');
+      const ticket = db.prepare('SELECT * FROM nb_runner_tickets WHERE code=?').get(decodeURIComponent(parts[2]));
+      if (!ticket) fail(404, 'Ticket not found.');
+      if (parts[3] === 'status') {
+        const status = String(payload.status || '');
+        if (!['open', 'assigned', 'in_progress', 'awaiting_runner', 'resolved', 'closed'].includes(status)) fail(400, 'Unknown ticket status.');
+        db.prepare('UPDATE nb_runner_tickets SET status=?,assigned_agent=COALESCE(?,assigned_agent),updated_at=? WHERE id=?').run(status, payload.agent ? String(payload.agent).slice(0, 80) : null, now(), ticket.id);
+        audit('admin', admin.user_id, 'runner_ticket_status', 'ticket', ticket.id, status);
+        send(res, 200, { message: `Ticket ${ticket.code} is now ${status}.` });
+        return true;
+      }
+      if (!str(payload.body, 2, 2000)) fail(400, 'Write a reply of at least 2 characters.');
+      transaction(() => {
+        db.prepare('INSERT INTO nb_runner_ticket_messages(id,ticket_id,author_role,author_name,body,created_at) VALUES(?,?,?,?,?,?)').run(uid(), ticket.id, 'admin', admin.name, payload.body.trim(), now());
+        db.prepare("UPDATE nb_runner_tickets SET status='awaiting_runner',updated_at=? WHERE id=? AND status NOT IN ('resolved','closed')").run(now(), ticket.id);
+      });
+      notify(ticket.user_id, 'Support replied to your safety report', `${ticket.code}: ${payload.body.trim().slice(0, 120)}`, 'support', '#/safety');
+      audit('admin', admin.user_id, 'runner_ticket_reply', 'ticket', ticket.id, ticket.code);
+      send(res, 200, { message: 'Reply sent to the runner.' });
+      return true;
+    }
+
+    if (base === '/api/admin' && route === '/payouts' && method === 'GET') {
+      requireAdmin();
+      const rows = db.prepare(`SELECT p.*, u.name AS runner_name FROM nb_runner_payouts p JOIN nb_users u ON u.id=p.runner_id ORDER BY p.created_at DESC LIMIT 200`).all();
+      send(res, 200, { payouts: rows.map((p) => ({ id: p.id, runner: p.runner_name, runnerId: p.runner_id, period: p.period_label, gross: p.gross_paise, adjustments: p.adjustments_paise, net: p.net_paise, status: p.status, reference: p.reference, createdAt: p.created_at, updatedAt: p.updated_at })) });
+      return true;
+    }
+
+    if (base === '/api/admin' && route.match(/^\/payouts\/[a-zA-Z0-9-]+\/status$/) && method === 'POST') {
+      const admin = requireAdmin();
+      const id = route.split('/')[2];
+      const payout = db.prepare('SELECT * FROM nb_runner_payouts WHERE id=?').get(id);
+      if (!payout) fail(404, 'Payout not found.');
+      const status = String(payload.status || '');
+      if (!['pending', 'processing', 'completed', 'failed', 'on_hold'].includes(status)) fail(400, 'Unknown payout status.');
+      const reference = payload.reference ? String(payload.reference).trim().slice(0, 80) : payout.reference;
+      if (status === 'completed' && !reference) fail(400, 'A completed payout needs the bank/UPI reference.');
+      db.prepare('UPDATE nb_runner_payouts SET status=?,reference=?,updated_at=? WHERE id=?').run(status, reference, now(), id);
+      notify(payout.runner_id, 'Payout update', `Your payout for ${payout.period_label} (${'₹' + Math.round(payout.net_paise / 100)}) is now ${status}${reference ? ` · ref ${reference}` : ''}.`, 'payout', '#/payouts');
+      audit('admin', admin.user_id, 'payout_status', 'payout', id, `${status}${reference ? ' · ' + reference : ''}`);
+      send(res, 200, { message: `Payout marked ${status}.` });
+      return true;
+    }
 
     fail(404, 'API endpoint not found');
     return true;

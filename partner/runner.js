@@ -11,6 +11,11 @@
   const NAV = [
     { href: '#/overview', label: 'Today', icon: 'bike', count: 'offers' },
     { href: '#/history', label: 'Delivery history', icon: 'route' },
+    { href: '#/earnings', label: 'Earnings', icon: 'route' },
+    { href: '#/payouts', label: 'Payouts', icon: 'settlement' },
+    { href: '#/preferences', label: 'Work preferences', icon: 'settings' },
+    { href: '#/safety', label: 'Safety & support', icon: 'support' },
+    { href: '#/notifications', label: 'Notifications', icon: 'bell' },
     { href: '#/profile', label: 'Partner profile', icon: 'settings' }
   ];
 
@@ -291,6 +296,289 @@
     function state() { return PA.state.user || {}; }
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Earnings dashboard — real delivery/payout records only.            */
+  /* ------------------------------------------------------------------ */
+  async function earnings(match, ctx) {
+    const data = await PA.api('GET', '/runner/earnings');
+    if (!ctx.isCurrent()) return;
+    const t = data.totals;
+    const days = Object.keys(data.byDay).sort();
+    const maxDay = Math.max(1, ...Object.values(data.byDay));
+    PA.set(`
+      <div class="space-between"><div><h1>Earnings</h1>
+        <p class="muted small">Every figure comes from deliveries you completed on the shared platform.</p></div>
+        <a class="btn" href="#/payouts">Payout history →</a></div>
+      <div class="grid g4">
+        <div class="card stat"><span class="label">Today</span><span class="value">${PA.money(t.today)}</span><span class="hint">Delivered today</span></div>
+        <div class="card stat"><span class="label">Last 7 days</span><span class="value">${PA.money(t.week)}</span><span class="hint">Rolling week</span></div>
+        <div class="card stat"><span class="label">This month</span><span class="value">${PA.money(t.month)}</span><span class="hint">Since the 1st</span></div>
+        <div class="card stat"><span class="label">All time</span><span class="value">${PA.money(t.allTime)}</span><span class="hint">${t.deliveries} deliveries · ${t.distanceKm} km</span></div>
+      </div>
+      <div class="grid g2">
+        <div class="card">
+          <h3>Daily earnings</h3>
+          ${days.length ? `<div class="bars" style="margin-top:12px">${days.slice(-14).map((d) => `
+            <div class="bar-row"><span class="muted small mono">${esc(d.slice(5))}</span>
+              <div class="bar-track"><div class="bar-fill" style="width:${Math.round((data.byDay[d] / maxDay) * 100)}%"></div></div>
+              <b class="small">${PA.money(data.byDay[d])}</b></div>`).join('')}</div>`
+            : `<div class="empty"><div class="emoji">📊</div><b>No earnings yet</b><span>Complete a delivery and the graph will fill in.</span></div>`}
+        </div>
+        <div class="card">
+          <h3>How your earnings are calculated</h3>
+          ${PA.kv([
+            ['Base delivery', PA.money(data.rateCard.basePaise)],
+            ['Distance component', `${PA.money(data.rateCard.perKmPaise)} per km (runner → shop)`],
+            ['Minimum / maximum', `${PA.money(data.rateCard.minPaise)} – ${PA.money(data.rateCard.maxPaise)}`],
+            ['Average per delivery', PA.money(t.avgPerDelivery)]
+          ])}
+          <p class="muted small" style="margin-top:10px">${esc(data.rateCard.note)} You see the exact payout before you accept an offer.</p>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Delivery earnings breakdown</h3>
+        ${data.deliveries.length ? `<div class="table-wrap"><table class="data">
+          <thead><tr><th>Order</th><th>Shop</th><th>Delivered</th><th class="num">Distance</th><th class="num">Base</th><th class="num">Distance pay</th><th class="num">Total</th></tr></thead>
+          <tbody>${data.deliveries.map((d) => `<tr>
+            <td class="mono small">${esc(d.orderCode)}</td>
+            <td class="small">${esc(d.shop)}</td>
+            <td class="small">${PA.dateTime(d.deliveredAt)}</td>
+            <td class="num">${d.breakdown.distanceKm ?? '—'} km</td>
+            <td class="num">${PA.money(d.breakdown.base)}</td>
+            <td class="num">${PA.money(d.breakdown.distanceComponent)}</td>
+            <td class="num"><b>${PA.money(d.breakdown.total)}</b></td>
+          </tr>`).join('')}</tbody></table></div>`
+          : PA.empty('🛵', 'No completed deliveries yet', 'Earnings are recorded the moment a delivery closes with the customer OTP.')}
+      </div>
+    `);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Payout history                                                     */
+  /* ------------------------------------------------------------------ */
+  async function payouts(match, ctx) {
+    const data = await PA.api('GET', '/runner/payouts');
+    if (!ctx.isCurrent()) return;
+    const s = data.summary;
+    PA.set(`
+      <div class="space-between"><div><h1>Payouts</h1>
+        <p class="muted small">Payouts are processed by operations on a periodic schedule. Status only changes when a real payout is confirmed.</p></div>
+        <button class="btn btn-primary" id="request-payout">Request payout</button></div>
+      <div class="grid g4">
+        <div class="card stat"><span class="label">Pending</span><span class="value">${PA.money(s.pending)}</span><span class="hint">Requested, not yet processed</span></div>
+        <div class="card stat"><span class="label">Processing</span><span class="value">${PA.money(s.processing)}</span><span class="hint">Being paid out</span></div>
+        <div class="card stat"><span class="label">Completed</span><span class="value">${PA.money(s.completed)}</span><span class="hint">Paid to your account</span></div>
+        <div class="card stat"><span class="label">On hold / failed</span><span class="value">${PA.money(s.onHold + s.failed)}</span><span class="hint">Contact support if stuck</span></div>
+      </div>
+      ${data.payouts.length ? `<div class="card flush"><div class="table-wrap"><table class="data">
+        <thead><tr><th>Period</th><th class="num">Gross</th><th class="num">Adjustments</th><th class="num">Net</th><th>Reference</th><th>Status</th><th>Requested</th></tr></thead>
+        <tbody>${data.payouts.map((p) => `<tr>
+          <td><b>${esc(p.period)}</b></td>
+          <td class="num">${PA.money(p.gross)}</td>
+          <td class="num">${PA.money(p.adjustments)}</td>
+          <td class="num"><b>${PA.money(p.net)}</b></td>
+          <td class="small mono">${p.reference ? esc(p.reference) : '—'}</td>
+          <td>${PA.badge(p.status.replace('_', ' '), p.status === 'completed' ? 'green' : p.status === 'failed' ? 'red' : 'amber')}</td>
+          <td class="small">${PA.dateTime(p.createdAt)}</td>
+        </tr>`).join('')}</tbody></table></div></div>`
+        : `<div class="card">${PA.empty('💰', 'No payout requests yet', 'Once you complete deliveries, request a payout and operations will process it here.')}</div>`}
+    `);
+    PA.on('#request-payout', 'click', async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        const res = await PA.api('POST', '/runner/payouts/request', {});
+        PA.toast(res.message || 'Payout requested.');
+        PA.render();
+      } catch (err) { e.currentTarget.disabled = false; PA.toast(err.message, 'err'); }
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Work preferences                                                   */
+  /* ------------------------------------------------------------------ */
+  async function preferences(match, ctx) {
+    const data = await PA.api('GET', '/runner/preferences');
+    const areas = await PA.api('GET', '/runner/service-areas').catch(() => ({ areas: [] }));
+    if (!ctx.isCurrent()) return;
+    const p = data.preferences;
+    const hourOptions = ['Morning (6am – 12pm)', 'Afternoon (12pm – 5pm)', 'Evening (5pm – 10pm)', 'Custom'];
+    const catOptions = ['Groceries', 'General store', 'Food & beverages', 'Stationery & books', 'Electronics & accessories', 'Clothing & footwear', 'Medical & pharmacy'];
+    PA.set(`
+      <div class="space-between"><div><h1>Work preferences</h1>
+        <p class="muted small">Offers outside your maximum distance or preferred hours are never sent to you.</p></div></div>
+      <form class="card" id="prefs-form">
+        <h3>Delivery areas</h3>
+        <div class="field" style="margin-top:10px"><label for="pf-areas">Preferred localities</label>
+          <input class="input" id="pf-areas" value="${esc(p.areas)}" placeholder="Lajpat Nagar, Defence Colony" />
+          <span class="help">Comma separated. Leave empty to accept offers anywhere in the serviceable city.</span></div>
+        <div class="field"><label for="pf-pins">Preferred PIN codes</label>
+          <input class="input" id="pf-pins" value="${esc(p.pincodes)}" placeholder="110024, 110049" />
+          <span class="help">6-digit PIN codes, comma separated.${areas.areas && areas.areas.length ? ` Serviceable today: ${esc(areas.areas.map((a) => a.pincode).join(', '))}.` : ''}</span></div>
+        <div class="field"><label for="pf-dist">Maximum delivery distance (km)</label>
+          <input class="input" id="pf-dist" type="number" min="1" max="25" step="0.5" value="${esc(String(p.maxDistanceKm))}" />
+          <span class="help">Runner requests beyond this distance will not be offered to you (platform cap: 10 km).</span></div>
+        <h3 style="margin-top:18px">Working hours</h3>
+        <div class="field" style="margin-top:10px"><label for="pf-hours">Preferred shifts</label>
+          <input class="input" id="pf-hours" value="${esc(p.hours)}" placeholder="${esc(hourOptions.join(', '))}" />
+          <span class="help">E.g. Morning (6am – 12pm), Evening (5pm – 10pm).</span></div>
+        <h3 style="margin-top:18px">Preferred order types</h3>
+        <div class="field" style="margin-top:10px"><label for="pf-cats">Categories</label>
+          <input class="input" id="pf-cats" value="${esc(p.categories)}" placeholder="${esc(catOptions.join(', '))}" />
+          <span class="help">Comma separated. Preferences are advisory — safety and eligibility rules always win.</span></div>
+        <div class="row" style="margin-top:16px"><button class="btn btn-primary" type="submit">Save preferences</button></div>
+      </form>
+    `);
+    PA.on('#prefs-form', 'submit', async (e) => {
+      e.preventDefault();
+      const btn = e.currentTarget.querySelector('button[type=submit]');
+      btn.disabled = true;
+      try {
+        const res = await PA.api('PATCH', '/runner/preferences', {
+          areas: document.getElementById('pf-areas').value,
+          pincodes: document.getElementById('pf-pins').value,
+          hours: document.getElementById('pf-hours').value,
+          categories: document.getElementById('pf-cats').value,
+          maxDistanceKm: Number(document.getElementById('pf-dist').value)
+        });
+        PA.toast(res.message || 'Preferences saved.');
+        PA.render();
+      } catch (err) { btn.disabled = false; PA.toast(err.message, 'err'); }
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Safety & support                                                   */
+  /* ------------------------------------------------------------------ */
+  async function safety(match, ctx) {
+    const data = await PA.api('GET', '/runner/safety/tickets');
+    if (!ctx.isCurrent()) return;
+    const statusTone = (s) => s === 'resolved' || s === 'closed' ? 'green' : s === 'open' ? 'amber' : 'grey';
+    PA.set(`
+      <div class="space-between"><div><h1>Safety & support</h1>
+        <p class="muted small">Report unsafe situations, accidents or delivery problems. Safety reports are handled with priority.</p></div>
+        <button class="btn btn-danger" id="new-report">Report an incident</button></div>
+      <div class="grid g3">
+        <div class="card"><h3>🚨 Emergency</h3>
+          <p class="muted small" style="margin-top:8px">In an emergency, contact local emergency services first (112 in India), then report the incident here so support can act on the delivery.</p></div>
+        <div class="card"><h3>🛡️ Unsafe delivery</h3>
+          <p class="muted small" style="margin-top:8px">Never risk your safety to meet an estimate. Report unsafe routes, aggressive customers or unsafe handovers — support can suspend the delivery.</p></div>
+        <div class="card"><h3>📦 Delivery problems</h3>
+          <p class="muted small" style="margin-top:8px">Damaged parcels, wrong addresses or shop issues go through the same report form and reach the right support team.</p></div>
+      </div>
+      <div class="card">
+        <h3>My reports</h3>
+        ${data.tickets.length ? `<div class="list" style="margin-top:10px">${data.tickets.map((t) => `
+          <div class="item">
+            <span class="emoji">${t.category === 'safety' ? '🚨' : t.category === 'accident' ? '⚠️' : '📩'}</span>
+            <div class="grow"><b>${esc(t.subject)}</b>
+              <div class="muted small mono">${esc(t.code)} · ${esc(t.category)} · ${PA.dateTime(t.createdAt)}</div></div>
+            ${PA.badge(t.status.replace('_', ' '), statusTone(t.status))}
+            <button class="btn btn-sm" data-ticket="${esc(t.code)}">Open</button>
+          </div>`).join('')}</div>`
+          : PA.empty('🛡️', 'No reports filed', 'Everything is fine so far. File a report any time you need help.')}
+      </div>
+    `);
+
+    PA.on('#new-report', 'click', () => {
+      PA.modal({
+        title: 'Report an incident',
+        body: `
+          <div class="field"><label for="sr-cat">Category</label>
+            <select class="input" id="sr-cat">
+              <option value="safety">Unsafe situation</option>
+              <option value="accident">Accident or incident</option>
+              <option value="customer">Customer-related problem</option>
+              <option value="seller">Seller/shop problem</option>
+              <option value="delivery">Damaged or wrong parcel</option>
+              <option value="general">Other</option>
+            </select></div>
+          <div class="field"><label for="sr-subject">Subject</label>
+            <input class="input" id="sr-subject" placeholder="Short summary" /></div>
+          <div class="field"><label for="sr-desc">What happened?</label>
+            <textarea class="input" id="sr-desc" rows="4" placeholder="Describe the situation — include the order code if it relates to a delivery."></textarea></div>`,
+        actions: [
+          { label: 'Cancel' },
+          {
+            label: 'Send report', primary: true, onClick: async (back) => {
+              try {
+                const res = await PA.api('POST', '/runner/safety/tickets', {
+                  category: back.querySelector('#sr-cat').value,
+                  subject: back.querySelector('#sr-subject').value,
+                  description: back.querySelector('#sr-desc').value
+                });
+                PA.toast(res.message || 'Report sent.');
+                PA.render();
+              } catch (err) { PA.toast(err.message, 'err'); return true; }
+            }
+          }
+        ]
+      });
+    });
+
+    PA.onAll('[data-ticket]', 'click', async (e) => {
+      const code = e.currentTarget.dataset.ticket;
+      try {
+        const data = await PA.api('GET', `/runner/safety/tickets/${encodeURIComponent(code)}`);
+        const t = data.ticket;
+        PA.modal({
+          title: `${t.code} · ${t.subject}`,
+          body: `<div class="list">${t.messages.map((m) => `
+            <div class="item"><span class="emoji">${m.authorRole === 'runner' ? '🛵' : '🎧'}</span>
+              <div class="grow"><b>${esc(m.authorName)} ${m.authorRole === 'runner' ? '(you)' : '(support)'}</b>
+                <div class="small">${esc(m.body)}</div>
+                <div class="muted small">${PA.dateTime(m.at)}</div></div></div>`).join('')}</div>
+            ${t.status !== 'closed' ? `<div class="field" style="margin-top:12px"><label for="tr-reply">Add a reply</label>
+              <textarea class="input" id="tr-reply" rows="3"></textarea></div>` : '<p class="muted small">This ticket is closed.</p>'}`,
+          actions: [
+            { label: 'Close' },
+            ...(t.status !== 'closed' ? [{
+              label: 'Send reply', primary: true, onClick: async (back) => {
+                const body = back.querySelector('#tr-reply').value.trim();
+                if (!body) { PA.toast('Write a reply first.', 'warn'); return true; }
+                try {
+                  await PA.api('POST', `/runner/safety/tickets/${encodeURIComponent(code)}/reply`, { body });
+                  PA.toast('Reply sent.');
+                  PA.render();
+                } catch (err) { PA.toast(err.message, 'err'); return true; }
+              }
+            }] : [])
+          ]
+        });
+      } catch (err) { PA.toast(err.message, 'err'); }
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Notifications                                                      */
+  /* ------------------------------------------------------------------ */
+  async function notifications(match, ctx) {
+    const data = await PA.api('GET', '/runner/notifications');
+    if (!ctx.isCurrent()) return;
+    PA.badges({ notifications: data.unread });
+    PA.set(`
+      <div class="space-between"><div><h1>Notifications</h1>
+        <p class="muted small">${data.unread} unread. Delivery offers, payout updates and support replies arrive here.</p></div>
+        ${data.unread ? '<button class="btn" id="mark-read">Mark all as read</button>' : ''}</div>
+      ${data.notifications.length ? `<div class="card flush"><div class="list">${data.notifications.map((n) => `
+        <div class="item" style="${n.read ? 'opacity:.72' : ''}">
+          <span class="emoji">${n.type === 'runner' ? '🛵' : n.type === 'payout' ? '💰' : n.type === 'support' ? '🎧' : '🔔'}</span>
+          <div class="grow"><b>${esc(n.title)}</b>
+            <div class="muted small">${esc(n.body)}</div>
+            <div class="muted small">${PA.dateTime(n.at)}</div></div>
+          ${n.read ? '' : PA.badge('New', 'amber')}
+        </div>`).join('')}</div></div>`
+        : `<div class="card">${PA.empty('🔔', 'No notifications yet', 'Offers, payout updates and support replies will show up here.')}</div>`}
+    `);
+    PA.on('#mark-read', 'click', async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        await PA.api('POST', '/runner/notifications/read', {});
+        PA.toast('All notifications marked as read.');
+        PA.render();
+      } catch (err) { e.currentTarget.disabled = false; PA.toast(err.message, 'err'); }
+    });
+  }
+
   PA.start({
     mode: 'runner',
     title: 'Runner Portal',
@@ -300,6 +588,11 @@
       [/^\/overview$/, overview],
       [/^\/jobs\/([A-Za-z0-9-]+)$/, jobDetail],
       [/^\/history$/, history],
+      [/^\/earnings$/, earnings],
+      [/^\/payouts$/, payouts],
+      [/^\/preferences$/, preferences],
+      [/^\/safety$/, safety],
+      [/^\/notifications$/, notifications],
       [/^\/profile$/, profile]
     ]
   });
