@@ -428,6 +428,15 @@ async function act(c, code, action, extra = {}) {
   return c.req(`/api/partner/seller/orders/${encodeURIComponent(code)}/action`, { body: { action, ...extra } });
 }
 
+async function packAll(c, code) {
+  const packing = must(await get(c, `/api/partner/seller/orders/${encodeURIComponent(code)}/packing`), 200, 'packing checklist');
+  for (const item of packing.items) {
+    must(await c.req(`/api/partner/seller/orders/${encodeURIComponent(code)}/packing`, { body: { itemId: item.orderItemId, packedQty: item.orderedQty, missingQty: 0, status: 'packed' } }), 200, 'mark packed');
+  }
+  const after = must(await get(c, `/api/partner/seller/orders/${encodeURIComponent(code)}/packing`), 200, 'packing complete');
+  assert.equal(after.summary.complete, true, 'packing checklist is complete before ready');
+}
+
 async function addAndOrder(productId, qty) {
   const c = S.customer;
   must(await c.req('/api/customer/cart/items', { body: { productId, qty } }), 200, 'cart add');
@@ -487,6 +496,7 @@ test('journey 9 — stock is reserved, deducted and released exactly once', asyn
 
   // A rejected order returns its units to the shelf.
   must(await act(S.sellerA, S.soA.code, 'prepare'), 200, 'prepare');
+  await packAll(S.sellerA, S.soA.code);
   must(await act(S.sellerA, S.soA.code, 'ready'), 200, 'ready');
 
   const spare = S.pick.b;
@@ -645,6 +655,7 @@ test('journey 13 — a delivered order can be returned, refunded and reviewed', 
   assert.ok(so, 'the returnable order reached its shop');
   must(await act(seller, so.code, 'accept'), 200, 'accept');
   must(await act(seller, so.code, 'prepare'), 200, 'prepare');
+  await packAll(seller, so.code);
   must(await act(seller, so.code, 'ready'), 200, 'ready');
   must(await act(seller, so.code, 'self_deliver'), 200, 'shop dispatches with its own rider');
 

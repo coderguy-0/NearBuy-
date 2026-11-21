@@ -500,7 +500,313 @@ CREATE TABLE IF NOT EXISTS nb_runners (
   completed INTEGER NOT NULL DEFAULT 0,
   active INTEGER NOT NULL DEFAULT 1
 );
+
+/* ------------------------------------------------------------------ */
+/* Seller Hub extension tables (shared DB, seller/shop scoped)         */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS nb_seller_verifications (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES nb_users(id) ON DELETE CASCADE,
+  shop_id TEXT REFERENCES nb_shops(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'documents_pending',
+  legal_name TEXT,
+  business_category TEXT,
+  shop_type TEXT,
+  description TEXT,
+  address TEXT,
+  pincode TEXT,
+  city TEXT,
+  state TEXT,
+  country TEXT DEFAULT 'India',
+  lat REAL,
+  lng REAL,
+  contact_number TEXT,
+  business_email TEXT,
+  ownership_type TEXT,
+  pan_number TEXT,
+  gst_number TEXT,
+  reason TEXT,
+  submitted_at TEXT,
+  reviewed_at TEXT,
+  reviewer_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verif_user ON nb_seller_verifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_verif_status ON nb_seller_verifications(status);
+
+CREATE TABLE IF NOT EXISTS nb_seller_documents (
+  id TEXT PRIMARY KEY,
+  verification_id TEXT NOT NULL REFERENCES nb_seller_verifications(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  shop_id TEXT,
+  doc_type TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  file_type TEXT,
+  file_size INTEGER,
+  storage_ref TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_docs_verif ON nb_seller_documents(verification_id);
+
+CREATE TABLE IF NOT EXISTS nb_shop_hours (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id TEXT NOT NULL REFERENCES nb_shops(id) ON DELETE CASCADE,
+  day_of_week INTEGER NOT NULL,
+  open_time TEXT NOT NULL DEFAULT '09:00',
+  close_time TEXT NOT NULL DEFAULT '21:00',
+  break_start TEXT,
+  break_end TEXT,
+  shifts_json TEXT NOT NULL DEFAULT '[]',
+  closed INTEGER NOT NULL DEFAULT 0,
+  holiday_date TEXT,
+  holiday_label TEXT,
+  UNIQUE (shop_id, day_of_week, holiday_date)
+);
+CREATE INDEX IF NOT EXISTS idx_hours_shop ON nb_shop_hours(shop_id);
+
+CREATE TABLE IF NOT EXISTS nb_shop_service_areas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id TEXT NOT NULL REFERENCES nb_shops(id) ON DELETE CASCADE,
+  pincode TEXT NOT NULL,
+  locality TEXT,
+  city TEXT,
+  lat REAL,
+  lng REAL,
+  radius_km REAL,
+  active INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (shop_id, pincode)
+);
+
+CREATE TABLE IF NOT EXISTS nb_inventory_transactions (
+  id TEXT PRIMARY KEY,
+  shop_id TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  actor_user_id TEXT,
+  actor_name TEXT,
+  type TEXT NOT NULL,
+  previous_qty INTEGER NOT NULL,
+  new_qty INTEGER NOT NULL,
+  delta INTEGER NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inv_shop ON nb_inventory_transactions(shop_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_inv_product ON nb_inventory_transactions(product_id, created_at);
+
+CREATE TABLE IF NOT EXISTS nb_scanner_devices (
+  id TEXT PRIMARY KEY,
+  shop_id TEXT NOT NULL REFERENCES nb_shops(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  device_type TEXT NOT NULL DEFAULT 'usb_keyboard',
+  status TEXT NOT NULL DEFAULT 'registered',
+  last_active_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scanner_shop ON nb_scanner_devices(shop_id);
+
+CREATE TABLE IF NOT EXISTS nb_scanner_events (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL UNIQUE,
+  shop_id TEXT NOT NULL,
+  device_id TEXT,
+  code TEXT NOT NULL,
+  product_id TEXT,
+  order_code TEXT,
+  action TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  actor_user_id TEXT,
+  quantity INTEGER,
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  confirmed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scan_shop ON nb_scanner_events(shop_id, created_at);
+
+CREATE TABLE IF NOT EXISTS nb_packing_items (
+  id TEXT PRIMARY KEY,
+  seller_order_id TEXT NOT NULL REFERENCES nb_seller_orders(id) ON DELETE CASCADE,
+  order_item_id TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  ordered_qty INTEGER NOT NULL,
+  packed_qty INTEGER NOT NULL DEFAULT 0,
+  missing_qty INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  note TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE (seller_order_id, order_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS nb_settlements (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  shop_id TEXT NOT NULL REFERENCES nb_shops(id) ON DELETE CASCADE,
+  period_start TEXT NOT NULL,
+  period_end TEXT NOT NULL,
+  gross_paise INTEGER NOT NULL DEFAULT 0,
+  refunds_paise INTEGER NOT NULL DEFAULT 0,
+  commission_paise INTEGER NOT NULL DEFAULT 0,
+  adjustments_paise INTEGER NOT NULL DEFAULT 0,
+  net_paise INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  bank_reference TEXT,
+  payout_date TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_settle_shop ON nb_settlements(shop_id, created_at);
+
+CREATE TABLE IF NOT EXISTS nb_settlement_items (
+  id TEXT PRIMARY KEY,
+  settlement_id TEXT NOT NULL REFERENCES nb_settlements(id) ON DELETE CASCADE,
+  seller_order_id TEXT NOT NULL,
+  gross_paise INTEGER NOT NULL DEFAULT 0,
+  refund_paise INTEGER NOT NULL DEFAULT 0,
+  commission_paise INTEGER NOT NULL DEFAULT 0,
+  net_paise INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS nb_shop_staff (
+  id TEXT PRIMARY KEY,
+  shop_id TEXT NOT NULL REFERENCES nb_shops(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL UNIQUE REFERENCES nb_users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'sales_staff',
+  permissions_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_staff_shop ON nb_shop_staff(shop_id);
+
+CREATE TABLE IF NOT EXISTS nb_seller_tickets (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL REFERENCES nb_users(id) ON DELETE CASCADE,
+  shop_id TEXT NOT NULL REFERENCES nb_shops(id) ON DELETE CASCADE,
+  order_code TEXT,
+  category TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  description TEXT NOT NULL,
+  attachment TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  assigned_agent TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sticket_user ON nb_seller_tickets(user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS nb_seller_ticket_messages (
+  id TEXT PRIMARY KEY,
+  ticket_id TEXT NOT NULL REFERENCES nb_seller_tickets(id) ON DELETE CASCADE,
+  author_role TEXT NOT NULL,
+  author_name TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nb_order_receipts (
+  id TEXT PRIMARY KEY,
+  seller_order_id TEXT NOT NULL UNIQUE REFERENCES nb_seller_orders(id) ON DELETE CASCADE,
+  order_id TEXT NOT NULL,
+  shop_id TEXT NOT NULL,
+  receipt_number TEXT NOT NULL,
+  doc_type TEXT NOT NULL DEFAULT 'order_receipt',
+  issued_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nb_seller_notification_prefs (
+  user_id TEXT PRIMARY KEY REFERENCES nb_users(id) ON DELETE CASCADE,
+  in_app INTEGER NOT NULL DEFAULT 1,
+  email INTEGER NOT NULL DEFAULT 0,
+  sms INTEGER NOT NULL DEFAULT 0,
+  whatsapp INTEGER NOT NULL DEFAULT 0,
+  order_alerts INTEGER NOT NULL DEFAULT 1,
+  stock_alerts INTEGER NOT NULL DEFAULT 1,
+  payment_alerts INTEGER NOT NULL DEFAULT 1,
+  runner_alerts INTEGER NOT NULL DEFAULT 1,
+  marketing INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nb_shop_financial_settings (
+  shop_id TEXT PRIMARY KEY REFERENCES nb_shops(id) ON DELETE CASCADE,
+  commission_rate REAL NOT NULL DEFAULT 0,
+  bank_name TEXT,
+  bank_account_last4 TEXT,
+  bank_ifsc TEXT,
+  bank_status TEXT NOT NULL DEFAULT 'not_submitted',
+  settlement_preference TEXT NOT NULL DEFAULT 'weekly',
+  tax_config_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
 `);
+
+/* Idempotent column migrations for existing databases. */
+function addColumn(table, column, definition) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+addColumn('nb_products', 'sku', 'TEXT');
+addColumn('nb_products', 'barcode', 'TEXT');
+addColumn('nb_products', 'parent_product_id', 'TEXT');
+addColumn('nb_products', 'subcategory', 'TEXT');
+addColumn('nb_products', 'weight_grams', 'INTEGER');
+addColumn('nb_products', 'dimensions', 'TEXT');
+addColumn('nb_products', 'max_stock', 'INTEGER');
+addColumn('nb_products', 'archived', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('nb_shops', 'logo_url', 'TEXT');
+addColumn('nb_shops', 'cover_url', 'TEXT');
+addColumn('nb_shops', 'about_text', 'TEXT');
+addColumn('nb_shops', 'return_policy', 'TEXT');
+addColumn('nb_shops', 'pickup_instructions', 'TEXT');
+addColumn('nb_shops', 'delivery_info', 'TEXT');
+addColumn('nb_shops', 'support_contact', 'TEXT');
+addColumn('nb_shops', 'business_email', 'TEXT');
+addColumn('nb_shops', 'legal_name', 'TEXT');
+addColumn('nb_shops', 'ownership_type', 'TEXT');
+addColumn('nb_shops', 'seller_code', 'TEXT');
+addColumn('nb_shops', 'shop_code', 'TEXT');
+addColumn('nb_shops', 'commission_rate', 'REAL NOT NULL DEFAULT 0');
+addColumn('nb_shops', 'bank_name', 'TEXT');
+addColumn('nb_shops', 'bank_account_last4', 'TEXT');
+addColumn('nb_shops', 'bank_ifsc', 'TEXT');
+addColumn('nb_shops', 'bank_status', 'TEXT NOT NULL DEFAULT \'not_submitted\'');
+addColumn('nb_shops', 'temporary_closure_until', 'TEXT');
+addColumn('nb_shops', 'holiday_date', 'TEXT');
+addColumn('nb_shops', 'holiday_label', 'TEXT');
+addColumn('nb_shops', 'self_delivery_enabled', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('nb_shops', 'runner_enabled', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('nb_coupons', 'promo_type', 'TEXT');
+addColumn('nb_coupons', 'product_ids', 'TEXT');
+addColumn('nb_coupons', 'category_slugs', 'TEXT');
+addColumn('nb_coupons', 'buy_qty', 'INTEGER');
+addColumn('nb_coupons', 'get_qty', 'INTEGER');
+addColumn('nb_coupons', 'eligibility', 'TEXT');
+addColumn('nb_reviews', 'seller_reply', 'TEXT');
+addColumn('nb_reviews', 'seller_reply_at', 'TEXT');
+addColumn('nb_scanner_devices', 'device_serial', 'TEXT');
+addColumn('nb_reviews', 'reported_at', 'TEXT');
+addColumn('nb_reviews', 'reported_reason', 'TEXT');
+addColumn('nb_seller_orders', 'delivery_staff_id', 'TEXT');
+addColumn('nb_seller_orders', 'delivery_staff_name', 'TEXT');
+addColumn('nb_seller_orders', 'packages_count', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('nb_seller_orders', 'weight_grams', 'INTEGER');
+addColumn('nb_seller_orders', 'requested_timing', 'TEXT');
+addColumn('nb_seller_orders', 'runner_charges_paise', 'INTEGER');
+addColumn('nb_seller_orders', 'handover_confirmed_at', 'TEXT');
+addColumn('nb_seller_orders', 'handover_confirmed_by', 'TEXT');
+addColumn('nb_seller_orders', 'packing_complete', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('nb_seller_orders', 'partial_fulfillment', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('nb_seller_orders', 'partial_note', 'TEXT');
+addColumn('nb_order_items', 'packed_qty', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('nb_order_items', 'missing_qty', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('nb_order_items', 'packed_status', 'TEXT NOT NULL DEFAULT \'pending\'');
+addColumn('nb_users', 'two_factor_enabled', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('nb_sessions', 'ip', 'TEXT');
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */

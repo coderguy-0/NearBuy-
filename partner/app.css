@@ -346,3 +346,56 @@ table.data td.num, table.data th.num { text-align: right; }
   body { background: #fff; }
   .card { box-shadow: none; }
 }
+
+/* ------------------------------------------------- Seller Hub additions */
+:root {
+  --cyan: #13bde5;
+  --secondary: #62758b;
+  --warning: #f59e0b;
+  --error: #e5484d;
+}
+.muted-2 { color: var(--secondary); }
+.page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.page-head h1 { margin-bottom: 2px; }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.tabs a, .tabs button {
+  border: 1px solid var(--border); background: #fff; color: var(--navy);
+  padding: 7px 13px; border-radius: 999px; font: 700 12.5px/1 inherit; cursor: pointer; text-decoration: none;
+}
+.tabs a:hover, .tabs button:hover { text-decoration: none; border-color: #b9d4ee; }
+.tabs a[aria-current='page'], .tabs button[aria-current='page'] { background: var(--navy); border-color: var(--navy); color: #fff; }
+.kpi-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+.kpi { background: #fff; border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow); display: grid; gap: 3px; }
+.kpi .label { font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.kpi .value { font-size: 24px; font-weight: 800; color: var(--deep); letter-spacing: -.02em; }
+.kpi .hint { font-size: 12px; color: var(--muted); }
+.kpi.accent { border-top: 4px solid var(--bright); }
+.kpi.green { border-top: 4px solid var(--green); }
+.kpi.amber { border-top: 4px solid var(--amber); }
+.kpi.red { border-top: 4px solid var(--error); }
+.chart-card svg { width: 100%; height: auto; display: block; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; }
+.pack-row { display: grid; grid-template-columns: minmax(0, 1fr) 110px 110px 130px; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #eef5fc; }
+.pack-row:last-child { border-bottom: 0; }
+.pack-row .num-input { width: 100%; }
+.progress { height: 8px; border-radius: 999px; background: #e8f1fb; overflow: hidden; }
+.progress > span { display: block; height: 100%; background: linear-gradient(90deg, var(--bright), var(--cyan)); border-radius: 999px; }
+.scan-box { border: 2px dashed #b9d4ee; border-radius: var(--radius); padding: 18px; background: #f7fbff; display: grid; gap: 12px; }
+.map-box { border: 1px solid var(--border); border-radius: var(--radius); background: #eef6ff; padding: 10px; }
+.map-box svg { width: 100%; height: auto; display: block; }
+.stepper { display: flex; gap: 8px; flex-wrap: wrap; }
+.stepper .step { flex: 1; min-width: 140px; border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; background: #fff; font-size: 12.5px; }
+.stepper .step.active { border-color: var(--blue); background: var(--tint); }
+.stepper .step.done { border-color: #bfe9d0; background: #eefaf2; }
+.stepper .step b { display: block; font-size: 13px; color: var(--deep); }
+.switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #eef5fc; }
+.switch-row:last-child { border-bottom: 0; }
+.switch-row .desc { font-size: 12px; color: var(--muted); }
+input[type='checkbox'].switch { width: 42px; height: 24px; appearance: none; border-radius: 999px; background: #d5e3f2; position: relative; cursor: pointer; flex: none; }
+input[type='checkbox'].switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+input[type='checkbox'].switch:checked { background: var(--blue); }
+input[type='checkbox'].switch:checked::after { left: 21px; }
+@media (max-width: 720px) {
+  .pack-row { grid-template-columns: minmax(0, 1fr) 90px; }
+}
