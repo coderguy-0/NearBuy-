@@ -14,6 +14,7 @@
     { href: '#/shops', label: 'Shops', icon: 'shop' },
     { href: '#/catalogue', label: 'Catalogue', icon: 'box' },
     { href: '#/deliveries', label: 'Deliveries', icon: 'bike' },
+    { href: '#/runners', label: 'Runners & payouts', icon: 'route' },
     { href: '#/returns', label: 'Returns & refunds', icon: 'rotate' },
     { href: '#/support', label: 'Support & reviews', icon: 'ticket' },
     { href: '#/marketing', label: 'Marketing', icon: 'tag' },
@@ -593,6 +594,128 @@
     });
   }
 
+  /* ------------------------------------------------- runners & payouts */
+  async function runners(match, ctx) {
+    const [runnerData, ticketData, payoutData] = await Promise.all([
+      PA.api('GET', '/runners'),
+      PA.api('GET', '/runner-tickets'),
+      PA.api('GET', '/payouts')
+    ]);
+    if (!ctx.isCurrent()) return;
+    const statusTone = (s) => s === 'completed' || s === 'resolved' || s === 'closed' ? 'green' : s === 'failed' || s === 'suspended' ? 'red' : s === 'open' || s === 'pending' ? 'amber' : 'grey';
+    PA.set(`
+      <div class="space-between"><div><h1>Runners & payouts</h1>
+        <p class="muted small">Delivery partner accounts, safety reports and payout processing on the shared platform.</p></div></div>
+
+      <div class="card flush">
+        <div class="card-head"><h2>Delivery partners</h2></div>
+        ${table(['Partner', 'Status', 'Deliveries', 'Earned', 'Rating', 'Actions'], runnerData.runners.map((r) => `<tr>
+          <td><b>${esc(r.name)}</b><div class="muted small">${esc(r.email)} · ${esc(r.vehicle || '—')} · joined ${PA.dateTime(r.joinedAt)}</div></td>
+          <td>${PA.badge(r.accountStatus === 'suspended' ? 'suspended' : r.status, statusTone(r.accountStatus === 'suspended' ? 'suspended' : r.status))}</td>
+          <td class="num">${r.deliveries}</td>
+          <td class="num">${PA.money(r.earned)}</td>
+          <td class="num">${r.rating != null ? r.rating.toFixed(1) : '—'}</td>
+          <td>${r.accountStatus === 'suspended'
+            ? `<button class="btn btn-sm btn-success" data-runner="${esc(r.userId)}" data-act="reactivate">Reactivate</button>`
+            : `<button class="btn btn-sm btn-danger" data-runner="${esc(r.userId)}" data-act="suspend">Suspend</button>`}</td>
+        </tr>`), '<div class="card-body muted small">No delivery partners registered yet.</div>')}
+      </div>
+
+      <div class="card flush">
+        <div class="card-head"><h2>Runner safety & support reports</h2></div>
+        ${table(['Ticket', 'Runner', 'Category', 'Status', 'Updated', 'Actions'], ticketData.tickets.map((t) => `<tr>
+          <td><b>${esc(t.subject)}</b><div class="muted small mono">${esc(t.code)}</div></td>
+          <td class="small">${esc(t.runner)}</td>
+          <td class="small">${esc(t.category)}</td>
+          <td>${PA.badge(t.status.replace('_', ' '), statusTone(t.status))}</td>
+          <td class="small">${PA.dateTime(t.updatedAt)}</td>
+          <td><button class="btn btn-sm" data-rticket="${esc(t.code)}">Open</button></td>
+        </tr>`), '<div class="card-body muted small">No runner reports.</div>')}
+      </div>
+
+      <div class="card flush">
+        <div class="card-head"><h2>Runner payouts</h2><span class="muted small" style="margin-left:10px">Never mark a payout completed without the real bank/UPI reference.</span></div>
+        ${table(['Runner', 'Period', 'Net', 'Status', 'Reference', 'Requested', 'Actions'], payoutData.payouts.map((p) => `<tr>
+          <td><b>${esc(p.runner)}</b></td>
+          <td class="small">${esc(p.period)}</td>
+          <td class="num"><b>${PA.money(p.net)}</b></td>
+          <td>${PA.badge(p.status.replace('_', ' '), statusTone(p.status))}</td>
+          <td class="small mono">${p.reference ? esc(p.reference) : '—'}</td>
+          <td class="small">${PA.dateTime(p.createdAt)}</td>
+          <td>${p.status === 'completed' ? '—' : `
+            <div class="row tight">
+              <button class="btn btn-sm" data-payout="${esc(p.id)}" data-status="processing">Processing</button>
+              <button class="btn btn-sm btn-success" data-payout="${esc(p.id)}" data-status="completed">Complete</button>
+              <button class="btn btn-sm btn-danger" data-payout="${esc(p.id)}" data-status="failed">Fail</button>
+            </div>`}</td>
+        </tr>`), '<div class="card-body muted small">No payout requests yet.</div>')}
+      </div>
+    `);
+
+    PA.onAll('[data-runner]', 'click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await PA.api('PATCH', `/runners/${encodeURIComponent(btn.dataset.runner)}`, { active: btn.dataset.act === 'reactivate' });
+        PA.toast(res.message || 'Updated.');
+        PA.render();
+      } catch (err) { btn.disabled = false; PA.toast(err.message, 'err'); }
+    });
+
+    PA.onAll('[data-rticket]', 'click', async (e) => {
+      const code = e.currentTarget.dataset.rticket;
+      try {
+        const data = await PA.api('GET', `/runner-tickets/${encodeURIComponent(code)}`);
+        const t = data.ticket;
+        PA.modal({
+          title: `${t.code} · ${t.subject}`,
+          wide: true,
+          body: `<div class="list">${t.messages.map((m) => `
+            <div class="item"><span class="emoji">${m.authorRole === 'runner' ? '🛵' : '🎧'}</span>
+              <div class="grow"><b>${esc(m.authorName)} (${esc(m.authorRole)})</b>
+                <div class="small">${esc(m.body)}</div>
+                <div class="muted small">${PA.dateTime(m.at)}</div></div></div>`).join('')}</div>
+            <div class="field"><label for="at-reply">Reply to runner</label><textarea class="input" id="at-reply" rows="3"></textarea></div>
+            <div class="field"><label for="at-status">Ticket status</label>
+              <select class="input" id="at-status">
+                ${['open', 'assigned', 'in_progress', 'awaiting_runner', 'resolved', 'closed'].map((s) => `<option value="${s}" ${s === t.status ? 'selected' : ''}>${s.replace('_', ' ')}</option>`).join('')}
+              </select></div>`,
+          actions: [
+            { label: 'Close' },
+            {
+              label: 'Save', primary: true, onClick: async (back) => {
+                try {
+                  const body = back.querySelector('#at-reply').value.trim();
+                  const status = back.querySelector('#at-status').value;
+                  if (body) await PA.api('POST', `/runner-tickets/${encodeURIComponent(code)}/reply`, { body });
+                  if (status !== t.status) await PA.api('POST', `/runner-tickets/${encodeURIComponent(code)}/status`, { status, agent: 'Platform support' });
+                  PA.toast('Ticket updated.');
+                  PA.render();
+                } catch (err) { PA.toast(err.message, 'err'); return true; }
+              }
+            }
+          ]
+        });
+      } catch (err) { PA.toast(err.message, 'err'); }
+    });
+
+    PA.onAll('[data-payout]', 'click', async (e) => {
+      const btn = e.currentTarget;
+      const status = btn.dataset.status;
+      let reference = '';
+      if (status === 'completed') {
+        reference = await ask('Bank / UPI reference', 'Enter the real payout reference from the bank transfer or UPI run. A payout cannot be completed without it.');
+        if (!reference) return;
+      }
+      btn.disabled = true;
+      try {
+        const res = await PA.api('POST', `/payouts/${encodeURIComponent(btn.dataset.payout)}/status`, { status, reference });
+        PA.toast(res.message || 'Payout updated.');
+        PA.render();
+      } catch (err) { btn.disabled = false; PA.toast(err.message, 'err'); }
+    });
+  }
+
   function ask(title, help) {
     return new Promise((resolve) => {
       PA.modal({
@@ -620,6 +743,7 @@
       [/^\/shops$/, shops],
       [/^\/catalogue$/, catalogue],
       [/^\/deliveries$/, deliveries],
+      [/^\/runners$/, runners],
       [/^\/returns$/, returns],
       [/^\/support$/, support],
       [/^\/marketing$/, marketing],
