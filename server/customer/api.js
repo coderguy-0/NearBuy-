@@ -295,7 +295,8 @@ function productCard(row, opts = {}) {
     imageUrl: row.image_url, price: row.price_paise, mrp: row.mrp_paise, discount,
     taxRate: row.tax_rate, stock: available, lowStock: available > 0 && available <= row.low_stock,
     available: available > 0, returnDays: row.return_days, rating: row.rating, reviewCount: row.review_count,
-    shop: shop ? { id: shop.id, slug: shop.slug, name: shop.name, emoji: shop.emoji, tone: shop.tone, rating: shop.rating } : null,
+    highlights: parseJsonArray(row.highlights).slice(0, 3), specs: parseJsonArray(row.specs).slice(0, 3),
+    shop: shop ? { id: shop.id, slug: shop.slug, name: shop.name, emoji: shop.emoji, tone: shop.tone, rating: shop.rating, verified: Boolean(shop.verified), isOpen: Boolean(shop.is_open) } : null,
     distanceKm: opts.location && shop ? haversineKm(Number(opts.location.lat), Number(opts.location.lng), shop.lat, shop.lng) : null,
     deliveryEnabled: shop ? Boolean(shop.delivery_enabled) : false,
     pickupEnabled: shop ? Boolean(shop.pickup_enabled) : false,
@@ -422,6 +423,7 @@ function queryProducts({ location, q, category, shop, brand, minPrice, maxPrice,
   if (sort === 'price_low') items.sort((a, b) => a.price - b.price);
   else if (sort === 'price_high') items.sort((a, b) => b.price - a.price);
   else if (sort === 'rating') items.sort((a, b) => b.rating - a.rating || b.reviewCount - a.reviewCount);
+  else if (sort === 'popularity') items.sort((a, b) => b.reviewCount - a.reviewCount || b.rating - a.rating);
   else if (sort === 'discount') items.sort((a, b) => b.discount - a.discount);
   else if (sort === 'distance') items.sort((a, b) => (a.distanceKm == null ? 99 : a.distanceKm) - (b.distanceKm == null ? 99 : b.distanceKm));
   else if (sort === 'nearest') items.sort((a, b) => (a.distanceKm == null ? 99 : a.distanceKm) - (b.distanceKm == null ? 99 : b.distanceKm));

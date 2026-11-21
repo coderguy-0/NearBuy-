@@ -1,4 +1,4 @@
-/* Shops, catalogues, search and product detail with price comparison. */
+/* Shops, catalogues and product detail with price comparison. */
 (function () {
   'use strict';
   const NB = window.NB;
@@ -471,9 +471,6 @@
   }));
   NB.view(/^\/products$/, listingView({
     title: 'All products', eyebrow: 'Browse everything', description: 'Every product from the shops that deliver to your area.'
-  }));
-  NB.view(/^\/search$/, listingView({
-    title: 'Search results', eyebrow: 'Search results', description: 'Matching products from nearby shops.'
   }));
 
   /* ------------------------------------------------------------------ */

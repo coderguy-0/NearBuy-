@@ -47,7 +47,8 @@ links to it any more; every navigation path leads to the connected product above
 | Categories | `#/categories`, `#/categories/:slug` | Category grid and per-category listings with admin-configured subcategories |
 | Shops | `#/shops` | List **and** map view; filters for category, distance, rating, open now, delivery, pickup and verified |
 | Shop profile | `#/shop/:slug` | Cover, logo, hours ("closed · opens 09:00"), policies, catalogue, offers and reviews |
-| Products | `#/products`, `#/search` | Search with type-ahead suggestions, sorting (price, rating, discount, distance) and filters |
+| Products | `#/products` | Browse everything with the same filter rail and sorting |
+| Search results | `#/search` | Flipkart-style SRP: breadcrumb + “Showing 1–24 of N results” meta, sticky faceted rail (price range, category, brand, rating, availability, shop) with removable filter chips, sort ribbon (relevance, popularity, price, rating, discount), horizontal list cards with spec bullets, rating pill, NearBuy Assured badge, wishlist toggle, add-to-compare tray (up to 4, side-by-side modal), sponsored in-feed offer strip, numbered pagination and a “Did you find what you were looking for?” feedback widget. All filters serialize into the URL, so links are shareable and back/forward works |
 | Product | `#/product/:id` | Price, stock, delivery estimate, shop details, **Compare prices near you**, wishlist |
 | Offers | `#/offers` | Only live, non-expired coupons, with the shops and minimum baskets they apply to |
 | Cart | `#/cart` | One cart grouped by shop, delivery or free pickup per shop, server-quoted fees |

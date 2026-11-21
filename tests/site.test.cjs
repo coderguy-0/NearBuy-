@@ -79,6 +79,7 @@ const ASSETS = [
   '/customer/core.js',
   '/customer/views-home.js',
   '/customer/views-shop.js',
+  '/customer/views-search.js',
   '/customer/views-cart.js',
   '/customer/views-orders.js',
   '/customer/views-account.js',
