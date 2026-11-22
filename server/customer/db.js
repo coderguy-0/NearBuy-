@@ -829,6 +829,9 @@ addColumn('nb_shops', 'holiday_date', 'TEXT');
 addColumn('nb_shops', 'holiday_label', 'TEXT');
 addColumn('nb_shops', 'self_delivery_enabled', 'INTEGER NOT NULL DEFAULT 1');
 addColumn('nb_shops', 'runner_enabled', 'INTEGER NOT NULL DEFAULT 1');
+/* Public proprietor name shown on the storefront next to the shop's map pin. Separate
+ * from owner_user_id, which is only set when the seller also holds a NearBuy account. */
+addColumn('nb_shops', 'proprietor_name', 'TEXT');
 addColumn('nb_coupons', 'promo_type', 'TEXT');
 addColumn('nb_coupons', 'product_ids', 'TEXT');
 addColumn('nb_coupons', 'category_slugs', 'TEXT');

@@ -1903,6 +1903,7 @@
           ${PA.field('sp-logo', 'Logo URL', shop.logo_url || '', { placeholder: 'https://…/logo.png' })}
           ${PA.field('sp-cover', 'Cover image URL', shop.cover_url || '')}
           ${PA.field('sp-emoji', 'Emoji badge', shop.emoji || '🏪')}
+          ${PA.field('sp-owner', 'Owner / proprietor name', shop.proprietor_name || shop.ownerName || '', { placeholder: 'Shown on the customer map', help: 'Printed next to your shop pin so customers know who runs it.' })}
         </div>
         <div class="field"><label for="sp-about">About the shop</label><textarea class="input" id="sp-about" rows="3">${esc(shop.about_text || shop.description || '')}</textarea></div>
 
@@ -1942,6 +1943,7 @@
           about: $('#sp-about').value.trim(), description: $('#sp-about').value.trim(),
           address: $('#sp-address').value.trim(), locality: $('#sp-locality').value.trim(), city: $('#sp-city').value.trim(),
           pincode: $('#sp-pincode').value.trim(), lat: Number($('#sp-lat').value), lng: Number($('#sp-lng').value),
+          ownerName: $('#sp-owner').value.trim(),
           phone: $('#sp-phone').value.trim(), businessEmail: $('#sp-bemail').value.trim(), supportContact: $('#sp-support').value.trim(),
           returnPolicy: $('#sp-return-policy').value.trim(), pickupInstructions: $('#sp-pickup').value.trim(), deliveryInfo: $('#sp-delivery-info').value.trim()
         });

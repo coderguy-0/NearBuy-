@@ -49,7 +49,7 @@
             <div class="field"><label for="shopRating">Minimum rating</label><select id="shopRating" name="minRating"><option value="">Any rating</option>${[4.5, 4, 3.5, 3].map((r) => `<option value="${r}" ${String(r) === state.minRating ? 'selected' : ''}>${r}★ and above</option>`).join('')}</select></div>
             <button class="btn btn--primary btn--block" type="submit">Apply filters</button>
           </form>
-          <div class="filters__note">${NB.icon('info')} Distances use straight-line coordinates × 1.35. No live map or routing provider is configured.</div>
+          <div class="filters__note">${NB.icon('info')} Distances are straight-line, from your saved location. Open the <b>Map</b> view to see every shop to scale with its phone number and owner.</div>
         </aside>
         <div class="shop-results">
           <div class="results-bar">
@@ -98,38 +98,30 @@
               return;
             }
             results.innerHTML = data.shops.map(NB.shopCard).join('');
+            /* Decide which pane is visible *before* building the map: the projection
+             * measures the canvas, and a display:none element reports zero size. */
+            results.hidden = state.view === 'map';
+            map.hidden = state.view !== 'map';
             renderMap(data.shops);
             pager.innerHTML = data.pages > 1 ? `<button class="btn btn--ghost btn--sm" id="prevPage" ${state.page <= 1 ? 'disabled' : ''}>${NB.icon('arrowLeft')} Previous</button><span>Page ${data.page} of ${data.pages}</span><button class="btn btn--ghost btn--sm" id="nextPage" ${state.page >= data.pages ? 'disabled' : ''}>Next ${NB.icon('arrowRight')}</button>` : '';
             const prev = NB.$('#prevPage', pager); const next = NB.$('#nextPage', pager);
             if (prev) prev.addEventListener('click', () => { state.page -= 1; load(); });
             if (next) next.addEventListener('click', () => { state.page += 1; load(); });
-            results.hidden = state.view === 'map';
-            map.hidden = state.view !== 'map';
           } catch (err) {
             results.innerHTML = NB.errorView(err);
             const retry = NB.$('#retryView', results); if (retry) retry.addEventListener('click', load);
           }
         }
 
+        let mapCtl = null;
         function renderMap(shops) {
-          const pts = shops.filter((s) => Number.isFinite(s.lat) && Number.isFinite(s.lng));
-          if (!pts.length) { map.innerHTML = `<div class="shop-map__empty">No coordinates are available for these shops.</div>`; return; }
-          const lats = pts.map((s) => s.lat); const lngs = pts.map((s) => s.lng);
-          const minLat = Math.min(...lats), maxLat = Math.max(...lats);
-          const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
-          const spread = (a, b) => (b - a) || 0.01;
-          map.innerHTML = `
-            <div class="map-canvas" role="img" aria-label="Schematic map of nearby shops">
-              <div class="map-grid-lines"></div>
-              <div class="map-loc">${NB.icon('location')} ${NB.esc(NB.state.location?.locality || 'Your area')}</div>
-              ${pts.map((s) => {
-                const x = 10 + ((s.lng - minLng) / spread(minLng, maxLng)) * 80;
-                const y = 88 - ((s.lat - minLat) / spread(minLat, maxLat)) * 76;
-                return `<a class="map-pin tone-${s.tone}" href="#/shop/${encodeURIComponent(s.slug)}" style="left:${x}%;top:${y}%" title="${NB.esc(s.name)} · ${s.distanceKm != null ? s.distanceKm + ' km' : ''}">
-                  <span class="map-pin__dot">${NB.esc(s.emoji || '🏪')}</span><span class="map-pin__label">${NB.esc(s.name)}<small>${s.distanceKm != null ? s.distanceKm + ' km' : ''}</small></span></a>`;
-              }).join('')}
-            </div>
-            <p class="map-note">${NB.icon('info')} Schematic map built from shop coordinates. A live map-tile and routing provider is not connected in this deployment.</p>`;
+          map.innerHTML = NB.shopMap(shops, {
+            title: 'Shops near you',
+            subtitle: NB.state.location
+              ? `From ${NB.state.location.locality || NB.state.location.pincode} · to scale`
+              : 'Set your location to see distances'
+          });
+          mapCtl = NB.wireShopMap(map, shops);
         }
 
         function syncForm() {
@@ -159,6 +151,8 @@
           NB.$$('[data-view]', root).forEach((x) => x.classList.toggle('is-active', x === b));
           results.hidden = state.view === 'map';
           map.hidden = state.view !== 'map';
+          /* the canvas was display:none a moment ago, so its measured size changed */
+          if (mapCtl) mapCtl.redraw();
         }));
         load();
       }
@@ -229,12 +223,19 @@
           </section>
         </div>
         <aside class="shop-detail__side">
+          <div class="side-card side-card--flush">
+            <h3>${NB.icon('map')} Find this shop</h3>
+            ${NB.shopMap([s], {
+              selected: s.slug,
+              title: s.name,
+              subtitle: s.distanceKm != null ? `${s.distanceKm} km from you` : (NB.state.location ? 'To scale' : 'Set your location for a distance')
+            })}
+          </div>
           <div class="side-card">
             <h3>Shop information</h3>
             <dl class="info-list">
-              <div><dt>Address</dt><dd>${NB.esc(s.address)}<br>${NB.esc(s.locality)}, ${NB.esc(s.city)} — ${NB.esc(s.pincode)}</dd></div>
+              <div><dt>Owner</dt><dd>${s.ownerName ? NB.esc(s.ownerName) : 'Not listed'}</dd></div>
               <div><dt>Timings</dt><dd>${s.opensAt}–${s.closesAt} daily</dd></div>
-              <div><dt>Contact</dt><dd>${s.phone ? `<a href="tel:${NB.esc(s.phone)}">${NB.esc(s.phone)}</a>` : 'Not listed'}</dd></div>
               <div><dt>Delivery</dt><dd>${data.policies.delivery}</dd></div>
               <div><dt>Pickup</dt><dd>${data.policies.pickup}</dd></div>
               <div><dt>Minimum order</dt><dd>${s.minOrder ? NB.money(s.minOrder) : 'No minimum'}</dd></div>
@@ -257,6 +258,7 @@
       title: s.name,
       html,
       after(root) {
+        NB.wireShopMap(root, [s]);
         let activeCat = 'all';
         const search = NB.$('#shopSearch', root);
         const grid = NB.$('#shopProducts', root);

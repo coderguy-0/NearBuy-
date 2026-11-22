@@ -769,6 +769,274 @@
       </div>
     </article>`;
 
+  /* --------------------------------------------------------------- shop map */
+  /* A dependency-free map of nearby shops. Pins are placed with a true-scale
+   * equirectangular projection (kilometres north/east from a centre point), so the
+   * distance rings around "you are here" are real circles rather than decoration. */
+  const KM_PER_DEG_LAT = 111.32;
+  const kmPerDegLng = (lat) => 111.32 * Math.cos((Number(lat) * Math.PI) / 180);
+  /* "<0.1 km" reads better than "0 km" when the shopper is standing in the shop. */
+  NB.mapDistance = (km) => (km == null ? null : Number(km) < 0.1 ? '<0.1 km' : `${km} km`);
+  const NB_TEL = (phone) => (phone ? String(phone).replace(/[^+\d]/g, '') : '');
+
+  NB.mapLayout = (shops, { width, height, zoom = 1, centre = null, minSpanKm = 1.2 } = {}) => {
+    const pts = (shops || []).filter((s) => s && Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)));
+    if (!pts.length) return null;
+    const w = Math.max(1, Number(width) || 640);
+    const h = Math.max(1, Number(height) || 380);
+    const loc = NB.state.location;
+    const user = loc && Number.isFinite(Number(loc.lat)) && Number.isFinite(Number(loc.lng))
+      ? { lat: Number(loc.lat), lng: Number(loc.lng), locality: loc.locality || loc.pincode || 'Your area' }
+      : null;
+    const all = pts.map((s) => ({ lat: Number(s.lat), lng: Number(s.lng) }));
+    if (user) all.push(user);
+
+    let lat0; let lng0;
+    if (centre && Number.isFinite(Number(centre.lat)) && Number.isFinite(Number(centre.lng))) {
+      lat0 = Number(centre.lat); lng0 = Number(centre.lng);
+    } else {
+      const lats = all.map((p) => p.lat);
+      const lngs = all.map((p) => p.lng);
+      lat0 = (Math.min(...lats) + Math.max(...lats)) / 2;
+      lng0 = (Math.min(...lngs) + Math.max(...lngs)) / 2;
+    }
+
+    const kmLat = KM_PER_DEG_LAT;
+    const kmLng = kmPerDegLng(lat0);
+    const pad = Math.min(w, h) * 0.16;
+    let maxNorth = 0; let maxEast = 0;
+    for (const p of all) {
+      maxNorth = Math.max(maxNorth, Math.abs((p.lat - lat0) * kmLat));
+      maxEast = Math.max(maxEast, Math.abs((p.lng - lng0) * kmLng));
+    }
+    /* Largest scale (px per km) that still fits every point inside the padding. */
+    const fitScale = Math.min(
+      (h / 2 - pad) / Math.max(maxNorth, 0.2),
+      (w / 2 - pad) / Math.max(maxEast, 0.2)
+    );
+    const scale = Math.max(1e-6, Math.min(fitScale, h / minSpanKm)) / (Number(zoom) || 1);
+    return {
+      lat0, lng0, kmLat, kmLng, scale, spanKm: h / scale, user, width: w, height: h,
+      x: (lng) => w / 2 + (Number(lng) - lng0) * kmLng * scale,
+      y: (lat) => h / 2 - (Number(lat) - lat0) * kmLat * scale,
+      px: (km) => km * scale
+    };
+  };
+
+  NB.mapPanel = (s) => {
+    if (!s) {
+      return `<div class="nbmap__hint">${NB.icon('info')}
+        <p>Pick a pin to see how far the shop is, who runs it, and how to call them.</p></div>`;
+    }
+    const tel = NB_TEL(s.phone);
+    /* Address often repeats the locality — keep each part once. */
+    const parts = [s.address, s.locality, s.city].map((p) => String(p || '').trim()).filter(Boolean);
+    const where = parts
+      .filter((p, i) => parts.indexOf(p) === i)
+      /* skip a locality the street address already spells out */
+      .filter((p, i) => i === 0 || p !== s.locality || !String(s.address || '').includes(p))
+      .join(', ');
+    const distance = s.distanceKm != null
+      ? `${NB.mapDistance(s.distanceKm)} from you`
+      : (s.locality ? `In ${s.locality}` : 'Distance unavailable');
+    return `
+      <div class="nbmap__shop">
+        <span class="nbmap__emoji tone-${NB.esc(s.tone || 'blue')}">${NB.esc(s.emoji || '🏪')}</span>
+        <div class="nbmap__shop-main">
+          <h4><a href="#/shop/${encodeURIComponent(s.slug)}">${NB.esc(s.name)}</a></h4>
+          <span class="nbmap__stars">${NB.icon('star')} ${Number(s.rating).toFixed(1)} <small>(${s.reviewCount})</small></span>
+        </div>
+        <span class="badge ${s.isOpen ? 'badge--open' : 'badge--closed'}">${s.isOpen ? 'Open now' : 'Closed'}</span>
+      </div>
+      <dl class="nbmap__facts">
+        <div><dt>${NB.icon('location')} Distance</dt><dd><b>${NB.esc(distance)}</b></dd></div>
+        <div><dt>${NB.icon('phone')} Phone</dt><dd>${s.phone
+          ? `<a href="tel:${NB.esc(tel)}">${NB.esc(s.phone)}</a>` : '<span class="muted">Not listed</span>'}</dd></div>
+        <div><dt>${NB.icon('user')} Owner</dt><dd>${s.ownerName ? NB.esc(s.ownerName) : '<span class="muted">Not listed</span>'}</dd></div>
+        <div><dt>${NB.icon('store')} Location</dt><dd>${NB.esc(where || 'Not listed')}${s.pincode ? ` — ${NB.esc(s.pincode)}` : ''}</dd></div>
+        <div><dt>${NB.icon('clock')} Hours</dt><dd>${NB.esc(s.opensAt || '—')}–${NB.esc(s.closesAt || '—')}</dd></div>
+      </dl>
+      <div class="nbmap__actions">
+        ${s.phone ? `<a class="btn btn--primary btn--sm" href="tel:${NB.esc(tel)}">${NB.icon('phone')} Call</a>` : ''}
+        ${s.directionsUrl ? `<a class="btn btn--ghost btn--sm" href="${NB.esc(s.directionsUrl)}" target="_blank" rel="noopener noreferrer">${NB.icon('map')} Directions</a>` : ''}
+        <a class="btn btn--ghost btn--sm" href="#/shop/${encodeURIComponent(s.slug)}">Visit shop</a>
+      </div>`;
+  };
+
+  NB.mapListItem = (s) => {
+    const tel = NB_TEL(s.phone);
+    return `
+      <button type="button" class="nbmap__row" data-nbmap-pick="${NB.esc(s.slug)}">
+        <span class="nbmap__row-emoji tone-${NB.esc(s.tone || 'blue')}">${NB.esc(s.emoji || '🏪')}</span>
+        <span class="nbmap__row-body">
+          <b>${NB.esc(s.name)}</b>
+          <small>${NB.esc(s.ownerName || s.category || '')}${s.phone ? ` · <a href="tel:${NB.esc(tel)}" data-nbmap-stop>${NB.esc(s.phone)}</a>` : ''}</small>
+        </span>
+        <span class="nbmap__row-dist">${NB.mapDistance(s.distanceKm) || '—'}</span>
+      </button>`;
+  };
+
+  NB.shopMap = (shops, { selected = null, title = 'Shop map', subtitle = '' } = {}) => {
+    const list = (shops || []).filter(Boolean);
+    const coords = list.filter((s) => Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)));
+    return `
+      <div class="nbmap" data-nbmap data-nbmap-selected="${NB.esc(selected || '')}">
+        <div class="nbmap__stage">
+          <div class="nbmap__canvas" data-nbmap-canvas role="group"
+            aria-label="Map of ${list.length} nearby shop${list.length === 1 ? '' : 's'}. Choose a pin for distance, phone number, owner and location.">
+            <div class="nbmap__layer" data-nbmap-layer></div>
+          </div>
+          <div class="nbmap__controls">
+            <button type="button" class="nbmap__ctl" data-nbmap-act="in" aria-label="Zoom in" title="Zoom in">${NB.icon('plus')}</button>
+            <button type="button" class="nbmap__ctl" data-nbmap-act="out" aria-label="Zoom out" title="Zoom out">${NB.icon('minus')}</button>
+            <button type="button" class="nbmap__ctl" data-nbmap-act="fit" aria-label="Fit every shop" title="Fit every shop">${NB.icon('map')}</button>
+          </div>
+          <div class="nbmap__scalebar" data-nbmap-scale aria-hidden="true"></div>
+        </div>
+        <aside class="nbmap__side">
+          <div class="nbmap__head">
+            <b>${NB.icon('map')} ${NB.esc(title)}</b>
+            <span class="muted small">${NB.esc(subtitle || (coords.length
+              ? 'Real coordinates · to scale'
+              : 'No coordinates for these shops'))}</span>
+          </div>
+          <div class="nbmap__panel" data-nbmap-panel aria-live="polite">${NB.mapPanel(null)}</div>
+          ${list.length > 1 ? `<div class="nbmap__list" data-nbmap-list>${list.map(NB.mapListItem).join('')}</div>` : ''}
+        </aside>
+      </div>`;
+  };
+
+  NB.wireShopMap = (root, shops) => {
+    const host = root.querySelector('[data-nbmap]');
+    if (!host) return;
+    const canvas = host.querySelector('[data-nbmap-canvas]');
+    const layer = host.querySelector('[data-nbmap-layer]');
+    const panel = host.querySelector('[data-nbmap-panel]');
+    const scalebar = host.querySelector('[data-nbmap-scale]');
+    const listEl = host.querySelector('[data-nbmap-list]');
+    const all = (shops || []).filter(Boolean);
+    const pins = all.filter((s) => Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)));
+    if (!pins.length) {
+      host.innerHTML = `<div class="nbmap__empty">${NB.icon('map')}<b>No map available</b><p>These shops have not published coordinates yet.</p></div>`;
+      return;
+    }
+    let zoom = 1;
+    let selected = host.dataset.nbmapSelected || null;
+
+    const pick = (slug, scroll) => {
+      selected = slug;
+      const s = all.find((x) => x.slug === slug) || null;
+      if (panel) panel.innerHTML = NB.mapPanel(s);
+      NB.$$('[data-nbmap-pick]', host).forEach((el) => el.classList.toggle('is-active', el.dataset.nbmapPick === slug));
+      if (s && scroll !== false) {
+        const row = listEl && listEl.querySelector(`[data-nbmap-pick="${CSS.escape(slug)}"]`);
+        if (row && listEl) listEl.scrollTop = Math.max(0, row.offsetTop - listEl.offsetTop - 8);
+      }
+      NB.$$('.nbmap-pin', layer).forEach((el) => el.classList.toggle('is-active', el.dataset.nbmapPick === slug));
+    };
+
+    const draw = () => {
+      const box = canvas.getBoundingClientRect();
+      const w = box.width || canvas.clientWidth || 640;
+      const h = box.height || canvas.clientHeight || 380;
+      const lay = NB.mapLayout(pins, { width: w, height: h, zoom });
+      if (!lay) return;
+
+      const bits = [];
+      /* 3–4 evenly spaced rings: close enough together to read as a scale,
+       * far enough apart that the labels do not collide in the middle. */
+      const rings = [0.2, 0.5, 1, 2, 3, 5, 10, 20, 50]
+        .filter((km) => lay.px(km) >= 40 && lay.px(km) <= Math.max(w, h) * 0.95)
+        .slice(0, 4);
+      if (lay.user) {
+        const cx = lay.x(lay.user.lng);
+        const cy = lay.y(lay.user.lat);
+        for (const km of rings) {
+          const r = lay.px(km);
+          bits.push(`<span class="nbmap__ring" style="left:${cx - r}px;top:${cy - r}px;width:${r * 2}px;height:${r * 2}px"></span>`);
+          bits.push(`<span class="nbmap__ring-label" style="left:${cx + r}px;top:${cy}px">${km} km</span>`);
+        }
+        bits.push(`<span class="nbmap__user" style="left:${cx}px;top:${cy}px" title="You are here">
+          <i></i><span>${NB.icon('location')} ${NB.esc(lay.user.locality)}</span></span>`);
+      }
+
+      /* Pins that share coordinates (two shops in one complex) would sit exactly on
+       * top of each other and hide one of them. Fan those out just far enough that
+       * both stay clickable; everything else keeps its true projected position. */
+      const minSep = 34;
+      const placed = [];
+      for (const s of pins) {
+        const trueX = lay.x(s.lng);
+        const trueY = lay.y(s.lat);
+        let x = trueX;
+        let y = trueY;
+        for (let i = 0; i < 24 && placed.some((p) => Math.abs(p.x - x) < minSep && Math.abs(p.y - y) < minSep); i++) {
+          const ang = (Math.PI * 2 * i) / 8 - Math.PI / 2;
+          const rad = minSep * (0.75 + i * 0.2);
+          x = trueX + Math.cos(ang) * rad;
+          y = trueY + Math.sin(ang) * rad * 0.72;
+        }
+        placed.push({ x, y });
+        const dist = NB.mapDistance(s.distanceKm) || s.locality || '';
+        bits.push(`<button type="button" class="nbmap-pin tone-${NB.esc(s.tone || 'blue')}${s.slug === selected ? ' is-active' : ''}"
+          data-nbmap-pick="${NB.esc(s.slug)}" style="left:${x}px;top:${y}px"
+          aria-label="${NB.esc(s.name)}${dist ? ', ' + NB.esc(dist) : ''}. Show phone, owner and location.">
+          <span class="nbmap-pin__dot">${NB.esc(s.emoji || '🏪')}</span>
+          <span class="nbmap-pin__tag">${NB.esc(s.name)}${s.distanceKm != null ? `<small>${NB.mapDistance(s.distanceKm)}</small>` : ''}</span>
+        </button>`);
+      }
+      layer.innerHTML = bits.join('');
+
+      if (scalebar) {
+        const km = [1, 0.5, 0.2, 5, 2].find((k) => lay.px(k) >= 48 && lay.px(k) <= w * 0.35);
+        scalebar.innerHTML = km
+          ? `<i style="width:${lay.px(km)}px"></i><span>${km} km</span>`
+          : `<i style="width:${Math.round(lay.px(1))}px"></i><span>1 km</span>`;
+      }
+      if (selected) pick(selected, false);
+    };
+
+    host.addEventListener('click', (e) => {
+      const tel = e.target.closest('[data-nbmap-stop]');
+      if (tel) return;
+      const act = e.target.closest('[data-nbmap-act]');
+      if (act) {
+        const a = act.dataset.nbmapAct;
+        if (a === 'in') zoom = Math.min(6, zoom * 1.6);
+        else if (a === 'out') zoom = Math.max(0.6, zoom / 1.6);
+        else zoom = 1;
+        draw();
+        return;
+      }
+      const hit = e.target.closest('[data-nbmap-pick]');
+      if (hit) { e.preventDefault(); pick(hit.dataset.nbmapPick); }
+    });
+
+    NB.$$('[data-nbmap-pick]', host).forEach((el) => el.classList.toggle('is-active', el.dataset.nbmapPick === selected));
+    if (selected) {
+      const s = all.find((x) => x.slug === selected);
+      if (panel && s) panel.innerHTML = NB.mapPanel(s);
+    }
+    draw();
+
+    /* Re-project when the viewport changes the canvas size. The map is rebuilt on
+     * every filter/page change, so the previous observer must be released first or
+     * each rebuild leaks one that still points at a detached canvas. */
+    if (host._nbMapTeardown) host._nbMapTeardown();
+    let teardown = () => {};
+    if (typeof ResizeObserver === 'function') {
+      const ro = new ResizeObserver(() => draw());
+      ro.observe(canvas);
+      teardown = () => ro.disconnect();
+    } else {
+      const onResize = () => draw();
+      window.addEventListener('resize', onResize);
+      teardown = () => window.removeEventListener('resize', onResize);
+    }
+    host._nbMapTeardown = teardown;
+    return { redraw: draw, pick, teardown };
+  };
+
   NB.offerCard = (o) => `
     <div class="offer-card">
       <div class="offer-card__cut"></div>

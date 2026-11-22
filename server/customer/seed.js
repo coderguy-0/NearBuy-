@@ -394,12 +394,13 @@ module.exports = function seed() {
       const id = uid();
       shopIds[s.slug] = id;
       db.prepare(`INSERT INTO nb_shops
-        (id,slug,owner_user_id,name,category_slug,tagline,description,emoji,tone,phone,address,locality,city,pincode,lat,lng,rating,review_count,verified,is_open,opens_at,closes_at,prep_minutes,delivery_enabled,pickup_enabled,delivery_fee_paise,free_delivery_over_paise,pickup_fee_paise,min_order_paise,radius_km,service_pincodes,badge,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        (id,slug,owner_user_id,name,category_slug,tagline,description,emoji,tone,phone,address,locality,city,pincode,lat,lng,rating,review_count,verified,is_open,opens_at,closes_at,prep_minutes,delivery_enabled,pickup_enabled,delivery_fee_paise,free_delivery_over_paise,pickup_fee_paise,min_order_paise,radius_km,service_pincodes,badge,created_at,proprietor_name)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         id, s.slug, s.owner ? owners[s.owner] : null, s.name, s.category, s.tagline, s.description, s.emoji, s.tone,
         '011-' + Math.floor(40000000 + Math.random() * 9000000), s.address, s.locality, 'New Delhi', s.pincode, s.lat, s.lng,
         s.rating, s.reviews, s.verified, s.open, s.opens, s.closes, s.prep, s.delivery, s.pickup,
-        rupees(s.deliveryFee), rupees(s.freeOver), rupees(s.pickupFee), rupees(s.minOrder), s.radius, s.pins, s.badge, now()
+        rupees(s.deliveryFee), rupees(s.freeOver), rupees(s.pickupFee), rupees(s.minOrder), s.radius, s.pins, s.badge, now(),
+        s.ownerName || null
       );
 
       const rows = CATALOGUE[s.slug] || [];
