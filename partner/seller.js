@@ -148,6 +148,9 @@
     const c = data.counts || {};
     const prodStats = data.products || {};
     const recent = data.recent || [];
+    /* `/seller/analytics` returns { metrics, series }; never assume either is present. */
+    const anMetrics = analytics && analytics.metrics ? analytics.metrics : null;
+    const anSeries = analytics && Array.isArray(analytics.series) ? analytics.series : [];
     PA.set(`
       ${pageHead(`${shop.name || 'Your shop'} — Dashboard`,
         `${shop.verified ? '✓ Verified seller' : 'Verification pending'} · Seller ID ${esc(shop.sellerId || '—')} · Shop ID ${esc(shop.shopId || '—')} · ${shop.isOpen ? 'Open now' : 'Closed'} · ${shop.opensAt || ''}–${shop.closesAt || ''}`,
@@ -169,13 +172,13 @@
         <div class="card chart-card flush">
           <div class="card-head"><h2>Sales — last 30 days</h2><span class="spacer"></span><a class="small" href="#/analytics">Full analytics</a></div>
           <div class="card-body">
-            ${analytics && analytics.daily && analytics.daily.length
-              ? lineChart(analytics.daily.map((d) => ({ label: d.day.slice(5), value: d.gross })), { labelFmt: money })
+            ${(anMetrics && anSeries.length)
+              ? lineChart(anSeries.map((d) => ({ label: d.date.slice(5), value: d.sales })), { labelFmt: money })
               : '<p class="muted small">Sales will appear here once orders start coming in.</p>'}
           </div>
           <div class="card-foot row" style="justify-content:space-between">
-            <span class="small muted">Order volume ${analytics ? analytics.totals.orders : 0} · AOV ${money(analytics ? Math.round(analytics.totals.orders ? analytics.totals.gross / analytics.totals.orders : 0) : 0)}</span>
-            <span class="small muted">Refunds ${money(analytics ? analytics.totals.refunds : 0)}</span>
+            <span class="small muted">Order volume ${anMetrics ? anMetrics.orderCount : 0} · AOV ${money(anMetrics ? anMetrics.averageOrderValue : 0)}</span>
+            <span class="small muted">Refunds ${money(anMetrics ? anMetrics.refunds : 0)}</span>
           </div>
         </div>
 
@@ -511,18 +514,20 @@
       return true;
     }
     PA.on('#save-packing', 'click', async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try { await saveEach(false); PA.toast('Packing progress saved.'); PA.render(); }
-      catch (err) { PA.toast(err.message, 'err'); e.currentTarget.disabled = false; }
+      catch (err) { PA.toast(err.message, 'err'); btn.disabled = false; }
     });
     PA.on('#mark-complete', 'click', async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try {
         await saveEach(true);
         const res = await PA.api('POST', `/seller/orders/${encodeURIComponent(code)}/action`, { action: 'ready' });
         PA.toast(res.message || 'Packing complete — order is ready.');
         PA.render();
-      } catch (err) { PA.toast(err.message, 'err'); e.currentTarget.disabled = false; }
+      } catch (err) { PA.toast(err.message, 'err'); btn.disabled = false; }
     });
   }
 
@@ -1898,6 +1903,7 @@
           ${PA.field('sp-logo', 'Logo URL', shop.logo_url || '', { placeholder: 'https://…/logo.png' })}
           ${PA.field('sp-cover', 'Cover image URL', shop.cover_url || '')}
           ${PA.field('sp-emoji', 'Emoji badge', shop.emoji || '🏪')}
+          ${PA.field('sp-owner', 'Owner / proprietor name', shop.proprietor_name || shop.ownerName || '', { placeholder: 'Shown on the customer map', help: 'Printed next to your shop pin so customers know who runs it.' })}
         </div>
         <div class="field"><label for="sp-about">About the shop</label><textarea class="input" id="sp-about" rows="3">${esc(shop.about_text || shop.description || '')}</textarea></div>
 
@@ -1937,6 +1943,7 @@
           about: $('#sp-about').value.trim(), description: $('#sp-about').value.trim(),
           address: $('#sp-address').value.trim(), locality: $('#sp-locality').value.trim(), city: $('#sp-city').value.trim(),
           pincode: $('#sp-pincode').value.trim(), lat: Number($('#sp-lat').value), lng: Number($('#sp-lng').value),
+          ownerName: $('#sp-owner').value.trim(),
           phone: $('#sp-phone').value.trim(), businessEmail: $('#sp-bemail').value.trim(), supportContact: $('#sp-support').value.trim(),
           returnPolicy: $('#sp-return-policy').value.trim(), pickupInstructions: $('#sp-pickup').value.trim(), deliveryInfo: $('#sp-delivery-info').value.trim()
         });
@@ -2030,14 +2037,27 @@
     const data = await PA.api('GET', '/seller/hours');
     const prof = await PA.api('GET', '/seller/profile').catch(() => ({ shop: {} }));
     if (!ctx.isCurrent()) return;
-    const rows = data.hours || [];
-    const byDay = Object.fromEntries(rows.filter((r) => !r.holidayDate).map((r) => [r.day, r]));
-    const holidays = rows.filter((r) => r.holidayDate);
+    /* The API returns a grouped payload ({ days, holidays, isOpen, ... }).
+     * Older builds returned a flat row array — accept both so the page never throws. */
+    const payloadHours = data.hours || {};
+    const flatRows = Array.isArray(payloadHours) ? payloadHours : null;
+    const dayRows = flatRows
+      ? flatRows.filter((r) => !r.holidayDate)
+      : (Array.isArray(payloadHours.days) ? payloadHours.days : []);
+    const holidayRows = flatRows
+      ? flatRows.filter((r) => r.holidayDate).map((r) => ({ holidayDate: r.holidayDate, holidayLabel: r.holidayLabel }))
+      : (Array.isArray(payloadHours.holidays) ? payloadHours.holidays.map((h) => ({ holidayDate: h.holidayDate || h.date, holidayLabel: h.holidayLabel || h.label })) : []);
+    const byDay = Object.fromEntries(dayRows.map((r) => [r.day, r]));
+    const holidays = holidayRows;
     const shop = prof.shop || {};
+    /* `/seller/profile` exposes snake_case (`is_open`); the hours payload exposes `isOpen`. */
+    const shopIsOpen = flatRows
+      ? (shop.isOpen === undefined ? shop.is_open : shop.isOpen)
+      : (payloadHours.isOpen === undefined ? shop.is_open : payloadHours.isOpen);
     const next = data.nextOpening;
     PA.set(`
       ${pageHead('Business Hours', 'Outside these hours the storefront shows you closed and blocks unsupported fulfilment promises. Accepted orders always continue.',
-        `<button class="btn" id="hours-open-toggle">${shop.isOpen === false ? 'Open now' : 'Close temporarily'}</button>`)}
+        `<button class="btn" id="hours-open-toggle">${shopIsOpen === false ? 'Open now' : 'Close temporarily'}</button>`)}
 
       ${next ? `<div class="banner-note info"><b>Next opening:</b> ${esc(next.label || next.at)}</div>` : ''}
 
@@ -2083,7 +2103,7 @@
           <h3>Quick controls</h3>
           <p class="muted small">These flip the live shop status customers see, without touching your schedule.</p>
           <div class="switch-row"><div><b class="small">Shop open flag</b><div class="desc">Turn off to hide “open now” on the storefront.</div></div>
-            <input type="checkbox" class="switch" id="open-flag" ${shop.isOpen !== false ? 'checked' : ''}/></div>
+            <input type="checkbox" class="switch" id="open-flag" ${shopIsOpen !== false ? 'checked' : ''}/></div>
           <div class="banner-note warn" style="margin-top:10px">Closing preserves existing accepted orders — only new commitments stop.</div>
         </div>
       </div>`);
@@ -2113,9 +2133,10 @@
     });
 
     PA.on('#save-hours', 'click', async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try { await PA.api('PATCH', '/seller/hours', payloadFromForm()); PA.toast('Weekly hours saved and synced to the storefront.'); PA.render(); }
-      catch (err) { PA.toast(err.message, 'err'); e.currentTarget.disabled = false; }
+      catch (err) { PA.toast(err.message, 'err'); btn.disabled = false; }
     });
     PA.on('#set-holiday', 'click', async () => {
       const date = $('#hol-date').value, label = $('#hol-label').value.trim() || 'Holiday';
@@ -2133,10 +2154,11 @@
       catch (err) { PA.toast(err.message, 'err'); PA.render(); }
     });
     PA.on('#hours-open-toggle', 'click', async (e) => {
-      const closing = shop.isOpen !== false;
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      const closing = shopIsOpen !== false;
+      btn.disabled = true;
       try { await PA.api('PATCH', '/seller/hours', payloadFromForm({ isOpen: !closing })); PA.toast(!closing ? 'Shop re-opened.' : 'Shop closed temporarily.'); PA.render(); }
-      catch (err) { PA.toast(err.message, 'err'); e.currentTarget.disabled = false; }
+      catch (err) { PA.toast(err.message, 'err'); btn.disabled = false; }
     });
   }
 

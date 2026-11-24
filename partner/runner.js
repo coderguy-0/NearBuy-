@@ -68,7 +68,8 @@
     `);
 
     PA.on('#toggle-online', 'click', async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try {
         const next = online ? 'offline' : 'online';
         const body = { status: next };
@@ -85,7 +86,7 @@
         await PA.api('POST', '/runner/status', body);
         PA.toast(next === 'online' ? 'You are online.' : 'You are offline. No new offers will arrive.');
         PA.render();
-      } catch (err) { e.currentTarget.disabled = false; PA.toast(err.message, 'err'); }
+      } catch (err) { btn.disabled = false; PA.toast(err.message, 'err'); }
     });
 
     wireJobActions();
@@ -384,12 +385,13 @@
         : `<div class="card">${PA.empty('💰', 'No payout requests yet', 'Once you complete deliveries, request a payout and operations will process it here.')}</div>`}
     `);
     PA.on('#request-payout', 'click', async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try {
         const res = await PA.api('POST', '/runner/payouts/request', {});
         PA.toast(res.message || 'Payout requested.');
         PA.render();
-      } catch (err) { e.currentTarget.disabled = false; PA.toast(err.message, 'err'); }
+      } catch (err) { btn.disabled = false; PA.toast(err.message, 'err'); }
     });
   }
 
@@ -570,12 +572,13 @@
         : `<div class="card">${PA.empty('🔔', 'No notifications yet', 'Offers, payout updates and support replies will show up here.')}</div>`}
     `);
     PA.on('#mark-read', 'click', async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try {
         await PA.api('POST', '/runner/notifications/read', {});
         PA.toast('All notifications marked as read.');
         PA.render();
-      } catch (err) { e.currentTarget.disabled = false; PA.toast(err.message, 'err'); }
+      } catch (err) { btn.disabled = false; PA.toast(err.message, 'err'); }
     });
   }
 

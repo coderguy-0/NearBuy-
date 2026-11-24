@@ -267,6 +267,22 @@ function shopCard(row, location) {
     serviceable = pins.includes(String(location.pincode)) && (distanceKm == null || distanceKm <= row.radius_km + 0.75);
   }
   const counts = db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN stock-reserved>0 THEN 1 ELSE 0 END) AS in_stock FROM nb_products WHERE shop_id=? AND active=1').get(row.id);
+  /* The shop's own phone line and the name of the seller who runs it. Both are public
+   * business details the storefront shows next to the map pin, so they are safe to
+   * expose to a browsing guest. No personal seller data (email, payout, KYC) leaks.
+   * `proprietor_name` covers shops whose seller has no NearBuy account of their own. */
+  const owner = row.owner_user_id
+    ? db.prepare('SELECT name FROM nb_users WHERE id=?').get(row.owner_user_id)
+    : null;
+  /* The explicitly-set proprietor name wins: it is the public, editable field shown
+   * on the customer map. The linked account's display name is only a fallback for
+   * shops that predate that column. */
+  const ownerName = row.proprietor_name || owner?.name || null;
+  const phone = row.phone || row.support_contact || null;
+  const hasCoords = Number.isFinite(Number(row.lat)) && Number.isFinite(Number(row.lng));
+  const directionsUrl = hasCoords
+    ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${row.lat},${row.lng}`)}`
+    : null;
   return {
     id: row.id, slug: row.slug, name: row.name, categorySlug: row.category_slug,
     category: db.prepare('SELECT name FROM nb_categories WHERE slug=?').get(row.category_slug)?.name || row.category_slug,
@@ -278,7 +294,8 @@ function shopCard(row, location) {
     pickupFee: row.pickup_fee_paise, minOrder: row.min_order_paise, radiusKm: row.radius_km,
     address: row.address, locality: row.locality, city: row.city, pincode: row.pincode,
     lat: row.lat, lng: row.lng, distanceKm, serviceable, servicePincodes: row.service_pincodes,
-    badge: row.badge, productCount: Number(counts?.total || 0), inStockCount: Number(counts?.in_stock || 0)
+    badge: row.badge, productCount: Number(counts?.total || 0), inStockCount: Number(counts?.in_stock || 0),
+    phone, ownerName, directionsUrl
   };
 }
 
@@ -3786,8 +3803,14 @@ async function handle(req, res) {
       const lng = payload.lng !== undefined ? Number(payload.lng) : shop.lng;
       if (!Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lng) || Math.abs(lng) > 180) fail(400, 'Enter valid latitude and longitude.');
       const legalChanged = payload.legalName !== undefined && String(payload.legalName).trim() !== (shop.legal_name || shop.name);
+      /* The proprietor name is what the Customer Portal prints next to the shop's map
+       * pin, so it is editable from the same form as the rest of the public profile. */
+      if (payload.ownerName !== undefined) {
+        const ownerName = String(payload.ownerName).trim();
+        if (ownerName && !str(ownerName, 2, 80)) fail(400, 'Owner name must be 2–80 characters.');
+      }
       transaction(() => {
-        db.prepare(`UPDATE nb_shops SET name=?,category_slug=?,tagline=?,description=?,about_text=?,address=?,locality=?,city=?,pincode=?,lat=?,lng=?,phone=?,business_email=?,support_contact=?,logo_url=?,cover_url=?,return_policy=?,pickup_instructions=?,delivery_info=?,legal_name=?,ownership_type=? WHERE id=?`)
+        db.prepare(`UPDATE nb_shops SET name=?,category_slug=?,tagline=?,description=?,about_text=?,address=?,locality=?,city=?,pincode=?,lat=?,lng=?,phone=?,business_email=?,support_contact=?,logo_url=?,cover_url=?,return_policy=?,pickup_instructions=?,delivery_info=?,legal_name=?,ownership_type=?,proprietor_name=? WHERE id=?`)
           .run(name, categorySlug, payload.tagline !== undefined ? String(payload.tagline).slice(0, 160) : shop.tagline,
             payload.description !== undefined ? String(payload.description).slice(0, 2000) : shop.description,
             payload.about !== undefined ? String(payload.about).slice(0, 2000) : shop.about_text,
@@ -3795,7 +3818,11 @@ async function handle(req, res) {
             payload.locality !== undefined ? String(payload.locality).slice(0, 80) : shop.locality,
             payload.city !== undefined ? String(payload.city).slice(0, 60) : shop.city,
             pincode, lat, lng,
-            payload.phone !== undefined ? normalPhone(payload.phone) : shop.phone,
+            /* Keep the stored formatting when the digits are unchanged, so saving an
+             * unrelated field does not turn "011-42541798" into "01142541798". */
+            payload.phone !== undefined
+              ? (normalPhone(payload.phone) === String(shop.phone || '').replace(/\D/g, '') ? shop.phone : normalPhone(payload.phone))
+              : shop.phone,
             payload.businessEmail !== undefined ? String(payload.businessEmail).trim().toLowerCase() : shop.business_email,
             payload.supportContact !== undefined ? String(payload.supportContact).slice(0, 120) : shop.support_contact,
             payload.logoUrl !== undefined ? String(payload.logoUrl).slice(0, 300) : shop.logo_url,
@@ -3805,6 +3832,7 @@ async function handle(req, res) {
             payload.deliveryInfo !== undefined ? String(payload.deliveryInfo).slice(0, 1000) : shop.delivery_info,
             payload.legalName !== undefined ? String(payload.legalName).trim().slice(0, 120) : shop.legal_name,
             payload.ownershipType !== undefined ? String(payload.ownershipType).slice(0, 60) : shop.ownership_type,
+            payload.ownerName !== undefined ? (String(payload.ownerName).trim().slice(0, 80) || null) : shop.proprietor_name,
             shop.id);
         if (legalChanged) {
           db.prepare("UPDATE nb_seller_verifications SET status='additional_info_required',reason=?,updated_at=? WHERE user_id=? AND status='approved'")

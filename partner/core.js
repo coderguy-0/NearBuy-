@@ -454,6 +454,9 @@
       try {
         const me = await PA.api('GET', '/me');
         state.user = me.user;
+        /* The session CSRF token must be restored with the session, otherwise every
+         * mutation after a page reload is refused with "security token is missing". */
+        state.csrf = (me.user && me.user.csrf) || '';
         state.shop = me.shop || null;
         state.runner = me.runner || null;
         if (!state.user) {
@@ -483,6 +486,7 @@
       try {
         const me = await PA.api('GET', '/me');
         state.user = me.user;
+        if (!state.csrf && me.user && me.user.csrf) state.csrf = me.user.csrf;
         state.shop = me.shop || null;
         state.runner = me.runner || null;
         if (!state.user || state.user.role !== state.mode) { state.user = null; state.csrf = ''; renderGate('Your session ended or this account belongs to a different workspace. Sign in with this portal’s account.'); }
