@@ -308,6 +308,37 @@ CREATE TABLE IF NOT EXISTS nb_payment_records (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_payment_order ON nb_payment_records(order_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_provider_ref ON nb_payment_records(provider, reference) WHERE reference IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_active_intent ON nb_payment_records(order_id, provider) WHERE provider='razorpay' AND reference IS NOT NULL AND status IN ('created','pending');
+
+CREATE TABLE IF NOT EXISTS nb_payment_allocations (
+  id TEXT PRIMARY KEY,
+  payment_record_id TEXT NOT NULL REFERENCES nb_payment_records(id) ON DELETE CASCADE,
+  order_id TEXT NOT NULL REFERENCES nb_orders(id) ON DELETE CASCADE,
+  seller_order_id TEXT NOT NULL REFERENCES nb_seller_orders(id) ON DELETE CASCADE,
+  shop_id TEXT NOT NULL REFERENCES nb_shops(id),
+  amount_paise INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (payment_record_id, seller_order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pay_alloc_shop ON nb_payment_allocations(shop_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pay_alloc_so ON nb_payment_allocations(seller_order_id);
+CREATE INDEX IF NOT EXISTS idx_pay_alloc_pr ON nb_payment_allocations(payment_record_id);
+
+CREATE TABLE IF NOT EXISTS nb_payment_webhook_events (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  event_key TEXT NOT NULL,
+  event_name TEXT NOT NULL,
+  payment_id TEXT,
+  reference TEXT,
+  payload_hash TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (provider, event_key)
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_ref ON nb_payment_webhook_events(provider, reference, created_at);
 
 CREATE TABLE IF NOT EXISTS nb_delivery_assignments (
   id TEXT PRIMARY KEY,
@@ -358,6 +389,8 @@ CREATE TABLE IF NOT EXISTS nb_refunds (
   id TEXT PRIMARY KEY,
   return_id TEXT,
   order_id TEXT NOT NULL,
+  seller_order_id TEXT REFERENCES nb_seller_orders(id) ON DELETE SET NULL,
+  reason TEXT,
   amount_paise INTEGER NOT NULL,
   status TEXT NOT NULL,
   reference TEXT,
@@ -859,6 +892,12 @@ addColumn('nb_order_items', 'missing_qty', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('nb_order_items', 'packed_status', 'TEXT NOT NULL DEFAULT \'pending\'');
 addColumn('nb_users', 'two_factor_enabled', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('nb_sessions', 'ip', 'TEXT');
+addColumn('nb_refunds', 'seller_order_id', 'TEXT');
+addColumn('nb_refunds', 'reason', 'TEXT');
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_refunds_order ON nb_refunds(order_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_refunds_seller_order ON nb_refunds(seller_order_id, status, created_at);
+`);
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -868,6 +907,101 @@ const now = () => new Date().toISOString();
 const iso = (d) => new Date(d).toISOString();
 const uid = () => randomUUID();
 const sha = (s) => createHash('sha256').update(String(s)).digest('hex');
+
+/**
+ * Deterministically split `totalAmountPaise` across `sellerOrders` using
+ * each seller order's `total_paise` weight and largest-remainder rounding so
+ * the allocated parts always conserve the exact paise total.
+ */
+function allocateAmountAcrossSellerOrders(totalAmountPaise, sellerOrders) {
+  const total = Math.max(0, Math.round(Number(totalAmountPaise) || 0));
+  if (!Array.isArray(sellerOrders) || !sellerOrders.length) return [];
+  const ordered = [...sellerOrders].sort((a, b) => {
+    const cmp = String(a.created_at || '').localeCompare(String(b.created_at || ''));
+    return cmp !== 0 ? cmp : String(a.id || '').localeCompare(String(b.id || ''));
+  });
+  if (total === 0) {
+    return ordered.map((so) => ({ sellerOrderId: so.id, shopId: so.shop_id, amountPaise: 0 }));
+  }
+  const weights = ordered.map((so) => Math.max(0, Math.round(Number(so.total_paise) || 0)));
+  const weightSum = weights.reduce((acc, w) => acc + w, 0);
+  if (weightSum === total) {
+    return ordered.map((so, i) => ({ sellerOrderId: so.id, shopId: so.shop_id, amountPaise: weights[i] }));
+  }
+  const denom = weightSum > 0 ? weightSum : ordered.length;
+  const parts = ordered.map((so, i) => {
+    const w = weightSum > 0 ? weights[i] : 1;
+    const exact = (total * w) / denom;
+    const floor = Math.floor(exact);
+    return { so, index: i, floor, frac: exact - floor };
+  });
+  const remainder = total - parts.reduce((acc, p) => acc + p.floor, 0);
+  const byFrac = [...parts].sort((a, b) => (b.frac - a.frac) || (a.index - b.index));
+  for (let i = 0; i < remainder; i++) {
+    byFrac[i % byFrac.length].floor += 1;
+  }
+  return parts.map((p) => ({ sellerOrderId: p.so.id, shopId: p.so.shop_id, amountPaise: p.floor }));
+}
+
+function syncPaymentAllocations(paymentRecordId, orderId, sellerOrders, amountPaise, timestamp = now()) {
+  db.prepare('DELETE FROM nb_payment_allocations WHERE payment_record_id=?').run(paymentRecordId);
+  const allocations = allocateAmountAcrossSellerOrders(amountPaise, sellerOrders);
+  const stmt = db.prepare(`INSERT INTO nb_payment_allocations
+    (id,payment_record_id,order_id,seller_order_id,shop_id,amount_paise,created_at)
+    VALUES(?,?,?,?,?,?,?)`);
+  for (const alloc of allocations) {
+    stmt.run(uid(), paymentRecordId, orderId, alloc.sellerOrderId, alloc.shopId, alloc.amountPaise, timestamp);
+  }
+  return allocations;
+}
+
+function resolveSellerOrdersForPaymentRecord(record) {
+  if (record.seller_order_id) {
+    const so = db.prepare('SELECT * FROM nb_seller_orders WHERE id=?').get(record.seller_order_id);
+    return so ? [so] : [];
+  }
+  const all = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=? ORDER BY created_at, id').all(record.order_id);
+  if (all.length <= 1) return all;
+  const active = all.filter((so) => !['cancelled', 'rejected'].includes(so.status));
+  const activeTotal = active.reduce((sum, so) => sum + Math.max(0, Math.round(Number(so.total_paise) || 0)), 0);
+  if (active.length > 0 && activeTotal === Math.round(Number(record.amount_paise) || 0)) {
+    return active;
+  }
+  return all;
+}
+
+/* Idempotent backfill for legacy rows created before seller-order attribution. */
+(function backfillFinancialAttribution() {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(`
+      UPDATE nb_refunds
+      SET seller_order_id = (SELECT r.seller_order_id FROM nb_returns r WHERE r.id = nb_refunds.return_id),
+          reason = COALESCE(reason, 'return')
+      WHERE return_id IS NOT NULL AND seller_order_id IS NULL;
+
+      UPDATE nb_refunds
+      SET seller_order_id = (SELECT so.id FROM nb_seller_orders so WHERE so.order_id = nb_refunds.order_id LIMIT 1)
+      WHERE seller_order_id IS NULL
+        AND return_id IS NULL
+        AND COALESCE(reason, '') <> 'duplicate_payment'
+        AND (SELECT COUNT(*) FROM nb_seller_orders so WHERE so.order_id = nb_refunds.order_id) = 1;
+    `);
+    const unallocated = db.prepare(`SELECT pr.*
+      FROM nb_payment_records pr
+      WHERE NOT EXISTS (SELECT 1 FROM nb_payment_allocations pa WHERE pa.payment_record_id = pr.id)`).all();
+    for (const pr of unallocated) {
+      const targetSellerOrders = resolveSellerOrdersForPaymentRecord(pr);
+      if (targetSellerOrders.length) {
+        syncPaymentAllocations(pr.id, pr.order_id, targetSellerOrders, pr.amount_paise, pr.created_at || now());
+      }
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw err;
+  }
+})();
 
 function makePassword(password) {
   const salt = randomBytes(16).toString('hex');
@@ -961,5 +1095,8 @@ module.exports = {
   money,
   rupees,
   pincodeArea,
-  haversineKm
+  haversineKm,
+  allocateAmountAcrossSellerOrders,
+  syncPaymentAllocations,
+  resolveSellerOrdersForPaymentRecord
 };
