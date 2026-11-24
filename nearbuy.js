@@ -633,14 +633,6 @@ function topbarHtml() {
     </div>
   </header>`;
 }
-function mobilebarHtml() {
-  const items = currentMeta().mobile || [];
-  if (!items.length) return '';
-  return `<nav class="mobilebar" aria-label="Quick navigation">${items.map(([view, label, ic]) => `
-    <button data-act="nav" data-surface="${route.surface}" data-view="${view}" class="${route.view === view ? 'active' : ''}" ${route.view === view ? 'aria-current="page"' : ''}>
-      ${icon(ic)}<span>${label}</span>
-    </button>`).join('')}</nav>`;
-}
 function syncDrawer() {
   const rail = $('#rail'), scrim = $('#scrim');
   if (rail) rail.classList.toggle('open', ui.drawer);
@@ -5723,7 +5715,6 @@ function paint() {
     $('#app').innerHTML = `${shopTopbarHtml()}${shopCategoryStripHtml()}
       <main class="nb-store-main" id="main"><div id="page">${pageHtml()}</div></main>
       ${shopFooterHtml()}${shopCartDrawerHtml()}`;
-    document.body.classList.toggle('has-mobilebar', false);
     if (ui.pendingLoginModal) {
       ui.pendingLoginModal = false;
       if (!portalOpen('shop')) {
@@ -5736,10 +5727,8 @@ function paint() {
     }
     document.title = `${viewTitle()} · Customer Portal — NearBuy`;
   } else {
-    const barHtml = opsLocked ? '' : mobilebarHtml();
     $('#app').innerHTML = `${railHtml()}<div class="scrim ${ui.drawer ? 'show' : ''}" id="scrim" data-act="drawer"></div>
-      <div class="main">${topbarHtml()}<main class="content"><div id="page">${pageHtml()}</div></main></div>${barHtml}`;
-    document.body.classList.toggle('has-mobilebar', barHtml.length > 0);
+      <div class="main">${topbarHtml()}<main class="content"><div id="page">${pageHtml()}</div></main></div>`;
     renderOverlay();
     syncDrawer();
     document.title = `${viewTitle()} · ${currentMeta().label} — NearBuy One`;

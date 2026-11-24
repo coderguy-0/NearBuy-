@@ -392,13 +392,6 @@
           </div>
         </div>
       </footer>
-      <nav class="mobile-nav" aria-label="Mobile navigation">
-        <a href="#/" data-nav="home">${NB.icon('home')}<span>Home</span></a>
-        <a href="#/categories" data-nav="categories">${NB.icon('grid')}<span>Categories</span></a>
-        <a href="#/shops" data-nav="shops">${NB.icon('store')}<span>Shops</span></a>
-        <a href="#/orders" data-nav="orders">${NB.icon('package')}<span>Orders</span></a>
-        <a href="#/cart" data-nav="cart" class="mobile-cart">${NB.icon('cart')}<span>Cart</span><i class="cart-btn__count" data-count="cart">0</i></a>
-      </nav>
       <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
       <div id="modalRoot" hidden></div>
       <div class="mobile-drawer" id="mobileDrawer" hidden>
@@ -408,7 +401,7 @@
           <button class="location-btn location-btn--wide" data-action="location">${NB.icon('location')}<span class="location-btn__text"><small>Delivering to</small><b id="locationLabelMobile">Select your location</b></span></button>
           <nav class="mobile-links">
             <a href="#/">Home</a><a href="#/categories">All categories</a><a href="#/shops">Nearby shops</a><a href="#/offers">Offers</a>
-            <a href="#/orders">Orders</a><a href="#/wishlist">Wishlist</a><a href="#/notifications">Notifications</a><a href="#/account">My account</a>
+            <a href="#/orders">Orders</a><a href="#/cart">Cart</a><a href="#/wishlist">Wishlist</a><a href="#/notifications">Notifications</a><a href="#/account">My account</a>
             <a href="#/help">Help &amp; support</a>
           </nav>
         </aside>
@@ -494,9 +487,9 @@
   NB.closeMenus = closeMenus;
 
   function bindShellEvents() {
-    $$('.primary-nav a, .mobile-nav a, .brand, [data-nav]').forEach((a) => {
+    $$('.primary-nav a, .brand, [data-nav]').forEach((a) => {
       a.addEventListener('click', (e) => {
-        if (a.getAttribute('data-nav')) $$('.primary-nav a, .mobile-nav a').forEach((x) => x.classList.toggle('is-active', x === a));
+        if (a.getAttribute('data-nav')) $$('.primary-nav a').forEach((x) => x.classList.toggle('is-active', x === a));
         if (a.closest('.mobile-drawer')) closeMenus();
         if (e.defaultPrevented) return;
       });
@@ -1194,7 +1187,7 @@
       if (token !== renderToken) return;
       viewEl.innerHTML = out.html;
       document.title = out.title ? `${out.title} · NearBuy` : 'NearBuy — Shop Local. Live Better.';
-      $$('.primary-nav a, .mobile-nav a').forEach((a) => a.classList.toggle('is-active', a.getAttribute('href') === ('#' + path)));
+      $$('.primary-nav a').forEach((a) => a.classList.toggle('is-active', a.getAttribute('href') === ('#' + path)));
       if (out.after) out.after(viewEl);
       window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
       viewEl.focus({ preventScroll: true });

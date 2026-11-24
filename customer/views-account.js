@@ -856,7 +856,7 @@
         ['One basket, many shops', 'Your basket is split into honest shop-level orders. Each shop receives only its items, sets its own prices, stock and fulfilment options, and never sees another seller’s order.'],
         ['What is real in this build', 'Accounts, addresses, serviceability, catalogues, stock, carts, orders, seller and runner actions, OTP checks, receipts, returns, refunds, reviews, support tickets and audit logs are all database-backed. Sample shops, products and sample orders are clearly labelled DEMO DATA.'],
         ['What still needs a provider', 'No payment gateway keys, map tiles, SMS, email or WhatsApp provider are configured here. Those integrations are built to be enabled with environment variables, and the interface says clearly when they are unavailable rather than pretending.'],
-        ['Built for the phone in your hand', 'Every primary page works from a 360 px Android phone to a wide desktop. The design system uses a professional blue palette, rounded cards and a mobile bottom navigation so the shopping journey stays quick.']
+        ['Built for the phone in your hand', 'Every primary page works from a 360 px Android phone to a wide desktop. The design system uses a professional blue palette, rounded cards and a mobile menu so the shopping journey stays quick.']
       ]
     },
     contact: {

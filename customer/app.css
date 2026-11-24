@@ -392,7 +392,6 @@ code, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
 .suggest__empty { padding: 16px; font-size: 13px; color: var(--muted); }
 
 /* mobile */
-.mobile-nav { display: none; }
 .mobile-drawer { position: fixed; inset: 0; z-index: 120; }
 .mobile-drawer__backdrop { position: absolute; inset: 0; background: rgba(8, 27, 51, .55); backdrop-filter: blur(2px); }
 .mobile-drawer__panel {
@@ -1610,20 +1609,6 @@ code, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
   .cart-btn { padding: 5px; background: none; border-color: transparent; }
   .cart-btn__icon { background: var(--fog); }
   .header-actions .hide-md { display: none; }
-  .mobile-nav {
-    position: fixed; bottom: 0; left: 0; right: 0; z-index: 55; display: flex;
-    background: rgba(255,255,255,.98); backdrop-filter: blur(8px);
-    border-top: 1px solid var(--line); box-shadow: 0 -4px 20px rgba(8,45,92,.08);
-    padding: 5px 4px calc(5px + env(safe-area-inset-bottom));
-  }
-  .mobile-nav a { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 5px 2px; border-radius: 8px; color: var(--muted); font-size: 9.5px; font-weight: 700; position: relative; }
-  .mobile-nav a .ic { width: 20px; height: 20px; }
-  .mobile-nav a.is-active { color: var(--blue); }
-  .mobile-nav a.is-active::before { content: ''; position: absolute; top: -5px; width: 22px; height: 3px; border-radius: 0 0 3px 3px; background: var(--blue); }
-  .mobile-nav .count-dot { top: -1px; right: 14px; }
-  body { padding-bottom: 62px; }
-  .site-footer { margin-bottom: 0; }
-  .toasts { bottom: 76px; }
   .product-grid { grid-template-columns: repeat(3, 1fr); }
   .product-grid--related { grid-template-columns: repeat(3, 1fr); }
   .hero__inner { grid-template-columns: 1fr; padding: 34px 30px; }
@@ -1780,7 +1765,7 @@ code, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
   .modal-backdrop { padding: 0; align-items: flex-end; }
   .modal { border-radius: 18px 18px 0 0; max-height: 94vh; width: 100%; }
   .modal__foot { padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
-  .toasts { left: 14px; right: 14px; bottom: 72px; max-width: none; }
+  .toasts { left: 14px; right: 14px; bottom: 14px; max-width: none; }
   .compare-table { font-size: 11px; }
   .compare-table th, .compare-table td { padding: 8px 8px; }
   .compare-table thead th:nth-child(3), .compare-table tbody td:nth-child(3) { display: none; }
