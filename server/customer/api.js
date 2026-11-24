@@ -17,7 +17,8 @@
 const { createHmac, randomBytes, randomUUID } = require('node:crypto');
 const {
   db, now, uid, sha, makePassword, checkPassword, deriveCode, safeEqual,
-  transaction, audit, pincodeArea, haversineKm
+  transaction, audit, pincodeArea, haversineKm,
+  allocateAmountAcrossSellerOrders, syncPaymentAllocations, resolveSellerOrdersForPaymentRecord
 } = require('./db');
 const seed = require('./seed');
 
@@ -31,8 +32,10 @@ const GATEWAY = {
   provider: 'razorpay',
   keyId: process.env.RAZORPAY_KEY_ID || '',
   keySecret: process.env.RAZORPAY_KEY_SECRET || '',
+  apiBase: (process.env.RAZORPAY_API_BASE || 'https://api.razorpay.com').replace(/\/+$/, ''),
   get configured() { return Boolean(this.keyId && this.keySecret); }
 };
+const inFlightPaymentIntents = new Map();
 
 /* Seed once, at startup, without blocking the server if it fails. */
 try { seed(); } catch (err) { console.error('[nearbuy] seed failed:', err.message); }
@@ -820,8 +823,8 @@ function orderDetail(order, opts = {}) {
   const summary = orderSummary(order);
   const address = JSON.parse(order.address_json);
   const sellerOrders = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=? ORDER BY created_at').all(order.id);
-  const payments = db.prepare('SELECT * FROM nb_payment_records WHERE order_id=? ORDER BY created_at').all(order.id).map((p) => ({
-    provider: p.provider, method: p.method, amount: p.amount_paise, status: p.status, reference: p.reference, at: p.created_at
+  const payments = db.prepare('SELECT * FROM nb_payment_records WHERE order_id=? ORDER BY created_at ASC, rowid ASC').all(order.id).map((p) => ({
+    id: p.id, provider: p.provider, method: p.method, amount: p.amount_paise, status: p.status, reference: p.reference, at: p.created_at, updatedAt: p.updated_at
   }));
   return {
     ...summary, address, note: order.note, events: orderEvents(order.id),
@@ -917,22 +920,273 @@ function releaseStockForSellerOrder(so) {
   }
 }
 
+function cancelOpenPaymentRecords(orderId) {
+  db.prepare("UPDATE nb_payment_records SET status='cancelled',updated_at=? WHERE order_id=? AND status IN ('pending','created')")
+    .run(now(), orderId);
+}
+
+function paymentAllocationsForRecord(record, sellerOrders = null) {
+  const existing = db.prepare(
+    'SELECT seller_order_id AS sellerOrderId, shop_id AS shopId, amount_paise AS amountPaise FROM nb_payment_allocations WHERE payment_record_id=?'
+  ).all(record.id);
+  if (existing.length) return existing;
+  const targets = sellerOrders || resolveSellerOrdersForPaymentRecord(record);
+  return allocateAmountAcrossSellerOrders(record.amount_paise, targets);
+}
+
+function syncPendingOfflinePayment(orderId) {
+  const ts = now();
+  const active = db.prepare(
+    "SELECT * FROM nb_seller_orders WHERE order_id=? AND status NOT IN ('cancelled','rejected') ORDER BY created_at, id"
+  ).all(orderId);
+  if (!active.length) return;
+  const paidSoIds = new Set(db.prepare(`SELECT DISTINCT pa.seller_order_id
+    FROM nb_payment_allocations pa
+    JOIN nb_payment_records pr ON pr.id=pa.payment_record_id
+    WHERE pa.order_id=? AND pr.status='paid' AND pa.amount_paise > 0`).all(orderId).map((r) => r.seller_order_id));
+  const unpaidActive = active.filter((so) => !paidSoIds.has(so.id));
+  const pendingRecords = db.prepare(`SELECT * FROM nb_payment_records
+    WHERE order_id=? AND seller_order_id IS NULL AND status='pending' AND reference IS NULL`).all(orderId);
+  for (const rec of pendingRecords) {
+    if (!unpaidActive.length) {
+      db.prepare("UPDATE nb_payment_records SET status='superseded',updated_at=? WHERE id=?").run(ts, rec.id);
+      syncPaymentAllocations(rec.id, orderId, active, 0, ts);
+    } else {
+      const remainingTotal = unpaidActive.reduce((sum, so) => sum + Number(so.total_paise || 0), 0);
+      db.prepare('UPDATE nb_payment_records SET amount_paise=?,updated_at=? WHERE id=?').run(remainingTotal, ts, rec.id);
+      syncPaymentAllocations(rec.id, orderId, unpaidActive, remainingTotal, ts);
+    }
+  }
+  if (!unpaidActive.length && active.every((so) => ['delivered', 'completed'].includes(so.status))) {
+    db.prepare("UPDATE nb_orders SET payment_status='paid',updated_at=? WHERE id=? AND payment_status<>'paid'").run(ts, orderId);
+  }
+}
+
+function allocatedPaidPaiseForSellerOrder(so) {
+  const paidRecords = db.prepare("SELECT * FROM nb_payment_records WHERE order_id=? AND status='paid'").all(so.order_id);
+  if (!paidRecords.length) {
+    const order = db.prepare('SELECT payment_status FROM nb_orders WHERE id=?').get(so.order_id);
+    return order && order.payment_status === 'paid' ? Number(so.total_paise || 0) : 0;
+  }
+  let total = 0;
+  for (const pr of paidRecords) {
+    const allocs = paymentAllocationsForRecord(pr);
+    for (const a of allocs) {
+      if (a.sellerOrderId === so.id) total += Number(a.amountPaise || 0);
+    }
+  }
+  return total;
+}
+
+function sellerOrderRefundableAmount(so) {
+  const paid = allocatedPaidPaiseForSellerOrder(so);
+  if (paid <= 0) return 0;
+  const existing = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n
+    FROM nb_refunds r
+    LEFT JOIN nb_returns ret ON ret.id=r.return_id
+    WHERE COALESCE(r.seller_order_id, ret.seller_order_id)=? AND r.status <> 'rejected'`).get(so.id);
+  return Math.max(0, paid - Number(existing?.n || 0));
+}
+
+function completedRefundTotalForShop(shopId, { fromIso = null, toIso = null } = {}) {
+  let sql = `SELECT COALESCE(SUM(r.amount_paise),0) AS n
+    FROM nb_refunds r
+    LEFT JOIN nb_returns ret ON ret.id=r.return_id
+    JOIN nb_seller_orders so ON so.id=COALESCE(r.seller_order_id, ret.seller_order_id)
+    WHERE so.shop_id=? AND r.status='completed'`;
+  const args = [shopId];
+  if (fromIso) { sql += ' AND r.created_at>=?'; args.push(fromIso); }
+  if (toIso) { sql += ' AND r.created_at<=?'; args.push(toIso); }
+  return Number(db.prepare(sql).get(...args)?.n || 0);
+}
+
+function completedRefundTotalForSellerOrder(sellerOrderId) {
+  const row = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n
+    FROM nb_refunds r
+    LEFT JOIN nb_returns ret ON ret.id=r.return_id
+    WHERE COALESCE(r.seller_order_id, ret.seller_order_id)=? AND r.status='completed'`).get(sellerOrderId);
+  return Number(row?.n || 0);
+}
+
+function sellerRefundRowsForShop(shopId, limit = 500) {
+  return db.prepare(`SELECT r.id, r.order_id, r.return_id, r.amount_paise, r.status, r.reason, r.reference, r.created_at, r.updated_at,
+      o.code AS order_code, so.id AS seller_order_id, so.code AS seller_order_code
+    FROM nb_refunds r
+    LEFT JOIN nb_returns ret ON ret.id=r.return_id
+    JOIN nb_seller_orders so ON so.id=COALESCE(r.seller_order_id, ret.seller_order_id)
+    JOIN nb_orders o ON o.id=r.order_id
+    WHERE so.shop_id=?
+    ORDER BY r.created_at DESC, r.rowid DESC
+    LIMIT ?`).all(shopId, limit);
+}
+
+function sellerPaymentRowsForShop(shopId, limit = null) {
+  const persisted = db.prepare(`SELECT pr.id, pr.order_id, pr.provider, pr.method, pr.status, pr.reference, pr.created_at, pr.updated_at,
+      pr.amount_paise AS parent_amount_paise,
+      pa.amount_paise AS allocated_paise,
+      pa.seller_order_id,
+      so.code AS seller_code, so.shop_id, so.total_paise AS seller_total_paise,
+      so.discount_paise AS seller_discount_paise, so.status AS seller_status,
+      o.code AS order_code, o.payment_method, o.total_paise AS order_total
+    FROM nb_payment_allocations pa
+    JOIN nb_payment_records pr ON pr.id=pa.payment_record_id
+    JOIN nb_seller_orders so ON so.id=pa.seller_order_id
+    JOIN nb_orders o ON o.id=pr.order_id
+    WHERE pa.shop_id=? AND pa.amount_paise > 0
+    ORDER BY pr.created_at DESC, pr.rowid DESC`).all(shopId);
+
+  const unallocated = db.prepare(`SELECT pr.*, o.code AS order_code, o.payment_method, o.total_paise AS order_total
+    FROM nb_payment_records pr
+    JOIN nb_orders o ON o.id=pr.order_id
+    WHERE NOT EXISTS (SELECT 1 FROM nb_payment_allocations pa WHERE pa.payment_record_id=pr.id)
+      AND (
+        (pr.seller_order_id IS NOT NULL AND EXISTS (SELECT 1 FROM nb_seller_orders so WHERE so.id=pr.seller_order_id AND so.shop_id=?))
+        OR (pr.seller_order_id IS NULL AND EXISTS (SELECT 1 FROM nb_seller_orders so WHERE so.order_id=pr.order_id AND so.shop_id=?))
+      )
+    ORDER BY pr.created_at DESC, pr.rowid DESC`).all(shopId, shopId);
+
+  if (!unallocated.length) {
+    return limit != null ? persisted.slice(0, limit) : persisted;
+  }
+
+  const combined = [...persisted];
+  for (const pr of unallocated) {
+    const targets = resolveSellerOrdersForPaymentRecord(pr);
+    const byId = new Map(targets.map((so) => [so.id, so]));
+    for (const alloc of allocateAmountAcrossSellerOrders(pr.amount_paise, targets)) {
+      if (alloc.shopId !== shopId || alloc.amountPaise <= 0) continue;
+      const so = byId.get(alloc.sellerOrderId);
+      if (!so) continue;
+      combined.push({
+        id: pr.id, order_id: pr.order_id, provider: pr.provider, method: pr.method, status: pr.status,
+        reference: pr.reference, created_at: pr.created_at, updated_at: pr.updated_at,
+        parent_amount_paise: pr.amount_paise, allocated_paise: alloc.amountPaise,
+        seller_order_id: so.id, seller_code: so.code, shop_id: so.shop_id,
+        seller_total_paise: so.total_paise, seller_discount_paise: so.discount_paise, seller_status: so.status,
+        order_code: pr.order_code, payment_method: pr.payment_method, order_total: pr.order_total
+      });
+    }
+  }
+  combined.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return limit != null ? combined.slice(0, limit) : combined;
+}
+
+function recordOfflinePaymentPaid(order) {
+  const ts = now();
+  const activeSellerOrders = db.prepare(
+    "SELECT * FROM nb_seller_orders WHERE order_id=? AND status NOT IN ('cancelled','rejected') ORDER BY created_at, id"
+  ).all(order.id);
+  const paidSoIds = new Set(db.prepare(`SELECT DISTINCT pa.seller_order_id
+    FROM nb_payment_allocations pa
+    JOIN nb_payment_records pr ON pr.id=pa.payment_record_id
+    WHERE pa.order_id=? AND pr.status='paid' AND pa.amount_paise > 0`).all(order.id).map((r) => r.seller_order_id));
+
+  if (activeSellerOrders.length && activeSellerOrders.every((so) => paidSoIds.has(so.id))) {
+    db.prepare("UPDATE nb_payment_records SET status='superseded',updated_at=? WHERE order_id=? AND status IN ('pending','created')")
+      .run(ts, order.id);
+    return;
+  }
+  const existingParentPaid = db.prepare("SELECT id FROM nb_payment_records WHERE order_id=? AND seller_order_id IS NULL AND status='paid' LIMIT 1").get(order.id);
+  if (existingParentPaid) return;
+
+  const targetSellerOrders = activeSellerOrders.length
+    ? activeSellerOrders.filter((so) => !paidSoIds.has(so.id))
+    : [];
+  const paidAmount = targetSellerOrders.length
+    ? targetSellerOrders.reduce((sum, so) => sum + Number(so.total_paise || 0), 0)
+    : Number(order.total_paise);
+
+  const pendingOffline = db.prepare(`SELECT id FROM nb_payment_records
+    WHERE order_id=? AND seller_order_id IS NULL AND provider IN ('cash','store') AND status='pending' AND reference IS NULL
+    ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(order.id);
+  if (pendingOffline) {
+    db.prepare("UPDATE nb_payment_records SET amount_paise=?,status='paid',updated_at=? WHERE id=?").run(paidAmount, ts, pendingOffline.id);
+    db.prepare("UPDATE nb_payment_records SET status='superseded',updated_at=? WHERE order_id=? AND id<>? AND status IN ('pending','created')")
+      .run(ts, order.id, pendingOffline.id);
+    if (targetSellerOrders.length) syncPaymentAllocations(pendingOffline.id, order.id, targetSellerOrders, paidAmount, ts);
+  } else {
+    db.prepare("UPDATE nb_payment_records SET status='superseded',updated_at=? WHERE order_id=? AND status IN ('pending','created')")
+      .run(ts, order.id);
+    const method = order.payment_method === 'pay_at_store' ? 'pay_at_store' : 'cod';
+    const provider = method === 'pay_at_store' ? 'store' : 'cash';
+    const paymentId = uid();
+    db.prepare(`INSERT INTO nb_payment_records(id,order_id,seller_order_id,provider,method,amount_paise,status,reference,created_at,updated_at)
+      VALUES(?,?,NULL,?,?,?,'paid',NULL,?,?)`).run(paymentId, order.id, provider, method, paidAmount, ts, ts);
+    if (targetSellerOrders.length) syncPaymentAllocations(paymentId, order.id, targetSellerOrders, paidAmount, ts);
+  }
+}
+
+function validatePaymentEligibility(order) {
+  if (!order) fail(404, 'Order not found');
+  if (order.is_demo) {
+    fail(403, 'Demo orders cannot start real payments. Use cash on delivery or pay at pickup; no money is collected in this sandbox.');
+  }
+  const paidRecord = db.prepare("SELECT id FROM nb_payment_records WHERE order_id=? AND status='paid' LIMIT 1").get(order.id);
+  if (order.payment_status === 'paid' || paidRecord) {
+    fail(409, 'There is nothing left to pay for this order.');
+  }
+  const sellerOrders = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=? ORDER BY created_at').all(order.id);
+  const derivedStatus = sellerOrders.length ? deriveStatus(sellerOrders) : order.status;
+  if (['cancelled', 'rejected'].includes(order.status) || derivedStatus === 'cancelled') {
+    fail(409, 'This order has been cancelled and cannot be paid.');
+  }
+  if (['completed', 'delivered'].includes(order.status) || ['completed', 'delivered'].includes(derivedStatus)) {
+    fail(409, 'This order is already completed and can no longer start an online payment.');
+  }
+  const activeSellerOrders = sellerOrders.filter((so) => !['cancelled', 'rejected'].includes(so.status));
+  const payableAmount = sellerOrders.length
+    ? (activeSellerOrders.length === sellerOrders.length
+      ? Number(order.total_paise)
+      : activeSellerOrders.reduce((sum, so) => sum + Number(so.total_paise || 0), 0))
+    : Number(order.total_paise);
+  if (!(payableAmount > 0)) {
+    fail(409, 'There is nothing left to pay for this order.');
+  }
+  return { sellerOrders, activeSellerOrders, derivedStatus, payableAmount };
+}
+
+function findActivePaymentIntent(orderId) {
+  return db.prepare(`SELECT * FROM nb_payment_records
+    WHERE order_id=? AND provider='razorpay' AND reference IS NOT NULL AND status IN ('created','pending')
+    ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(orderId);
+}
+
+function paymentIntentResponse(order, record, reused) {
+  return {
+    gatewayOrderId: record.reference,
+    keyId: GATEWAY.keyId,
+    amount: record.amount_paise,
+    orderCode: order.code,
+    currency: 'INR',
+    paymentId: record.id,
+    status: record.status,
+    reused: Boolean(reused)
+  };
+}
+
 function cancelSellerOrder(so, reason, actor = 'customer') {
   const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(so.order_id);
   releaseStockForSellerOrder(so);
-  db.prepare('UPDATE nb_seller_orders SET status=?,cancelled_at=?,updated_at=? WHERE id=?').run('cancelled', now(), now(), so.id);
-  db.prepare('UPDATE nb_orders SET updated_at=? WHERE id=?').run(now(), so.order_id);
+  const ts = now();
+  db.prepare('UPDATE nb_seller_orders SET status=?,cancelled_at=?,updated_at=? WHERE id=?').run('cancelled', ts, ts, so.id);
+  db.prepare('UPDATE nb_orders SET updated_at=? WHERE id=?').run(ts, so.order_id);
   addEvent(so.order_id, so.id, 'cancelled', 'Order cancelled', `${reason || 'Cancelled'}${actor === 'customer' ? ' (requested by customer)' : ''}`, actor);
   const shop = db.prepare('SELECT name FROM nb_shops WHERE id=?').get(so.shop_id);
   notify(order.customer_id, `Your ${shop.name} order was cancelled`, `${so.code}: ${reason || 'Cancelled'}`, 'order', `#/orders/${order.code}`);
   if (order.payment_status === 'paid') {
-    db.prepare('INSERT INTO nb_refunds(id,return_id,order_id,amount_paise,status,reference,created_at,updated_at) VALUES(?,NULL,?,?,?,NULL,?,?)')
-      .run(uid(), order.id, so.total_paise, 'processing', now(), now());
-    notify(order.customer_id, 'Refund initiated', `₹${Math.round(so.total_paise / 100)} for ${so.code} is being returned to the original payment method.`, 'refund', '#/orders');
+    const refundAmount = sellerOrderRefundableAmount(so);
+    if (refundAmount > 0) {
+      db.prepare('INSERT INTO nb_refunds(id,return_id,order_id,seller_order_id,reason,amount_paise,status,reference,created_at,updated_at) VALUES(?,NULL,?,?,?,?,?,NULL,?,?)')
+        .run(uid(), order.id, so.id, 'cancellation', refundAmount, 'processing', ts, ts);
+      notify(order.customer_id, 'Refund initiated', `₹${Math.round(refundAmount / 100)} for ${so.code} is being returned to the original payment method.`, 'refund', '#/orders');
+    }
   }
   const siblings = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=?').all(order.id);
   if (siblings.every((s) => ['cancelled', 'rejected'].includes(s.status))) {
-    db.prepare('UPDATE nb_orders SET status=?,updated_at=? WHERE id=?').run('cancelled', now(), order.id);
+    db.prepare('UPDATE nb_orders SET status=?,updated_at=? WHERE id=?').run('cancelled', ts, order.id);
+    cancelOpenPaymentRecords(order.id);
+  } else if (order.payment_status !== 'paid') {
+    syncPendingOfflinePayment(order.id);
   }
 }
 
@@ -1856,6 +2110,7 @@ async function handle(req, res) {
           idempotencyKey, user.is_demo ? 1 : 0, created, created
         );
         addEvent(orderId, null, 'placed', 'Order placed', `${quote.groups.length} shop${quote.groups.length === 1 ? '' : 's'} · ${paymentMethod === 'cod' ? 'Cash on delivery' : paymentMethod === 'pay_at_store' ? 'Pay at store' : 'Online payment pending'}`, 'customer');
+        const createdSellerOrders = [];
         for (const group of quote.groups) {
           const sellerOrderId = uid();
           const sellerCode = newSellerCode();
@@ -1866,6 +2121,7 @@ async function handle(req, res) {
             group.subtotal, group.discount, group.deliveryFee, group.tax, group.total, group.shop.prepMinutes,
             new Date(Date.now() + 72 * 3600e3).toISOString(), created, created
           );
+          createdSellerOrders.push({ id: sellerOrderId, shop_id: group.shop.id, total_paise: group.total, created_at: created });
           for (const item of group.items) {
             const product = db.prepare('SELECT * FROM nb_products WHERE id=?').get(item.productId);
             db.prepare(`INSERT INTO nb_order_items
@@ -1879,11 +2135,13 @@ async function handle(req, res) {
           const owner = db.prepare('SELECT owner_user_id FROM nb_shops WHERE id=?').get(group.shop.id)?.owner_user_id;
           if (owner) notify(owner, 'New order received', `${sellerCode} · ${group.items.reduce((t, i) => t + i.qty, 0)} item(s) · ₹${Math.round(group.total / 100)}. Accept or reject it in your Seller Hub.`, 'seller', '#/orders');
         }
+        const initialPaymentId = uid();
         db.prepare(`INSERT INTO nb_payment_records(id,order_id,seller_order_id,provider,method,amount_paise,status,reference,created_at,updated_at)
           VALUES(?,?,NULL,?,?,?,?,?,?,?)`).run(
-          uid(), orderId, paymentMethod === 'cod' ? 'cash' : paymentMethod === 'pay_at_store' ? 'store' : 'razorpay',
+          initialPaymentId, orderId, paymentMethod === 'cod' ? 'cash' : paymentMethod === 'pay_at_store' ? 'store' : 'razorpay',
           paymentMethod, quote.total, 'pending', null, created, created
         );
+        syncPaymentAllocations(initialPaymentId, orderId, createdSellerOrders, quote.total, created);
         if (couponRow) {
           db.prepare('INSERT INTO nb_coupon_redemptions(id,coupon_code,user_id,order_id,amount_paise,created_at) VALUES(?,?,?,?,?,?)')
             .run(uid(), couponRow.code, s.user_id, orderId, quote.discount, created);
@@ -2005,11 +2263,12 @@ async function handle(req, res) {
         if (!db.prepare('SELECT 1 FROM nb_returns WHERE code=?').get(returnCode)) break;
       }
       transaction(() => {
+        const ts = now();
         db.prepare(`INSERT INTO nb_returns(id,code,customer_id,order_id,seller_order_id,item_id,reason,comment,images_json,status,refund_amount_paise,decision_note,created_at,updated_at)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)`).run(returnId, returnCode, s.user_id, order.id, so.id, item.id, reason,
-          String(payload.comment || '').trim().slice(0, 800) || null, JSON.stringify(images), 'requested', item.line_total_paise, now(), now());
-        db.prepare('INSERT INTO nb_refunds(id,return_id,order_id,amount_paise,status,reference,created_at,updated_at) VALUES(?,?,?,?,?,NULL,?,?)')
-          .run(uid(), returnId, order.id, item.line_total_paise, 'requested', now(), now());
+          String(payload.comment || '').trim().slice(0, 800) || null, JSON.stringify(images), 'requested', item.line_total_paise, ts, ts);
+        db.prepare('INSERT INTO nb_refunds(id,return_id,order_id,seller_order_id,reason,amount_paise,status,reference,created_at,updated_at) VALUES(?,?,?,?,?,?,?,NULL,?,?)')
+          .run(uid(), returnId, order.id, so.id, 'return', item.line_total_paise, 'requested', ts, ts);
         addEvent(order.id, so.id, 'return_requested', 'Return requested', `${item.name} · ${reason}`, 'customer');
         notify(s.user_id, 'Return request received', `${returnCode} for ${item.name}. The shop will review it and you can follow the refund status in My Account.`, 'return', '#/account/returns');
       });
@@ -2025,7 +2284,13 @@ async function handle(req, res) {
         FROM nb_returns r JOIN nb_orders o ON o.id=r.order_id JOIN nb_seller_orders so ON so.id=r.seller_order_id
         LEFT JOIN nb_shops s ON s.id=so.shop_id LEFT JOIN nb_order_items i ON i.id=r.item_id
         WHERE r.customer_id=? ORDER BY r.created_at DESC`).all(s.user_id);
-      const refunds = db.prepare('SELECT * FROM nb_refunds WHERE order_id IN (SELECT id FROM nb_orders WHERE customer_id=?) ORDER BY created_at DESC').all(s.user_id);
+      const refunds = db.prepare(`SELECT r.*, o.code AS order_code, so.code AS seller_order_code, s.name AS shop_name
+        FROM nb_refunds r
+        JOIN nb_orders o ON o.id=r.order_id
+        LEFT JOIN nb_returns ret ON ret.id=r.return_id
+        LEFT JOIN nb_seller_orders so ON so.id=COALESCE(r.seller_order_id, ret.seller_order_id)
+        LEFT JOIN nb_shops s ON s.id=so.shop_id
+        WHERE o.customer_id=? ORDER BY r.created_at DESC`).all(s.user_id);
       send(res, 200, {
         returns: rows.map((r) => ({
           code: r.code, status: r.status, reason: r.reason, comment: r.comment, images: JSON.parse(r.images_json || '[]'),
@@ -2033,7 +2298,10 @@ async function handle(req, res) {
           orderCode: r.order_code, sellerOrderCode: r.seller_order_code, shop: { name: r.shop_name, slug: r.shop_slug },
           item: { name: r.item_name, emoji: r.item_emoji, qty: r.item_qty }
         })),
-        refunds: refunds.map((r) => ({ amount: r.amount_paise, status: r.status, reference: r.reference, at: r.created_at, updatedAt: r.updated_at }))
+        refunds: refunds.map((r) => ({
+          id: r.id, orderCode: r.order_code, sellerOrderCode: r.seller_order_code || null, shopName: r.shop_name || null,
+          amount: r.amount_paise, status: r.status, reference: r.reference, at: r.created_at, updatedAt: r.updated_at
+        }))
       });
       return true;
     }
@@ -2517,15 +2785,19 @@ async function handle(req, res) {
     function syncParentPayment(orderId) {
       const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(orderId);
       const siblings = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=?').all(orderId);
-      const allPaid = siblings.every((s) => ['delivered', 'completed'].includes(s.status));
-      const payment = { paid: 'paid', pending: 'pending' }[allPaid ? 'paid' : 'pending'];
-      if (payment === 'paid' && order.payment_status !== 'paid') {
+      const active = siblings.filter((s) => !['cancelled', 'rejected'].includes(s.status));
+      const allActiveDelivered = active.length > 0 && active.every((s) => ['delivered', 'completed'].includes(s.status));
+      if (allActiveDelivered && order.payment_status !== 'paid') {
+        const activeTotal = active.reduce((sum, s) => sum + Number(s.total_paise || 0), 0);
         db.prepare("UPDATE nb_orders SET payment_status='paid',updated_at=? WHERE id=?").run(now(), orderId);
-        db.prepare("UPDATE nb_payment_records SET status='paid',updated_at=? WHERE order_id=?").run(now(), orderId);
-        notify(order.customer_id, 'Payment recorded', `₹${Math.round(order.total_paise / 100)} was collected for ${order.code}.`, 'payment', `#/orders/${order.code}`);
+        recordOfflinePaymentPaid(order);
+        notify(order.customer_id, 'Payment recorded', `₹${Math.round(activeTotal / 100)} was collected for ${order.code}.`, 'payment', `#/orders/${order.code}`);
       }
       if (siblings.every((s) => ['delivered', 'completed', 'cancelled', 'rejected'].includes(s.status))) {
-        db.prepare('UPDATE nb_orders SET status=? WHERE id=?').run(siblings.every((s) => ['delivered', 'completed'].includes(s.status)) ? 'completed' : 'cancelled', orderId);
+        const nextStatus = active.length
+          ? (active.every((s) => s.status === 'completed') ? 'completed' : 'delivered')
+          : 'cancelled';
+        db.prepare('UPDATE nb_orders SET status=?,updated_at=? WHERE id=?').run(nextStatus, now(), orderId);
       }
     }
 
@@ -2545,7 +2817,7 @@ async function handle(req, res) {
       };
       const revenue = orders.filter((o) => ['delivered', 'completed'].includes(o.status)).reduce((t, o) => t + o.total_paise, 0);
       const grossSales = orders.filter((o) => !['cancelled', 'rejected'].includes(o.status)).reduce((t, o) => t + o.total_paise, 0);
-      const refunds = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n FROM nb_refunds r JOIN nb_seller_orders so ON so.order_id=r.order_id WHERE so.shop_id=? AND r.status='completed'`).get(shop.id);
+      const refundTotal = completedRefundTotalForShop(shop.id);
       const productStats = db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN stock-reserved>0 THEN 1 ELSE 0 END) AS inStock, SUM(CASE WHEN stock-reserved<=0 THEN 1 ELSE 0 END) AS outStock, SUM(CASE WHEN stock-reserved>0 AND stock-reserved<=low_stock THEN 1 ELSE 0 END) AS lowStock FROM nb_products WHERE shop_id=? AND active=1 AND COALESCE(archived,0)=0').get(shop.id);
       const lowStock = db.prepare('SELECT id,name,stock,reserved,low_stock,emoji FROM nb_products WHERE shop_id=? AND active=1 AND COALESCE(archived,0)=0 AND stock-reserved<=low_stock ORDER BY stock-reserved LIMIT 6').all(shop.id);
       const outStock = db.prepare('SELECT id,name,stock,reserved,emoji FROM nb_products WHERE shop_id=? AND active=1 AND COALESCE(archived,0)=0 AND stock-reserved<=0 ORDER BY name LIMIT 6').all(shop.id);
@@ -2559,7 +2831,7 @@ async function handle(req, res) {
       const codes = sellerCodes(shop, s.user_id);
       send(res, 200, {
         shop: { id: shop.id, name: shop.name, emoji: shop.emoji, slug: shop.slug, isOpen: Boolean(shop.is_open), opensAt: shop.opens_at, closesAt: shop.closes_at, verified: Boolean(shop.verified), rating: shop.rating, sellerId: codes.sellerId, shopId: codes.shopId, locality: shop.locality },
-        counts, revenue, grossSales, refunds: Number(refunds?.n || 0), netSales: Math.max(0, grossSales - Number(refunds?.n || 0)),
+        counts, revenue, grossSales, refunds: refundTotal, netSales: Math.max(0, grossSales - refundTotal),
         orders: orders.length,
         products: { total: Number(productStats?.total || 0), inStock: Number(productStats?.inStock || 0), lowStock: Number(productStats?.lowStock || 0), outStock: Number(productStats?.outStock || 0) },
         lowStock: lowStock.map((p) => ({ id: p.id, name: p.name, stock: Math.max(0, p.stock - p.reserved), lowAt: p.low_stock, emoji: p.emoji })),
@@ -2649,13 +2921,24 @@ async function handle(req, res) {
         } else if (action === 'reject') {
           if (!['placed', 'accepted'].includes(so.status)) fail(409, 'Only a new or accepted order can be rejected.');
           if (!str(reason, 3, 200)) fail(400, 'Give the customer a reason for rejecting this order.');
+          const ts = now();
           releaseStockForSellerOrder(so);
-          db.prepare('UPDATE nb_seller_orders SET status=?,rejected_reason=?,updated_at=? WHERE id=?').run('rejected', reason, now(), so.id);
+          db.prepare('UPDATE nb_seller_orders SET status=?,rejected_reason=?,updated_at=? WHERE id=?').run('rejected', reason, ts, so.id);
           addEvent(so.order_id, so.id, 'rejected', 'Seller rejected the order', reason, 'seller');
           notify(order.customer_id, `${shop.name} could not accept your order`, `${so.code}: ${reason}. Any payment will be refunded separately.`, 'order', `#/orders/${order.code}`);
           if (order.payment_status === 'paid') {
-            db.prepare('INSERT INTO nb_refunds(id,return_id,order_id,amount_paise,status,reference,created_at,updated_at) VALUES(?,NULL,?,?,?,NULL,?,?)')
-              .run(uid(), order.id, so.total_paise, 'processing', now(), now());
+            const refundAmount = sellerOrderRefundableAmount(so);
+            if (refundAmount > 0) {
+              db.prepare('INSERT INTO nb_refunds(id,return_id,order_id,seller_order_id,reason,amount_paise,status,reference,created_at,updated_at) VALUES(?,NULL,?,?,?,?,?,NULL,?,?)')
+                .run(uid(), order.id, so.id, 'rejection', refundAmount, 'processing', ts, ts);
+            }
+          }
+          const siblings = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=?').all(order.id);
+          if (siblings.every((sib) => ['cancelled', 'rejected'].includes(sib.status))) {
+            db.prepare('UPDATE nb_orders SET status=?,updated_at=? WHERE id=?').run('cancelled', ts, order.id);
+            cancelOpenPaymentRecords(order.id);
+          } else if (order.payment_status !== 'paid') {
+            syncPendingOfflinePayment(order.id);
           }
           message = 'Order rejected and reserved stock released.';
         } else if (action === 'prepare') {
@@ -2768,10 +3051,36 @@ async function handle(req, res) {
           message = 'Pickup completed after collection-code verification.';
         } else if (action === 'mark_paid') {
           if (!['delivered', 'completed'].includes(so.status)) fail(409, 'Payment can only be recorded after handover.');
-          db.prepare("UPDATE nb_payment_records SET status='paid',updated_at=? WHERE order_id=?").run(now(), order.id);
-          db.prepare("UPDATE nb_orders SET payment_status='paid',updated_at=? WHERE id=?").run(now(), order.id);
-          notify(order.customer_id, 'Payment recorded', `Cash payment for ${order.code} has been recorded by ${shop.name}.`, 'payment', `#/orders/${order.code}`);
-          message = 'Cash payment recorded.';
+          const ts = now();
+          if (order.payment_status === 'paid') {
+            message = 'Payment already recorded.';
+          } else {
+            const activeSiblings = db.prepare(
+              "SELECT * FROM nb_seller_orders WHERE order_id=? AND status NOT IN ('cancelled','rejected') ORDER BY created_at, id"
+            ).all(order.id);
+            if (activeSiblings.length <= 1 || activeSiblings.every((sib) => ['delivered', 'completed'].includes(sib.status))) {
+              recordOfflinePaymentPaid(order);
+              db.prepare("UPDATE nb_orders SET payment_status='paid',updated_at=? WHERE id=?").run(ts, order.id);
+              notify(order.customer_id, 'Payment recorded', `Cash payment for ${order.code} has been recorded by ${shop.name}.`, 'payment', `#/orders/${order.code}`);
+            } else {
+              const alreadyPaidForSo = allocatedPaidPaiseForSellerOrder(so) > 0;
+              if (!alreadyPaidForSo) {
+                const method = order.payment_method === 'pay_at_store' ? 'pay_at_store' : 'cod';
+                const provider = method === 'pay_at_store' ? 'store' : 'cash';
+                const payId = uid();
+                db.prepare(`INSERT INTO nb_payment_records(id,order_id,seller_order_id,provider,method,amount_paise,status,reference,created_at,updated_at)
+                  VALUES(?,?,?,?,?,?,'paid',NULL,?,?)`).run(payId, order.id, so.id, provider, method, so.total_paise, ts, ts);
+                syncPaymentAllocations(payId, order.id, [so], so.total_paise, ts);
+                syncPendingOfflinePayment(order.id);
+                const allActivePaid = activeSiblings.every((sib) => allocatedPaidPaiseForSellerOrder(sib) > 0);
+                if (allActivePaid) {
+                  db.prepare("UPDATE nb_orders SET payment_status='paid',updated_at=? WHERE id=?").run(ts, order.id);
+                }
+                notify(order.customer_id, 'Payment recorded', `Cash payment for ${so.code} has been recorded by ${shop.name}.`, 'payment', `#/orders/${order.code}`);
+              }
+            }
+            message = 'Cash payment recorded.';
+          }
         } else if (action === 'cancel') {
           if (!['placed', 'accepted'].includes(so.status)) fail(409, 'This order can no longer be cancelled by the seller.');
           if (!str(reason, 3, 200)) fail(400, 'Give a reason for cancelling.');
@@ -3300,26 +3609,160 @@ async function handle(req, res) {
       if (s.is_demo) fail(403, 'Demo orders cannot start real payments. Use cash on delivery or pay at pickup; no money is collected in this sandbox.');
       if (!GATEWAY.configured) fail(503, 'Online payment is not configured. This deployment has no Razorpay keys, so no payment can be started.');
       const order = orderByCode(String(payload.orderCode || ''), s.user_id);
-      if (order.payment_status === 'paid') fail(409, 'There is nothing left to pay for this order.');
-      const auth = Buffer.from(`${GATEWAY.keyId}:${GATEWAY.keySecret}`).toString('base64');
-      let gatewayOrder;
-      try {
-        const resGateway = await fetch('https://api.razorpay.com/v1/orders', {
-          method: 'POST',
-          headers: { authorization: `Basic ${auth}`, 'content-type': 'application/json' },
-          body: JSON.stringify({ amount: order.total_paise, currency: 'INR', receipt: order.code, notes: { nearbuyOrder: order.id } }),
-          signal: AbortSignal.timeout(12000)
-        });
-        gatewayOrder = await resGateway.json();
-        if (!resGateway.ok || !gatewayOrder.id) throw new Error(gatewayOrder?.error?.description || 'Gateway refused the order');
-      } catch (err) {
-        fail(502, `The payment gateway could not be reached: ${err.message}`);
+      const eligibility = validatePaymentEligibility(order);
+
+      const existingInFlight = inFlightPaymentIntents.get(order.id);
+      if (existingInFlight) {
+        const result = await existingInFlight;
+        const freshOrder = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(order.id);
+        const freshEligibility = validatePaymentEligibility(freshOrder);
+        const activeRecord = findActivePaymentIntent(order.id) || result.record;
+        if (!activeRecord || !activeRecord.reference || !['created', 'pending'].includes(activeRecord.status)) {
+          fail(409, 'This payment intent is no longer active. Please try again.');
+        }
+        if (Number(activeRecord.amount_paise) !== freshEligibility.payableAmount) {
+          fail(409, 'The payable amount for this order changed while starting payment. Please try again.');
+        }
+        send(res, 200, paymentIntentResponse(freshOrder, activeRecord, true));
+        return true;
       }
-      db.prepare("UPDATE nb_payment_records SET provider='razorpay',status='created',reference=?,updated_at=? WHERE order_id=?")
-        .run(gatewayOrder.id, now(), order.id);
-      db.prepare("UPDATE nb_orders SET payment_method='online',updated_at=? WHERE id=?").run(now(), order.id);
-      send(res, 201, { gatewayOrderId: gatewayOrder.id, keyId: GATEWAY.keyId, amount: order.total_paise, orderCode: order.code, currency: 'INR' });
-      return true;
+
+      const existingActive = findActivePaymentIntent(order.id);
+      if (existingActive && Number(existingActive.amount_paise) === eligibility.payableAmount) {
+        if (order.payment_method !== 'online') {
+          db.prepare("UPDATE nb_orders SET payment_method='online',updated_at=? WHERE id=?").run(now(), order.id);
+        }
+        send(res, 200, paymentIntentResponse(order, existingActive, true));
+        return true;
+      }
+
+      const attemptNumber = Number(
+        db.prepare("SELECT COUNT(*) AS n FROM nb_payment_records WHERE order_id=? AND provider='razorpay' AND reference IS NOT NULL").get(order.id)?.n || 0
+      ) + 1;
+      const attemptId = uid();
+      const receipt = (attemptNumber === 1 ? order.code : `${order.code}-${attemptNumber}`).slice(0, 40);
+
+      const createPromise = (async () => {
+        const auth = Buffer.from(`${GATEWAY.keyId}:${GATEWAY.keySecret}`).toString('base64');
+        let gatewayOrder;
+        try {
+          const resGateway = await fetch(`${GATEWAY.apiBase}/v1/orders`, {
+            method: 'POST',
+            headers: { authorization: `Basic ${auth}`, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              amount: eligibility.payableAmount,
+              currency: 'INR',
+              receipt,
+              notes: { nearbuyOrder: order.id, paymentAttempt: attemptId, attempt: attemptNumber }
+            }),
+            signal: AbortSignal.timeout(12000)
+          });
+          gatewayOrder = await resGateway.json();
+          const gatewayOrderId = typeof gatewayOrder?.id === 'string' ? gatewayOrder.id.trim() : '';
+          if (!resGateway.ok || !gatewayOrderId) throw new Error(gatewayOrder?.error?.description || 'Gateway refused the order');
+          gatewayOrder.id = gatewayOrderId;
+        } catch (err) {
+          fail(502, `The payment gateway could not be reached: ${err.message}`);
+        }
+
+        let persisted = null;
+        let reused = false;
+        let postError = null;
+
+        transaction(() => {
+          const ts = now();
+          const freshOrder = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(order.id);
+          const existingRef = db.prepare("SELECT * FROM nb_payment_records WHERE provider='razorpay' AND reference=?").get(gatewayOrder.id);
+
+          let freshEligibility;
+          try {
+            freshEligibility = validatePaymentEligibility(freshOrder);
+          } catch (err) {
+            if (!existingRef) {
+              const terminalStatus = freshOrder && freshOrder.payment_status === 'paid' ? 'superseded' : 'cancelled';
+              db.prepare(`INSERT INTO nb_payment_records(id,order_id,seller_order_id,provider,method,amount_paise,status,reference,created_at,updated_at)
+                VALUES(?,?,NULL,'razorpay','online',?,?,?,?,?)`)
+                .run(attemptId, order.id, eligibility.payableAmount, terminalStatus, gatewayOrder.id, ts, ts);
+              syncPaymentAllocations(attemptId, order.id, eligibility.activeSellerOrders, eligibility.payableAmount, ts);
+            }
+            postError = err;
+            return;
+          }
+
+          if (existingRef) {
+            if (existingRef.order_id !== order.id) {
+              postError = new HttpError(502, 'The payment gateway returned a reference already linked to another order.');
+              return;
+            }
+            persisted = existingRef;
+            reused = true;
+            return;
+          }
+
+          const concurrentActive = findActivePaymentIntent(order.id);
+          if (concurrentActive && Number(concurrentActive.amount_paise) === freshEligibility.payableAmount) {
+            db.prepare(`INSERT INTO nb_payment_records(id,order_id,seller_order_id,provider,method,amount_paise,status,reference,created_at,updated_at)
+              VALUES(?,?,NULL,'razorpay','online',?,'superseded',?,?,?)`)
+              .run(attemptId, order.id, eligibility.payableAmount, gatewayOrder.id, ts, ts);
+            syncPaymentAllocations(attemptId, order.id, eligibility.activeSellerOrders, eligibility.payableAmount, ts);
+            persisted = concurrentActive;
+            reused = true;
+            return;
+          }
+
+          if (freshEligibility.payableAmount !== eligibility.payableAmount) {
+            db.prepare(`INSERT INTO nb_payment_records(id,order_id,seller_order_id,provider,method,amount_paise,status,reference,created_at,updated_at)
+              VALUES(?,?,NULL,'razorpay','online',?,'superseded',?,?,?)`)
+              .run(attemptId, order.id, eligibility.payableAmount, gatewayOrder.id, ts, ts);
+            syncPaymentAllocations(attemptId, order.id, eligibility.activeSellerOrders, eligibility.payableAmount, ts);
+            postError = new HttpError(409, 'The payable amount for this order changed while starting payment. Please try again.');
+            return;
+          }
+
+          if (concurrentActive) {
+            db.prepare("UPDATE nb_payment_records SET status='superseded',updated_at=? WHERE id=?").run(ts, concurrentActive.id);
+          }
+
+          const placeholder = db.prepare(`SELECT id FROM nb_payment_records
+            WHERE order_id=? AND provider='razorpay' AND method='online' AND status='pending' AND reference IS NULL
+            ORDER BY created_at ASC, rowid ASC LIMIT 1`).get(order.id);
+
+          db.prepare(`UPDATE nb_payment_records SET status='superseded',updated_at=?
+            WHERE order_id=? AND status='pending' AND reference IS NULL AND id<>?`)
+            .run(ts, order.id, placeholder ? placeholder.id : '');
+
+          if (placeholder) {
+            db.prepare("UPDATE nb_payment_records SET amount_paise=?,status='created',reference=?,updated_at=? WHERE id=? AND reference IS NULL")
+              .run(freshEligibility.payableAmount, gatewayOrder.id, ts, placeholder.id);
+            syncPaymentAllocations(placeholder.id, order.id, freshEligibility.activeSellerOrders, freshEligibility.payableAmount, ts);
+            persisted = db.prepare('SELECT * FROM nb_payment_records WHERE id=?').get(placeholder.id);
+          } else {
+            db.prepare(`INSERT INTO nb_payment_records(id,order_id,seller_order_id,provider,method,amount_paise,status,reference,created_at,updated_at)
+              VALUES(?,?,NULL,'razorpay','online',?,'created',?,?,?)`)
+              .run(attemptId, order.id, freshEligibility.payableAmount, gatewayOrder.id, ts, ts);
+            syncPaymentAllocations(attemptId, order.id, freshEligibility.activeSellerOrders, freshEligibility.payableAmount, ts);
+            persisted = db.prepare('SELECT * FROM nb_payment_records WHERE id=?').get(attemptId);
+          }
+
+          db.prepare("UPDATE nb_orders SET payment_method='online',updated_at=? WHERE id=?").run(ts, order.id);
+          audit('customer', s.user_id, 'payment_intent_created', 'order', order.id, `${gatewayOrder.id} · ₹${Math.round(freshEligibility.payableAmount / 100)}`);
+        });
+
+        if (postError) throw postError;
+        return { record: persisted, reused };
+      })();
+
+      inFlightPaymentIntents.set(order.id, createPromise);
+      try {
+        const result = await createPromise;
+        const freshOrder = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(order.id);
+        send(res, result.reused ? 200 : 201, paymentIntentResponse(freshOrder, result.record, result.reused));
+        return true;
+      } finally {
+        if (inFlightPaymentIntents.get(order.id) === createPromise) {
+          inFlightPaymentIntents.delete(order.id);
+        }
+      }
     }
 
     /* ================================================================== */
@@ -3404,7 +3847,13 @@ async function handle(req, res) {
       const rows = db.prepare(`SELECT r.*, o.code AS order_code, s.name AS shop_name, i.name AS item_name
         FROM nb_returns r JOIN nb_orders o ON o.id=r.order_id JOIN nb_seller_orders so ON so.id=r.seller_order_id
         JOIN nb_shops s ON s.id=so.shop_id JOIN nb_order_items i ON i.id=r.item_id ORDER BY r.created_at DESC LIMIT 100`).all();
-      const refunds = db.prepare('SELECT * FROM nb_refunds ORDER BY created_at DESC LIMIT 100').all();
+      const refunds = db.prepare(`SELECT r.*, o.code AS order_code, so.code AS seller_order_code, s.name AS shop_name
+        FROM nb_refunds r
+        LEFT JOIN nb_orders o ON o.id=r.order_id
+        LEFT JOIN nb_returns ret ON ret.id=r.return_id
+        LEFT JOIN nb_seller_orders so ON so.id=COALESCE(r.seller_order_id, ret.seller_order_id)
+        LEFT JOIN nb_shops s ON s.id=so.shop_id
+        ORDER BY r.created_at DESC LIMIT 100`).all();
       send(res, 200, { returns: rows, refunds });
       return true;
     }
@@ -4188,8 +4637,7 @@ async function handle(req, res) {
       const valid = rows.filter((o) => !['cancelled', 'rejected'].includes(o.status));
       const completed = rows.filter((o) => ['delivered', 'completed'].includes(o.status));
       const gross = valid.reduce((t, o) => t + o.total_paise, 0);
-      const refunds = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n FROM nb_refunds r JOIN nb_seller_orders so ON so.order_id=r.order_id WHERE so.shop_id=? AND r.status='completed' AND r.created_at>=? AND r.created_at<=?`).get(shop.id, fromIso, toIso);
-      const refundTotal = Number(refunds?.n || 0);
+      const refundTotal = completedRefundTotalForShop(shop.id, { fromIso, toIso });
       const discounts = valid.reduce((t, o) => t + o.discount_paise, 0);
       const deliveryCharges = valid.reduce((t, o) => t + o.delivery_fee_paise, 0);
       const tax = valid.reduce((t, o) => t + o.tax_paise, 0);
@@ -4243,26 +4691,39 @@ async function handle(req, res) {
       const shop = sellerShopContext(s);
       requireSellerPerm(s, shop, 'view_revenue', 'Viewing revenue');
       const commissionRate = Number(shop.commission_rate || 0);
-      const payments = db.prepare(`SELECT pr.*, so.code AS seller_code, so.shop_id, o.code AS order_code, o.payment_method, o.total_paise AS order_total FROM nb_payment_records pr JOIN nb_orders o ON o.id=pr.order_id LEFT JOIN nb_seller_orders so ON so.order_id=o.id AND so.shop_id=? WHERE so.id IS NOT NULL ORDER BY pr.created_at DESC LIMIT 200`).all(shop.id);
-      const byStatus = (st) => payments.filter((p) => p.status === st).reduce((t, p) => t + p.amount_paise, 0);
-      const cod = payments.filter((p) => p.method === 'cod').reduce((t, p) => t + p.amount_paise, 0);
-      const payAtStore = payments.filter((p) => p.method === 'pay_at_store').reduce((t, p) => t + p.amount_paise, 0);
-      const refunds = db.prepare(`SELECT COALESCE(SUM(r.amount_paise),0) AS n FROM nb_refunds r JOIN nb_seller_orders so ON so.order_id=r.order_id WHERE so.shop_id=? AND r.status='completed'`).get(shop.id);
-      const grossCollected = byStatus('paid');
-      const commission = Math.round(grossCollected * commissionRate / 100);
+      const allPayments = sellerPaymentRowsForShop(shop.id);
+      const byStatus = (st) => allPayments.filter((p) => p.status === st).reduce((t, p) => t + p.allocated_paise, 0);
+      const cod = allPayments.filter((p) => p.method === 'cod' && !['cancelled', 'superseded', 'failed'].includes(p.status)).reduce((t, p) => t + p.allocated_paise, 0);
+      const payAtStore = allPayments.filter((p) => p.method === 'pay_at_store' && !['cancelled', 'superseded', 'failed'].includes(p.status)).reduce((t, p) => t + p.allocated_paise, 0);
+      const refundTotal = completedRefundTotalForShop(shop.id);
+      const paidPayments = allPayments.filter((p) => p.status === 'paid');
+      const grossCollected = paidPayments.reduce((t, p) => t + p.allocated_paise, 0);
+      const commission = paidPayments.reduce((t, p) => t + Math.round(p.allocated_paise * commissionRate / 100), 0);
       send(res, 200, {
         dashboard: {
-          successful: byStatus('paid'), pending: byStatus('pending'), failed: byStatus('failed'),
-          cod, payAtStore, refunds: Number(refunds?.n || 0), commission, commissionRate,
-          payableBalance: Math.max(0, grossCollected - commission - Number(refunds?.n || 0))
+          successful: grossCollected,
+          pending: byStatus('pending') + byStatus('created'),
+          failed: byStatus('failed'),
+          cod,
+          payAtStore,
+          refunds: refundTotal,
+          commission,
+          commissionRate,
+          payableBalance: Math.max(0, grossCollected - commission - refundTotal)
         },
-        transactions: payments.map((p) => {
-          const so = p.seller_code ? db.prepare('SELECT * FROM nb_seller_orders WHERE code=?').get(p.seller_code) : null;
-          const refund = so ? db.prepare(`SELECT COALESCE(SUM(amount_paise),0) AS n FROM nb_refunds WHERE order_id=? AND status='completed'`).get(so.order_id) : { n: 0 };
-          const gross = so ? so.total_paise : p.amount_paise;
-          const comm = Math.round(gross * commissionRate / 100);
-          const settlement = so ? db.prepare('SELECT st.status FROM nb_settlement_items si JOIN nb_settlements st ON st.id=si.settlement_id WHERE si.seller_order_id=? LIMIT 1').get(so.id) : null;
-          return { id: p.id, orderCode: p.order_code, sellerOrderCode: p.seller_code, method: p.method, provider: p.provider, gross, discount: so?.discount_paise || 0, refund: Number(refund?.n || 0), commission: comm, netPayable: Math.max(0, gross - comm - Number(refund?.n || 0)), paymentStatus: p.status, settlementStatus: settlement?.status || 'not_settled', reference: p.reference, at: p.created_at };
+        transactions: allPayments.slice(0, 200).map((p) => {
+          const isVoid = ['failed', 'cancelled', 'superseded'].includes(p.status);
+          const gross = p.allocated_paise;
+          const refund = p.status === 'paid' ? completedRefundTotalForSellerOrder(p.seller_order_id) : 0;
+          const comm = isVoid ? 0 : Math.round(gross * commissionRate / 100);
+          const settlement = db.prepare('SELECT st.status FROM nb_settlement_items si JOIN nb_settlements st ON st.id=si.settlement_id WHERE si.seller_order_id=? LIMIT 1').get(p.seller_order_id);
+          return {
+            id: p.id, orderCode: p.order_code, sellerOrderCode: p.seller_code, method: p.method, provider: p.provider,
+            gross, discount: p.seller_discount_paise || 0, refund, commission: comm,
+            netPayable: isVoid ? 0 : Math.max(0, gross - comm - refund),
+            paymentStatus: p.status, settlementStatus: settlement?.status || 'not_settled',
+            reference: p.reference, at: p.created_at
+          };
         })
       });
       return true;
@@ -4288,30 +4749,32 @@ async function handle(req, res) {
       const periodStart = String(payload.periodStart || '').slice(0, 10);
       const periodEnd = String(payload.periodEnd || '').slice(0, 10);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(periodStart) || !/^\d{4}-\d{2}-\d{2}$/.test(periodEnd) || periodStart > periodEnd) fail(400, 'Choose a valid settlement period.');
-      const orders = db.prepare(`SELECT so.* FROM nb_seller_orders so WHERE so.shop_id=? AND so.status IN ('delivered','completed') AND date(so.created_at)>=? AND date(so.created_at)<=?
-        AND so.id NOT IN (SELECT seller_order_id FROM nb_settlement_items) ORDER BY so.created_at`).all(shop.id, periodStart, periodEnd);
-      if (!orders.length) fail(409, 'No unsettled completed orders in this period.');
       const commissionRate = Number(shop.commission_rate || 0);
-      let gross = 0, refunds = 0, commission = 0;
       const id = uid();
       const code = `STL-${String(Math.floor(100000 + Math.random() * 900000))}`;
-      const lines = [];
+      let orderCount = 0;
       transaction(() => {
+        const orders = db.prepare(`SELECT so.* FROM nb_seller_orders so WHERE so.shop_id=? AND so.status IN ('delivered','completed') AND date(so.created_at)>=? AND date(so.created_at)<=?
+          AND so.id NOT IN (SELECT seller_order_id FROM nb_settlement_items) ORDER BY so.created_at`).all(shop.id, periodStart, periodEnd);
+        if (!orders.length) fail(409, 'No unsettled completed orders in this period.');
+        orderCount = orders.length;
+        let gross = 0, refunds = 0, commission = 0;
+        const lines = [];
         for (const so of orders) {
-          const refund = db.prepare(`SELECT COALESCE(SUM(amount_paise),0) AS n FROM nb_refunds WHERE order_id=? AND status='completed'`).get(so.order_id);
-          const r = Number(refund?.n || 0);
+          const r = completedRefundTotalForSellerOrder(so.id);
           const c = Math.round(so.total_paise * commissionRate / 100);
           gross += so.total_paise; refunds += r; commission += c;
           lines.push([uid(), id, so.id, so.total_paise, r, c, Math.max(0, so.total_paise - r - c)]);
         }
+        const ts = now();
         // Parent settlement first — settlement items carry a foreign key to it.
         db.prepare('INSERT INTO nb_settlements(id,code,shop_id,period_start,period_end,gross_paise,refunds_paise,commission_paise,adjustments_paise,net_paise,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(id, code, shop.id, periodStart, periodEnd, gross, refunds, commission, 0, Math.max(0, gross - refunds - commission), 'pending', now(), now());
+          .run(id, code, shop.id, periodStart, periodEnd, gross, refunds, commission, 0, Math.max(0, gross - refunds - commission), 'pending', ts, ts);
         for (const line of lines) {
           db.prepare('INSERT INTO nb_settlement_items(id,settlement_id,seller_order_id,gross_paise,refund_paise,commission_paise,net_paise) VALUES(?,?,?,?,?,?,?)').run(...line);
         }
       });
-      audit('seller', s.user_id, 'settlement_generated', 'settlement', id, `${code} · ${orders.length} order(s)`);
+      audit('seller', s.user_id, 'settlement_generated', 'settlement', id, `${code} · ${orderCount} order(s)`);
       send(res, 201, { message: `Settlement ${code} created as pending. It becomes settled only after the payout is confirmed.`, code, status: 'pending' });
       return true;
     }
@@ -4321,8 +4784,8 @@ async function handle(req, res) {
       const shop = sellerShopContext(s);
       const row = db.prepare('SELECT * FROM nb_settlements WHERE code=? AND shop_id=?').get(decodeURIComponent(route.split('/')[3]), shop.id);
       if (!row) fail(404, 'Settlement not found.');
-      const items = db.prepare('SELECT si.*, so.code AS order_code FROM nb_settlement_items si JOIN nb_seller_orders so ON so.id=si.seller_order_id WHERE si.settlement_id=? ORDER BY so.created_at').all(row.id);
-      send(res, 200, { settlement: { id: row.id, code: row.code, periodStart: row.period_start, periodEnd: row.period_end, gross: row.gross_paise, refunds: row.refunds_paise, commission: row.commission_paise, adjustments: row.adjustments_paise, net: row.net_paise, status: row.status, bankReference: row.bank_reference, payoutDate: row.payout_date }, items: items.map((i) => ({ orderCode: i.order_code, gross: i.gross_paise, refund: i.refund_paise, commission: i.commission_paise, net: i.net_paise })) });
+      const items = db.prepare('SELECT si.*, so.code AS order_code, so.created_at AS order_created_at FROM nb_settlement_items si JOIN nb_seller_orders so ON so.id=si.seller_order_id WHERE si.settlement_id=? ORDER BY so.created_at').all(row.id);
+      send(res, 200, { settlement: { id: row.id, code: row.code, periodStart: row.period_start, periodEnd: row.period_end, gross: row.gross_paise, refunds: row.refunds_paise, commission: row.commission_paise, adjustments: row.adjustments_paise, net: row.net_paise, status: row.status, bankReference: row.bank_reference, payoutDate: row.payout_date }, items: items.map((i) => ({ orderCode: i.order_code, sellerOrderId: i.seller_order_id, createdAt: i.order_created_at, gross: i.gross_paise, refund: i.refund_paise, commission: i.commission_paise, net: i.net_paise })) });
       return true;
     }
 
@@ -4628,11 +5091,17 @@ async function handle(req, res) {
         const rows = db.prepare('SELECT product_id, type, previous_qty, new_qty, delta, reason, actor_name, created_at FROM nb_inventory_transactions WHERE shop_id=? ORDER BY created_at DESC LIMIT 500').all(shop.id);
         sendCsv(res, 'movements.csv', [['Product', 'Type', 'Previous', 'New', 'Delta', 'Reason', 'By', 'At'], ...rows.map((r) => [r.product_id, r.type, r.previous_qty, r.new_qty, r.delta, r.reason || '', r.actor_name || '', r.created_at])]);
       } else if (type === 'payments') {
-        const rows = db.prepare(`SELECT pr.id, o.code, pr.method, pr.amount_paise, pr.status, pr.created_at FROM nb_payment_records pr JOIN nb_orders o ON o.id=pr.order_id JOIN nb_seller_orders so ON so.order_id=o.id AND so.shop_id=? ORDER BY pr.created_at DESC LIMIT 500`).all(shop.id);
-        sendCsv(res, 'payments.csv', [['Transaction', 'Order', 'Method', 'Amount (₹)', 'Status', 'At'], ...rows.map((r) => [r.id, r.code, r.method, (r.amount_paise / 100).toFixed(2), r.status, r.created_at])]);
+        const rows = sellerPaymentRowsForShop(shop.id, 500);
+        sendCsv(res, 'payments.csv', [
+          ['Transaction', 'Order', 'Seller order', 'Method', 'Amount (₹)', 'Status', 'At'],
+          ...rows.map((r) => [r.id, r.order_code, r.seller_code, r.method, (r.allocated_paise / 100).toFixed(2), r.status, r.created_at])
+        ]);
       } else if (type === 'refunds') {
-        const rows = db.prepare(`SELECT r.id, o.code, r.amount_paise, r.status, r.created_at FROM nb_refunds r JOIN nb_orders o ON o.id=r.order_id JOIN nb_seller_orders so ON so.order_id=o.id AND so.shop_id=? ORDER BY r.created_at DESC LIMIT 500`).all(shop.id);
-        sendCsv(res, 'refunds.csv', [['Refund', 'Order', 'Amount (₹)', 'Status', 'At'], ...rows.map((r) => [r.id, r.code, (r.amount_paise / 100).toFixed(2), r.status, r.created_at])]);
+        const rows = sellerRefundRowsForShop(shop.id, 500);
+        sendCsv(res, 'refunds.csv', [
+          ['Refund', 'Order', 'Seller order', 'Amount (₹)', 'Status', 'At'],
+          ...rows.map((r) => [r.id, r.order_code, r.seller_order_code, (r.amount_paise / 100).toFixed(2), r.status, r.created_at])
+        ]);
       } else if (type === 'settlements') {
         const rows = db.prepare('SELECT code, period_start, period_end, gross_paise, refunds_paise, commission_paise, net_paise, status FROM nb_settlements WHERE shop_id=? ORDER BY created_at DESC').all(shop.id);
         sendCsv(res, 'settlements.csv', [['Settlement', 'Period', 'Gross (₹)', 'Refunds (₹)', 'Commission (₹)', 'Net (₹)', 'Status'], ...rows.map((r) => [r.code, `${r.period_start} to ${r.period_end}`, (r.gross_paise / 100).toFixed(2), (r.refunds_paise / 100).toFixed(2), (r.commission_paise / 100).toFixed(2), (r.net_paise / 100).toFixed(2), r.status])]);
@@ -5248,6 +5717,36 @@ function publicConfig() {
   };
 }
 
+const WEBHOOK_EVENT_TARGET = Object.freeze({
+  'payment.authorized': { target: 'pending', allowedEntityStatuses: new Set(['authorized', 'created']) },
+  'payment.captured': { target: 'paid', allowedEntityStatuses: new Set(['captured']) },
+  'payment.failed': { target: 'failed', allowedEntityStatuses: new Set(['failed']) }
+});
+
+const PAYMENT_TRANSITIONS = Object.freeze({
+  created: new Set(['pending', 'failed', 'paid']),
+  pending: new Set(['failed', 'paid']),
+  failed: new Set(['paid']),
+  cancelled: new Set(['paid']),
+  superseded: new Set(['paid']),
+  paid: new Set()
+});
+
+function deriveWebhookEventKey(req, event, raw, payment) {
+  const headerId = String(req.headers['x-razorpay-event-id'] || '').trim();
+  if (headerId) return `header:${headerId.slice(0, 160)}`;
+  const bodyId = typeof event?.id === 'string' ? event.id.trim() : '';
+  if (bodyId) return `event:${bodyId.slice(0, 160)}`;
+  const eventName = typeof event?.event === 'string' ? event.event.trim() : 'unknown';
+  const paymentId = typeof payment?.id === 'string' ? payment.id.trim() : '';
+  const orderRef = typeof payment?.order_id === 'string' ? payment.order_id.trim() : '';
+  const paymentStatus = typeof payment?.status === 'string' ? payment.status.trim().toLowerCase() : '';
+  if (paymentId && orderRef) {
+    return `payment:${eventName}:${orderRef}:${paymentId}:${paymentStatus}`;
+  }
+  return `hash:${sha(raw)}`;
+}
+
 async function paymentWebhook(req, res) {
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
   if (!secret) { send(res, 503, { error: 'Webhook not configured (RAZORPAY_WEBHOOK_SECRET is missing).' }); return; }
@@ -5263,26 +5762,177 @@ async function paymentWebhook(req, res) {
   const provided = String(req.headers['x-razorpay-signature'] || '');
   if (!safeEqual(expected, provided)) { send(res, 401, { error: 'Invalid signature' }); return; }
   let event;
-  try { event = JSON.parse(raw.toString('utf8')); } catch { send(res, 400, { error: 'Invalid JSON' }); return; }
+  try {
+    event = JSON.parse(raw.toString('utf8'));
+    if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('Expected JSON object');
+  } catch {
+    send(res, 400, { error: 'Invalid JSON' });
+    return;
+  }
+
+  const eventName = typeof event.event === 'string' ? event.event.trim() : '';
+  const eventSpec = Object.hasOwn(WEBHOOK_EVENT_TARGET, eventName) ? WEBHOOK_EVENT_TARGET[eventName] : null;
+  if (!eventSpec) {
+    send(res, 200, { ok: true, ignored: true, reason: 'unsupported_event' });
+    return;
+  }
+
   const payment = event?.payload?.payment?.entity;
-  if (!payment || !payment.order_id) { send(res, 200, { ok: true, ignored: true }); return; }
-  const record = db.prepare("SELECT * FROM nb_payment_records WHERE provider='razorpay' AND reference=?").get(payment.order_id);
-  if (!record) { send(res, 200, { ok: true, ignored: true }); return; }
-  const captured = event.event === 'payment.captured' || payment.status === 'captured';
-  const failed = event.event === 'payment.failed' || payment.status === 'failed';
+  const gatewayOrderId = typeof payment?.order_id === 'string' ? payment.order_id.trim() : '';
+  if (!payment || typeof payment !== 'object' || !gatewayOrderId) {
+    send(res, 200, { ok: true, ignored: true, reason: 'missing_order_reference' });
+    return;
+  }
+
+  const eventKey = deriveWebhookEventKey(req, event, raw, payment);
+  const payloadHash = sha(raw);
+  const gatewayPaymentId = typeof payment.id === 'string' ? payment.id.trim() : null;
+
+  let outcome;
   transaction(() => {
-    db.prepare('UPDATE nb_payment_records SET status=?,updated_at=? WHERE id=?').run(captured ? 'paid' : failed ? 'failed' : 'pending', now(), record.id);
-    if (captured) {
-      db.prepare("UPDATE nb_orders SET payment_status='paid',updated_at=? WHERE id=?").run(now(), record.order_id);
-      const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(record.order_id);
-      notify(order.customer_id, 'Payment successful', `We received ₹${Math.round(record.amount_paise / 100)} for ${order.code}.`, 'payment', `#/orders/${order.code}`);
-    } else if (failed) {
-      const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(record.order_id);
-      notify(order.customer_id, 'Payment failed', `The gateway did not complete the payment for ${order.code}. No money was taken. You can try again.`, 'payment', `#/orders/${order.code}`);
+    const ts = now();
+
+    const existingEvent = db.prepare(
+      "SELECT id, outcome FROM nb_payment_webhook_events WHERE provider='razorpay' AND event_key=?"
+    ).get(eventKey);
+    if (existingEvent) {
+      outcome = { status: 200, body: { ok: true, duplicate: true } };
+      return;
     }
-    audit('gateway', null, captured ? 'payment_captured' : failed ? 'payment_failed' : 'payment_updated', 'order', record.order_id, payment.id || '');
+
+    const record = db.prepare(
+      "SELECT * FROM nb_payment_records WHERE provider='razorpay' AND reference=?"
+    ).get(gatewayOrderId);
+    if (!record) {
+      outcome = { status: 200, body: { ok: true, ignored: true, reason: 'unknown_reference' } };
+      return;
+    }
+
+    const order = db.prepare('SELECT * FROM nb_orders WHERE id=?').get(record.order_id);
+    if (!order) {
+      outcome = { status: 200, body: { ok: true, ignored: true, reason: 'unknown_order' } };
+      return;
+    }
+
+    if (payment.status !== undefined && payment.status !== null) {
+      const entityStatus = String(payment.status).trim().toLowerCase();
+      if (!eventSpec.allowedEntityStatuses.has(entityStatus)) {
+        audit('gateway', null, 'payment_webhook_rejected', 'order', order.id,
+          `status_mismatch event=${eventName} status=${entityStatus} ref=${gatewayOrderId}`);
+        outcome = { status: 400, body: { error: 'Payment status does not match webhook event.', code: 'status_mismatch' } };
+        return;
+      }
+    }
+
+    const currency = typeof payment.currency === 'string' ? payment.currency.trim().toUpperCase() : '';
+    if (currency !== 'INR') {
+      audit('gateway', null, 'payment_webhook_rejected', 'order', order.id,
+        `currency_mismatch expected=INR got=${currency || 'missing'} ref=${gatewayOrderId}`);
+      outcome = { status: 400, body: { error: 'Payment currency must be INR.', code: 'currency_mismatch' } };
+      return;
+    }
+
+    const expectedAmount = Number(record.amount_paise);
+    if (typeof payment.amount !== 'number' || !Number.isSafeInteger(payment.amount) || payment.amount <= 0 || payment.amount !== expectedAmount) {
+      audit('gateway', null, 'payment_webhook_rejected', 'order', order.id,
+        `amount_mismatch expected=${expectedAmount} got=${String(payment.amount)} ref=${gatewayOrderId}`);
+      outcome = { status: 400, body: { error: 'Payment amount does not match the order total.', code: 'amount_mismatch' } };
+      return;
+    }
+
+    const target = eventSpec.target;
+    const currentStatus = record.status;
+
+    const recordWebhookEvent = (eventOutcome) => {
+      db.prepare(`INSERT INTO nb_payment_webhook_events
+        (id,provider,event_key,event_name,payment_id,reference,payload_hash,outcome,created_at)
+        VALUES(?,'razorpay',?,?,?,?,?,?,?)`).run(
+        uid(), eventKey, eventName, gatewayPaymentId, gatewayOrderId, payloadHash, eventOutcome, ts
+      );
+    };
+
+    if (currentStatus === target) {
+      recordWebhookEvent('duplicate');
+      outcome = { status: 200, body: { ok: true, duplicate: true } };
+      return;
+    }
+
+    const allowedTargets = PAYMENT_TRANSITIONS[currentStatus] || new Set();
+    const orderAlreadyPaid = order.payment_status === 'paid';
+    if (!allowedTargets.has(target) || (orderAlreadyPaid && target !== 'paid')) {
+      recordWebhookEvent('ignored_transition');
+      audit('gateway', null, 'payment_transition_ignored', 'order', order.id,
+        `${currentStatus} -> ${target} (${eventName}) ref=${gatewayOrderId}`);
+      outcome = { status: 200, body: { ok: true, ignored: true, reason: 'invalid_transition' } };
+      return;
+    }
+
+    if (target === 'paid') {
+      db.prepare("UPDATE nb_payment_records SET status='paid',updated_at=? WHERE id=?").run(ts, record.id);
+      db.prepare("UPDATE nb_payment_records SET status='superseded',updated_at=? WHERE order_id=? AND id<>? AND status IN ('pending','created')")
+        .run(ts, record.order_id, record.id);
+      if (!orderAlreadyPaid) {
+        db.prepare("UPDATE nb_orders SET payment_status='paid',updated_at=? WHERE id=?").run(ts, record.order_id);
+        notify(order.customer_id, 'Payment successful', `We received ₹${Math.round(record.amount_paise / 100)} for ${order.code}.`, 'payment', `#/orders/${order.code}`);
+        const sellerOrders = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=? ORDER BY created_at, id').all(order.id);
+        const derived = sellerOrders.length ? deriveStatus(sellerOrders) : order.status;
+        const isFullyCancelled = ['cancelled', 'rejected'].includes(order.status) || derived === 'cancelled';
+        const allocations = paymentAllocationsForRecord(record, sellerOrders);
+        let totalRefunded = 0;
+        if (sellerOrders.length) {
+          const allocBySo = new Map(allocations.map((a) => [a.sellerOrderId, a.amountPaise]));
+          for (const so of sellerOrders) {
+            if (!['cancelled', 'rejected'].includes(so.status)) continue;
+            const share = allocBySo.get(so.id) || 0;
+            if (share <= 0) continue;
+            const existingRefund = db.prepare(
+              "SELECT id FROM nb_refunds WHERE seller_order_id=? AND return_id IS NULL AND status <> 'rejected' LIMIT 1"
+            ).get(so.id);
+            if (!existingRefund) {
+              db.prepare(`INSERT INTO nb_refunds(id,return_id,order_id,seller_order_id,reason,amount_paise,status,reference,created_at,updated_at)
+                VALUES(?,NULL,?,?,?,?,?,NULL,?,?)`)
+                .run(uid(), order.id, so.id, so.status === 'rejected' ? 'rejection' : 'cancellation', share, 'processing', ts, ts);
+              totalRefunded += share;
+            }
+          }
+        } else if (isFullyCancelled && Number(record.amount_paise) > 0) {
+          const existingRefund = db.prepare(
+            "SELECT id FROM nb_refunds WHERE order_id=? AND return_id IS NULL AND status <> 'rejected' LIMIT 1"
+          ).get(order.id);
+          if (!existingRefund) {
+            db.prepare(`INSERT INTO nb_refunds(id,return_id,order_id,seller_order_id,reason,amount_paise,status,reference,created_at,updated_at)
+              VALUES(?,NULL,?,NULL,'cancellation',?,?,NULL,?,?)`)
+              .run(uid(), order.id, record.amount_paise, 'processing', ts, ts);
+            totalRefunded += Number(record.amount_paise);
+          }
+        }
+        if (totalRefunded > 0) {
+          notify(order.customer_id, 'Refund initiated', `₹${Math.round(totalRefunded / 100)} for ${isFullyCancelled ? 'cancelled order ' : ''}${order.code} is being returned to the original payment method.`, 'refund', '#/orders');
+        }
+      } else {
+        const sellerOrders = db.prepare('SELECT * FROM nb_seller_orders WHERE order_id=? ORDER BY created_at, id').all(order.id);
+        syncPaymentAllocations(record.id, order.id, sellerOrders, 0, ts);
+        db.prepare(`INSERT INTO nb_refunds(id,return_id,order_id,seller_order_id,reason,amount_paise,status,reference,created_at,updated_at)
+          VALUES(?,NULL,?,NULL,'duplicate_payment',?,?,NULL,?,?)`)
+          .run(uid(), order.id, record.amount_paise, 'processing', ts, ts);
+        notify(order.customer_id, 'Duplicate payment refund initiated', `₹${Math.round(record.amount_paise / 100)} from a duplicate payment for ${order.code} is being refunded.`, 'refund', '#/orders');
+      }
+      recordWebhookEvent('processed');
+      audit('gateway', null, orderAlreadyPaid ? 'duplicate_payment_captured' : 'payment_captured', 'order', order.id, gatewayPaymentId || gatewayOrderId);
+    } else if (target === 'failed') {
+      db.prepare("UPDATE nb_payment_records SET status='failed',updated_at=? WHERE id=?").run(ts, record.id);
+      notify(order.customer_id, 'Payment failed', `The gateway did not complete the payment for ${order.code}. No money was taken. You can try again.`, 'payment', `#/orders/${order.code}`);
+      recordWebhookEvent('processed');
+      audit('gateway', null, 'payment_failed', 'order', order.id, gatewayPaymentId || gatewayOrderId);
+    } else if (target === 'pending') {
+      db.prepare("UPDATE nb_payment_records SET status='pending',updated_at=? WHERE id=?").run(ts, record.id);
+      recordWebhookEvent('processed');
+      audit('gateway', null, 'payment_authorized', 'order', order.id, gatewayPaymentId || gatewayOrderId);
+    }
+
+    outcome = { status: 200, body: { ok: true } };
   });
-  send(res, 200, { ok: true });
+  send(res, outcome.status, outcome.body);
 }
 
 module.exports = { handle };
